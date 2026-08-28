@@ -262,33 +262,47 @@ cross_shard_disabled = false
 dns_ttl = 5_000
 
 #
-# Redis-backed query result cache (MVP).
+# Redis-backed query result cache.
 #
-# Caches results of cacheable SELECT queries (simple protocol only).
-# Conservative invalidation: any write/DDL bumps a per-db generation,
-# effectively invalidating all cached entries for that database.
+# Caches cacheable read results (simple Query or extended Execute) and
+# invalidates by table tag on writes. Full reference: docs/RESULT_CACHE.md
 #
 [result_cache]
 enabled = true
 # Redis/Valkey/Dragonfly connection URL.
 redis_url = "redis://127.0.0.1:6379"
-# TTL (seconds). If omitted, PgDog applies a default.
+# TTL (seconds). If omitted, default is 30.
 expire_seconds = 30
-# Don't cache very large results.
+# Don't cache very large results (default 512 KiB if omitted).
 max_entry_bytes = 524288
-# Optional: A secret key for encrypting cached values in Redis.
-# If set, values will be encrypted using AES-256-GCM.
-# The key can be any string; it will be hashed to a 256-bit key.
-# It is recommended to use a long, random string.
+# Optional secret for AES-256-GCM of Redis values (SHA-256-derived key).
 # encryption_key = "your-super-secret-and-long-random-key"
 # Redis key prefix.
 key_prefix = "pgdog:result_cache"
-# Optional allow/deny lists (regex) to control what gets cached.
-# Unsafe lists take precedence over safe lists.
+# Coalesce in-process cache misses for the same key.
+singleflight_enabled = true
+# How long followers wait (milliseconds) before querying Postgres.
+singleflight_timeout_ms = 5000
+# Extend TTL on hit, capped by max_expire_seconds.
+adaptive_ttl_enabled = true
+max_expire_seconds = 300
+# XFetch probabilistic refresh condition (currently metric-only).
+xfetch_enabled = true
+xfetch_beta = 1.0
+# Cross-process stampede protection via Redis NX lock.
+distributed_singleflight_enabled = true
+distributed_singleflight_timeout_ms = 3000
+# Bypass cache for tables this session wrote to, for this window.
+read_after_write_consistency_enabled = true
+read_after_write_window_ms = 2000
+# Row-level invalidation is reserved and unused.
+# granular_invalidation_enabled = false
+# Regex allow/deny. Unsafe lists take precedence. Empty allow = all tables.
 cache_safe_schema_list = []
 cache_unsafe_schema_list = []
 cache_safe_table_list = []
 cache_unsafe_table_list = []
+
 
 #
 # Admin database used for stats and system admin.

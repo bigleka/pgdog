@@ -1,8 +1,5 @@
-#[[users]]
-#name = "postgres"
-#database = "postgres"
-#password = "postgres"
 [[users]]
-name = "user_name"
-database = "database_name"
-password = "password"
+name = "postgres"
+database = "postgres"
+password = "postgres"
+

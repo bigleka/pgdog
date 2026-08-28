@@ -63,16 +63,20 @@ pub struct QueryEngine {
     result_cache_capture: Option<ResultCacheCapture>,
     query_errored: bool,
     pending_invalidations: Vec<crate::frontend::router::parser::OwnedTable>,
+    last_write_at: Option<std::time::Instant>,
+    session_touched_tables: std::collections::HashSet<String>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct ResultCacheCapture {
     key: crate::result_cache::ResultCacheKey,
     db: String,
     tables: Vec<crate::frontend::router::parser::OwnedTable>,
     bytes: Vec<u8>,
     errored: bool,
+    singleflight_guard: Option<crate::result_cache::singleflight::SingleflightGuard>,
 }
+
 
 impl QueryEngine {
     /// Create new query engine.
@@ -98,8 +102,11 @@ impl QueryEngine {
             result_cache_capture: None,
             query_errored: false,
             pending_invalidations: Vec::new(),
+            last_write_at: None,
+            session_touched_tables: std::collections::HashSet::new(),
         })
     }
+
 
     pub fn from_client(client: &Client) -> Result<Self, Error> {
         Self::new(&client.params, &client.comms, client.admin)
@@ -135,6 +142,11 @@ impl QueryEngine {
         }
 
         // Rewrite statement if necessary.
+        // Lazily initialize result cache (if enabled).
+        if self.result_cache.is_none() && !context.admin {
+            self.result_cache = RedisResultCache::global().await;
+        }
+
         if !self.parse_and_rewrite(context).await? {
             return Ok(());
         }
@@ -154,24 +166,31 @@ impl QueryEngine {
 
         self.hooks.before_execution(context)?;
 
-        // Lazily initialize result cache (if enabled).
-        if self.result_cache.is_none() && !context.admin {
-            self.result_cache = RedisResultCache::global().await;
-        }
-
         // Table-based invalidation: invalidate cache entries dependent on touched tables.
         if let (Some(ref cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
-            let route = context.client_request.route();
-            if route.is_write() && context.client_request.is_executable()
-            {
-                let tables = context
+            if context.client_request.is_executable() {
+                let is_write = context
                     .client_request
                     .ast
                     .as_ref()
-                    .map(|ast| ast.tables().into_iter().map(|t| t.to_owned()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                if !tables.is_empty() {
-                    cache.invalidate_tables(cluster.name(), &tables).await;
+                    .map(|ast| ast.is_write_statement())
+                    .unwrap_or_else(|| context.client_request.route().is_write());
+
+                if is_write {
+                    let tables = context
+                        .client_request
+                        .ast
+                        .as_ref()
+                        .map(|ast| ast.tables().into_iter().map(|t| t.to_owned()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    if !tables.is_empty() {
+                        cache.invalidate_tables(cluster.name(), &tables).await;
+                        self.pending_invalidations.extend(tables.clone());
+                        self.last_write_at = Some(std::time::Instant::now());
+                        for t in &tables {
+                            self.session_touched_tables.insert(t.name.clone());
+                        }
+                    }
                 }
             }
         }
@@ -181,27 +200,134 @@ impl QueryEngine {
             if context.client_request.is_executable() {
                 if let Some(req) = CacheableRequest::from_client_request(context.client_request) {
                     let user = context.params.get_required("user").unwrap_or("unknown");
-                    if let Some(key) =
-                        cache
-                            .build_key(cluster.name(), user, context.params, &req)
-                            .await
-                    {
-                        if let Some(payload) = cache.get(&key).await {
-                            crate::stats::ResultCache::hit(payload.len());
-                            let bytes_sent = context.stream.send_raw_flush(&payload).await?;
-                            self.stats.sent(bytes_sent);
-                            self.set_state(State::Idle);
-                            return Ok(());
-                        }
 
-                        crate::stats::ResultCache::miss();
-                        self.result_cache_capture = Some(ResultCacheCapture {
-                            key,
-                            db: cluster.name().to_string(),
-                            tables: req.tables.clone(),
-                            bytes: Vec::new(),
-                            errored: false,
-                        });
+                    // Read-After-Write Consistency check for session
+                    let mut bypass_cache = false;
+                    let read_after_write_enabled =
+                        crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                            .map(|cfg| cfg.read_after_write_consistency_enabled)
+                            .unwrap_or(true);
+
+                    if read_after_write_enabled {
+                        if let Some(last_write) = self.last_write_at {
+                            let window_ms =
+                                crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                    .map(|cfg| cfg.read_after_write_window_ms)
+                                    .unwrap_or(2000);
+                            if last_write.elapsed() < std::time::Duration::from_millis(window_ms) {
+                                if req.tables.iter().any(|t| self.session_touched_tables.contains(&t.name)) {
+                                    bypass_cache = true;
+                                    crate::stats::ResultCache::read_after_write_bypass();
+                                }
+                            }
+                        }
+                    }
+
+                    if !bypass_cache {
+                        if let Some(key) =
+                            cache
+                                .build_key(cluster.name(), user, context.params, &req)
+                                .await
+                        {
+                            if let Some((payload, rem_ttl_opt)) = cache.get_with_ttl(&key).await {
+                                let xfetch_enabled =
+                                    crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                        .map(|cfg| cfg.xfetch_enabled)
+                                        .unwrap_or(true);
+
+                                if xfetch_enabled {
+                                    if let Some(rem_ttl) = rem_ttl_opt {
+                                        let beta =
+                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                                .map(|cfg| cfg.xfetch_beta)
+                                                .unwrap_or(1.0);
+                                        if crate::result_cache::xfetch::should_refresh(rem_ttl as f64, 0.1, beta) {
+                                            crate::stats::ResultCache::xfetch_trigger();
+                                        }
+                                    }
+                                }
+
+                                crate::stats::ResultCache::hit(payload.len());
+                                let bytes_sent = context.stream.send_raw_flush(&payload).await?;
+                                self.stats.sent(bytes_sent);
+                                self.set_state(State::Idle);
+                                return Ok(());
+                            }
+
+                            crate::stats::ResultCache::miss();
+
+                            let singleflight_enabled =
+                                crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                    .map(|cfg| cfg.singleflight_enabled)
+                                    .unwrap_or(true);
+
+                            let mut singleflight_guard = None;
+
+                            if singleflight_enabled {
+                                let status = cache.singleflight().enter(&key.redis_key).await;
+                                match status {
+                                    crate::result_cache::singleflight::SingleflightStatus::Leader(guard) => {
+                                        let dist_enabled =
+                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                                .map(|cfg| cfg.distributed_singleflight_enabled)
+                                                .unwrap_or(true);
+
+                                        if dist_enabled {
+                                            let lock_timeout_ms =
+                                                crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                                    .map(|cfg| cfg.distributed_singleflight_timeout_ms)
+                                                    .unwrap_or(3000);
+                                            let acquired =
+                                                cache.acquire_distributed_lock(&key.redis_key, lock_timeout_ms).await;
+                                            if !acquired {
+                                                let wait_timeout = std::time::Duration::from_millis(lock_timeout_ms);
+                                                if let Some(dist_payload) =
+                                                    cache.wait_for_distributed_key(&key, wait_timeout).await
+                                                {
+                                                    crate::stats::ResultCache::distributed_singleflight_joined(dist_payload.len());
+                                                    guard.finish(crate::result_cache::singleflight::SingleflightResult::Success(dist_payload.clone())).await;
+                                                    let bytes_sent = context.stream.send_raw_flush(&dist_payload).await?;
+                                                    self.stats.sent(bytes_sent);
+                                                    self.set_state(State::Idle);
+                                                    return Ok(());
+                                                }
+                                            }
+                                        }
+
+                                        singleflight_guard = Some(guard);
+                                    }
+                                    crate::result_cache::singleflight::SingleflightStatus::Follower(mut rx) => {
+                                        let timeout_ms =
+                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
+                                                .map(|cfg| cfg.singleflight_timeout_ms)
+                                                .unwrap_or(5000);
+                                        let timeout = std::time::Duration::from_millis(timeout_ms);
+                                        match tokio::time::timeout(timeout, rx.recv()).await {
+                                            Ok(Ok(crate::result_cache::singleflight::SingleflightResult::Success(payload))) => {
+                                                crate::stats::ResultCache::singleflight_joined(payload.len());
+                                                let bytes_sent = context.stream.send_raw_flush(&payload).await?;
+                                                self.stats.sent(bytes_sent);
+                                                self.set_state(State::Idle);
+                                                return Ok(());
+                                            }
+                                            _ => {
+                                                crate::stats::ResultCache::singleflight_timeout();
+                                                // Fallback to normal execution on DB
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            self.result_cache_capture = Some(ResultCacheCapture {
+                                key,
+                                db: cluster.name().to_string(),
+                                tables: req.tables.clone(),
+                                bytes: Vec::new(),
+                                errored: false,
+                                singleflight_guard,
+                            });
+                        }
                     }
                 }
             }
