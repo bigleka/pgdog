@@ -1,8 +1,9 @@
 [[databases]]
-name = "database_name"
-host = "server_address"
+name = "postgres"
+host = "shard_0"
+port = 5432
 role = "primary"
-#shard = 0
+
 
 #[[databases]]
 #name = "database_name"
@@ -17,3 +18,16 @@ expire_seconds = 60
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
 encryption_key = "uma-chave-secreta-muito-longa-e-dificil-de-adivinhar-aqui-321"
+singleflight_enabled = true
+singleflight_timeout_ms = 5000
+adaptive_ttl_enabled = true
+max_expire_seconds = 300
+xfetch_enabled = true
+xfetch_beta = 1.0
+xfetch_delta_secs = 0.2
+distributed_singleflight_enabled = true
+distributed_singleflight_timeout_ms = 3000
+read_after_write_consistency_enabled = true
+read_after_write_window_ms = 2000
+
+

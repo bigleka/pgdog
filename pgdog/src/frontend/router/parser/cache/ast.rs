@@ -252,6 +252,30 @@ impl Ast {
         }
     }
 
+    /// Returns true if this statement modifies tables or schema.
+    pub fn is_write_statement(&self) -> bool {
+        let root = self
+            .ast
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|s| s.node.as_ref());
+
+        matches!(
+            root,
+            Some(NodeEnum::InsertStmt(_))
+                | Some(NodeEnum::UpdateStmt(_))
+                | Some(NodeEnum::DeleteStmt(_))
+                | Some(NodeEnum::CopyStmt(_))
+                | Some(NodeEnum::CreateStmt(_))
+                | Some(NodeEnum::DropStmt(_))
+                | Some(NodeEnum::AlterTableStmt(_))
+                | Some(NodeEnum::TruncateStmt(_))
+        )
+    }
+
+
     /// Get a pre-computed fingerprint, or compute it again.
     pub fn fingerprint(&self) -> Result<&Fingerprint, Error> {
         if let Some(fingerprint) = self.fingerprint.get() {

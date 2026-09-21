@@ -8,6 +8,12 @@ static STORES: AtomicU64 = AtomicU64::new(0);
 static BYTES_SERVED: AtomicU64 = AtomicU64::new(0);
 static BYTES_STORED: AtomicU64 = AtomicU64::new(0);
 static REDIS_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SINGLEFLIGHT_JOINED: AtomicU64 = AtomicU64::new(0);
+static SINGLEFLIGHT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static TTL_EXTENDED: AtomicU64 = AtomicU64::new(0);
+static XFETCH_TRIGGERS: AtomicU64 = AtomicU64::new(0);
+static DISTRIBUTED_SINGLEFLIGHT_JOINED: AtomicU64 = AtomicU64::new(0);
+static READ_AFTER_WRITE_BYPASSES: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
     name: String,
@@ -35,6 +41,34 @@ impl ResultCache {
 
     pub fn redis_error() {
         REDIS_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn singleflight_joined(bytes: usize) {
+        SINGLEFLIGHT_JOINED.fetch_add(1, Ordering::Relaxed);
+        HITS.fetch_add(1, Ordering::Relaxed);
+        BYTES_SERVED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn singleflight_timeout() {
+        SINGLEFLIGHT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn ttl_extended() {
+        TTL_EXTENDED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn xfetch_trigger() {
+        XFETCH_TRIGGERS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn distributed_singleflight_joined(bytes: usize) {
+        DISTRIBUTED_SINGLEFLIGHT_JOINED.fetch_add(1, Ordering::Relaxed);
+        HITS.fetch_add(1, Ordering::Relaxed);
+        BYTES_SERVED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn read_after_write_bypass() {
+        READ_AFTER_WRITE_BYPASSES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics() -> Vec<Metric> {
@@ -73,6 +107,42 @@ impl ResultCache {
                 name: "result_cache_redis_errors".into(),
                 help: "Redis errors encountered by result cache".into(),
                 value: REDIS_ERRORS.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_singleflight_joined".into(),
+                help: "Singleflight joined count (follower requests coalesced)".into(),
+                value: SINGLEFLIGHT_JOINED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_singleflight_timeouts".into(),
+                help: "Singleflight waiter timeouts".into(),
+                value: SINGLEFLIGHT_TIMEOUTS.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_ttl_extended".into(),
+                help: "Adaptive TTL extensions performed".into(),
+                value: TTL_EXTENDED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_xfetch_triggers".into(),
+                help: "XFetch probabilistic early background refreshes triggered".into(),
+                value: XFETCH_TRIGGERS.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_distributed_singleflight_joined".into(),
+                help: "Distributed cross-node singleflight requests coalesced".into(),
+                value: DISTRIBUTED_SINGLEFLIGHT_JOINED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_read_after_write_bypasses".into(),
+                help: "Cache lookups bypassed due to read-after-write session consistency".into(),
+                value: READ_AFTER_WRITE_BYPASSES.load(Ordering::Relaxed),
                 gauge: false,
             }),
         ]

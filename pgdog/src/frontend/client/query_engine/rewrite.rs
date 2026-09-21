@@ -37,15 +37,16 @@ impl QueryEngine {
             .map(|cluster| cluster.use_query_parser(context.client_request))
             .unwrap_or(false);
 
-        // Force parser for SELECTs if result cache is enabled,
-        // so we can identify tables for caching/invalidation.
+        // Force parser for SELECTs and DMLs (INSERT, UPDATE, DELETE) if result cache is enabled,
+        // so we can identify tables for caching and table-based invalidation.
         if !use_parser && self.result_cache.is_some() {
             if let Ok(Some(q)) = context.client_request.query() {
-                if q.query()
-                    .trim_start()
-                    .get(..6)
-                    .map(|s| s.eq_ignore_ascii_case("select"))
-                    .unwrap_or(false)
+                let trimmed = q.query().trim_start();
+                let first_word = trimmed.split_whitespace().next().unwrap_or_default();
+                if first_word.eq_ignore_ascii_case("select")
+                    || first_word.eq_ignore_ascii_case("insert")
+                    || first_word.eq_ignore_ascii_case("update")
+                    || first_word.eq_ignore_ascii_case("delete")
                 {
                     use_parser = true;
                 }

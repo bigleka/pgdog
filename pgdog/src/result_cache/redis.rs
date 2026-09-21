@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::{CacheableRequest, ResultCacheKey};
+use super::singleflight::SingleflightGroup;
 
 #[derive(Debug, Clone)]
 pub struct ResultCacheConfig {
@@ -26,6 +27,17 @@ pub struct ResultCacheConfig {
     pub max_entry_bytes: usize,
     pub encryption_key: Option<String>,
     pub key_prefix: String,
+    pub singleflight_enabled: bool,
+    pub singleflight_timeout_ms: u64,
+    pub adaptive_ttl_enabled: bool,
+    pub max_expire_seconds: u64,
+    pub xfetch_enabled: bool,
+    pub xfetch_beta: f64,
+    pub xfetch_delta_secs: f64,
+    pub distributed_singleflight_enabled: bool,
+    pub distributed_singleflight_timeout_ms: u64,
+    pub read_after_write_consistency_enabled: bool,
+    pub read_after_write_window_ms: u64,
     pub safe_schema_list: Vec<Regex>,
     pub unsafe_schema_list: Vec<Regex>,
     pub safe_table_list: Vec<Regex>,
@@ -48,12 +60,24 @@ impl ResultCacheConfig {
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
             encryption_key: rc.encryption_key,
             key_prefix: rc.key_prefix.unwrap_or_else(|| "pgdog:result_cache".to_string()),
+            singleflight_enabled: rc.singleflight_enabled.unwrap_or(true),
+            singleflight_timeout_ms: rc.singleflight_timeout_ms.unwrap_or(5000),
+            adaptive_ttl_enabled: rc.adaptive_ttl_enabled.unwrap_or(true),
+            max_expire_seconds: rc.max_expire_seconds.unwrap_or(300),
+            xfetch_enabled: rc.xfetch_enabled.unwrap_or(true),
+            xfetch_beta: rc.xfetch_beta.unwrap_or(1.0),
+            xfetch_delta_secs: rc.xfetch_delta_secs.unwrap_or(0.2),
+            distributed_singleflight_enabled: rc.distributed_singleflight_enabled.unwrap_or(true),
+            distributed_singleflight_timeout_ms: rc.distributed_singleflight_timeout_ms.unwrap_or(3000),
+            read_after_write_consistency_enabled: rc.read_after_write_consistency_enabled.unwrap_or(true),
+            read_after_write_window_ms: rc.read_after_write_window_ms.unwrap_or(2000),
             safe_schema_list: compile_list(&rc.cache_safe_schema_list),
             unsafe_schema_list: compile_list(&rc.cache_unsafe_schema_list),
             safe_table_list: compile_list(&rc.cache_safe_table_list),
             unsafe_table_list: compile_list(&rc.cache_unsafe_table_list),
         })
     }
+
 
     pub fn ttl(&self) -> Option<Duration> {
         self.expire_seconds.map(Duration::from_secs)
@@ -101,6 +125,7 @@ struct Shared {
 #[derive(Debug, Clone)]
 pub struct RedisResultCache {
     shared: Arc<RwLock<Shared>>,
+    singleflight: SingleflightGroup,
 }
 
 impl Default for RedisResultCache {
@@ -111,11 +136,16 @@ impl Default for RedisResultCache {
                 manager: None,
                 prefix: "pgdog:result_cache".into(),
             })),
+            singleflight: SingleflightGroup::new(),
         }
     }
 }
 
 impl RedisResultCache {
+    pub fn singleflight(&self) -> &SingleflightGroup {
+        &self.singleflight
+    }
+
     pub async fn global() -> Option<Self> {
         let cfg = ResultCacheConfig::from_global_config()?;
         let cache = Self::default();
@@ -189,7 +219,7 @@ impl RedisResultCache {
         })
     }
 
-    pub async fn get(&self, key: &ResultCacheKey) -> Option<Vec<u8>> {
+    pub async fn get_with_ttl(&self, key: &ResultCacheKey) -> Option<(Vec<u8>, Option<i64>)> {
         let Some(cfg) = ResultCacheConfig::from_global_config() else {
             return None;
         };
@@ -204,11 +234,13 @@ impl RedisResultCache {
         };
 
         let res: redis::RedisResult<Vec<u8>> = conn.get(&key.redis_key).await;
+        let mut original_rem_ttl = None;
+
         if let Ok(ref bytes) = res {
             if !bytes.is_empty() {
-                if let Some(ttl) = key.ttl {
-                    let _: redis::RedisResult<()> = conn.expire(&key.redis_key, ttl.as_secs() as i64).await;
-                }
+                let rem_ttl_res: redis::RedisResult<i64> = conn.ttl(&key.redis_key).await;
+                let rem_ttl = rem_ttl_res.unwrap_or(0);
+                original_rem_ttl = Some(rem_ttl);
             }
         }
 
@@ -217,7 +249,7 @@ impl RedisResultCache {
 
         match res {
             Ok(bytes) if !bytes.is_empty() => {
-                if let Some(enc_key) = &cfg.encryption_key {
+                let payload = if let Some(enc_key) = &cfg.encryption_key {
                     // Decrypt the value
                     match decrypt(enc_key, &bytes) {
                         Some(plaintext) => Some(plaintext),
@@ -233,7 +265,9 @@ impl RedisResultCache {
                 } else {
                     // No encryption key, return as is
                     Some(bytes)
-                }
+                };
+
+                payload.map(|p| (p, original_rem_ttl))
             }
             Ok(_) => None,
             Err(err) => {
@@ -242,6 +276,135 @@ impl RedisResultCache {
                 None
             }
         }
+    }
+
+    /// Extend remaining TTL for a cached key under Adaptive TTL or sliding expiration.
+    pub async fn extend_ttl(&self, key: &ResultCacheKey, current_rem_ttl: i64) {
+        let Some(cfg) = ResultCacheConfig::from_global_config() else {
+            return;
+        };
+        if self.ensure_connected(&cfg).await.is_none() {
+            return;
+        }
+
+        let mut conn = {
+            let mut shared = self.shared.write();
+            match shared.manager.take() {
+                Some(m) => m,
+                None => return,
+            }
+        };
+
+        if cfg.adaptive_ttl_enabled {
+            if let Some(base_ttl) = key.ttl {
+                let max_ttl_secs = cfg.max_expire_seconds as i64;
+                let base_ttl_secs = base_ttl.as_secs() as i64;
+                if current_rem_ttl > 0 && current_rem_ttl < max_ttl_secs {
+                    let new_ttl = (current_rem_ttl + base_ttl_secs).min(max_ttl_secs);
+                    let _: redis::RedisResult<()> = conn.expire(&key.redis_key, new_ttl).await;
+                    crate::stats::ResultCache::ttl_extended();
+                } else if current_rem_ttl <= 0 {
+                    let _: redis::RedisResult<()> = conn.expire(&key.redis_key, base_ttl_secs).await;
+                }
+            }
+        } else if let Some(ttl) = key.ttl {
+            let _: redis::RedisResult<()> = conn.expire(&key.redis_key, ttl.as_secs() as i64).await;
+        }
+
+        let mut shared = self.shared.write();
+        shared.manager = Some(conn);
+    }
+
+    pub async fn get(&self, key: &ResultCacheKey) -> Option<Vec<u8>> {
+        self.get_with_ttl(key).await.map(|(bytes, _)| bytes)
+    }
+
+    pub async fn acquire_distributed_lock(&self, redis_key: &str, lock_ttl_ms: u64) -> bool {
+        let Some(cfg) = ResultCacheConfig::from_global_config() else {
+            return false;
+        };
+        if self.ensure_connected(&cfg).await.is_none() {
+            return false;
+        }
+
+        let mut conn = {
+            let mut shared = self.shared.write();
+            match shared.manager.take() {
+                Some(m) => m,
+                None => return false,
+            }
+        };
+
+        let lock_key = format!("{}:lock:{}", cfg.key_prefix, redis_key);
+        let opts = redis::SetOptions::default()
+            .conditional_set(redis::ExistenceCheck::NX)
+            .with_expiration(redis::SetExpiry::PX(lock_ttl_ms));
+
+        let res: redis::RedisResult<Option<String>> = conn.set_options(&lock_key, "1", opts).await;
+
+        let mut shared = self.shared.write();
+        shared.manager = Some(conn);
+
+        matches!(res, Ok(Some(_)))
+    }
+
+    pub async fn release_distributed_lock(&self, redis_key: &str) {
+        let Some(cfg) = ResultCacheConfig::from_global_config() else {
+            return;
+        };
+        if self.ensure_connected(&cfg).await.is_none() {
+            return;
+        }
+
+        let mut conn = {
+            let mut shared = self.shared.write();
+            match shared.manager.take() {
+                Some(m) => m,
+                None => return,
+            }
+        };
+
+        let lock_key = format!("{}:lock:{}", cfg.key_prefix, redis_key);
+        let _: redis::RedisResult<()> = conn.del(&lock_key).await;
+
+        let mut shared = self.shared.write();
+        shared.manager = Some(conn);
+    }
+
+    pub async fn wait_for_distributed_key(&self, key: &ResultCacheKey, timeout: Duration) -> Option<Vec<u8>> {
+        let start = std::time::Instant::now();
+        let interval = Duration::from_millis(40);
+        while start.elapsed() < timeout {
+            tokio::time::sleep(interval).await;
+            if let Some(payload) = self.get(key).await {
+                return Some(payload);
+            }
+        }
+        None
+    }
+
+    /// Evict a cached key from Redis. Used by XFetch to force a refresh
+    /// on the next request while the current request still serves stale data.
+    pub async fn evict(&self, key: &ResultCacheKey) {
+        let Some(cfg) = ResultCacheConfig::from_global_config() else {
+            return;
+        };
+        if self.ensure_connected(&cfg).await.is_none() {
+            return;
+        }
+
+        let mut conn = {
+            let mut shared = self.shared.write();
+            match shared.manager.take() {
+                Some(m) => m,
+                None => return,
+            }
+        };
+
+        let _: redis::RedisResult<()> = conn.del(&key.redis_key).await;
+
+        let mut shared = self.shared.write();
+        shared.manager = Some(conn);
     }
 
     pub async fn set(&self, key: &ResultCacheKey, payload: &[u8]) {
@@ -369,8 +532,11 @@ impl RedisResultCache {
             let keys: redis::RedisResult<Vec<String>> = conn.smembers(&set_key).await;
             match keys {
                 Ok(keys) => {
-                    if !keys.is_empty() {
-                        let _: redis::RedisResult<()> = conn.del(keys).await;
+                    for k in &keys {
+                        let res: redis::RedisResult<()> = conn.del(k).await;
+                        if let Err(err) = res {
+                            warn!("result_cache invalidate key {} failed: {}", k, err);
+                        }
                     }
                     let _: redis::RedisResult<()> = conn.del(&set_key).await;
                 }

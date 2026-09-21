@@ -58,80 +58,41 @@ SELECT * FROM payments WHERE user_id = 1;
 
 ## Features
 
-### Result Cache (Redis)
+### Result Cache (Redis / Valkey)
 
-PgDog includes a **Redis-backed query result cache** capable of caching `SELECT` queries to drastically improve read latency. It intelligently invalidates cache entries *only* when a DML/DDL transaction is successfully committed.
+PgDog includes a high-performance **L7 Wire-Level Result Cache** backed by Redis or Valkey/Dragonfly. On cache hits, PgDog directly replays raw PostgreSQL protocol wire packets, bypassing query parsing, routing, and database execution entirely (achieving sub-millisecond latencies).
 
-#### How it works
+**Key Capabilities:**
+- ⚡ **Wire Replay Engine**: Stores PostgreSQL backend messages directly in Redis for 0ms execution overhead.
+- 🏷️ **Tag-based DML Invalidation**: Automatically parses write queries (`INSERT`, `UPDATE`, `DELETE`) and flushes cache keys associated with affected tables.
+- 🛡️ **Tiered Singleflight Protection**: Eliminates cache stampedes using in-memory request coalescing within instances and Redis distributed locks across multi-instance PgDog clusters.
+- 🔄 **Probabilistic Early Recomputation (XFetch)**: Pre-refreshes hot keys before expiration (Vattani et al. algorithm) without evicting cached values, guaranteeing zero latency for concurrent readers.
+- 📈 **Adaptive Dynamic TTL**: Dynamically scales expiration time for frequently requested keys up to a configurable ceiling.
+- 🔍 **Read-After-Write (RAW) Consistency**: Bypasses cache within a configurable session window (e.g. 2s) for tables modified in the same client session, guaranteeing read-your-own-writes consistency.
+- 🔒 **At-Rest AES-256-GCM Encryption**: Secure wire payloads stored in Redis using authenticated symmetric encryption.
 
-- **Caching**: Stores the Postgres protocol response for read queries directly in Redis. Subsequent identical queries will hit the cache instead of the Postgres shards.
-- **Smart Invalidation**: When an `INSERT`, `UPDATE`, or `DELETE` statement is parsed, PgDog identifies the affected tables. It waits for the transaction to successfully `COMMIT` (or the autocommit to finish) before removing the associated keys from Redis. If the transaction rolls back or fails, the cache is preserved.
-
-#### Configuration
-
-To enable the result cache, add the `[result_cache]` section to your `pgdog.toml`:
+Example configuration:
 
 ```toml
 [result_cache]
 enabled = true
-# Provide the URL of your Redis server
 redis_url = "redis://127.0.0.1:6379"
-# Default Time-To-Live for cache entries
 expire_seconds = 30
-# Maximum size of a single cached response
 max_entry_bytes = 524288
-# Prefix for all Redis keys
 key_prefix = "pgdog:result_cache"
+singleflight_enabled = true
+adaptive_ttl_enabled = true
+max_expire_seconds = 300
+xfetch_enabled = true
+xfetch_beta = 1.0
+xfetch_delta_secs = 0.2
+distributed_singleflight_enabled = true
+read_after_write_consistency_enabled = true
+read_after_write_window_ms = 2000
+# encryption_key = "a-long-random-secret"
 ```
 
-Result Cache Encryption (result_cache)
-To increase security and protect sensitive data that may be cached, PgDog supports encryption of values ​​in the Redis result cache. This ensures that even in the event of unauthorized access or misconfiguration of the Redis instance, the cache data remains unreadable.
-
-How it Works
-When an encryption key is provided in the configuration, PgDog uses the AES-256-GCM algorithm to:
-
-Encrypt the query results before saving them to Redis.
-Decrypt the results when retrieving them from the cache, before sending them to the client.
-This process is completely transparent to the client application. The key provided in the configuration is internally processed with SHA-256 to derive a secure 256-bit encryption key.
-
-Configuration
-Encryption is enabled by adding the encryption_key option to the [result_cache] section of your pgdog.toml file.
-
-Example 1: Encryption Disabled (Default Behavior)
-By default, encryption is disabled. Data is stored in plain text in Redis. This occurs when the encryption_key is missing or commented out.
-
-# pgdog.toml
-
-```toml
-[result_cache]
-enabled = true
-redis_url = "redis://127.0.0.1:6379"
-expire_seconds = 30
-# A linha encryption_key está ausente ou comentada.
-# encryption_key = "..."
-```
-
-Expected Result in Redis: The value associated with a cache key will be the result of the query in binary format, readable by anyone with access to Redis.
-
-Example 2: Encryption Enabled
-To enable encryption, uncomment and set a value for encryption_key. It is recommended to use a long, random, and secret string for maximum security.
-
-# pgdog.toml
-```toml
-[result_cache]
-enabled = true
-redis_url = "redis://127.0.0.1:6379"
-expire_seconds = 30
-# Ativa a criptografia com a chave secreta fornecida.
-encryption_key = "uma-chave-secreta-muito-longa-e-dificil-de-adivinhar-aqui-321"
-```
-
-Expected Result in Redis: The value associated with a cache key will be a block of encrypted binary data. Attempting to read this value directly in Redis (using GET in redis-cli, for example) will result in unreadable data, protecting against accidental leaks.
-
-Security and Performance Considerations
-Key Security: The encryption_key is a secret and should be treated as such. Avoid committing it to public repositories. For production environments, consider using a secret management system and loading the key via an environment variable (a planned future improvement).
-
-Performance: AES-256-GCM encryption is extremely fast on modern hardware, especially on CPUs that support AES-NI. The impact on latency for cache operations (get/set) is generally minimal (on the order of microseconds). For the vast majority of applications, the security gain far outweighs the small performance cost.
+For complete architectural details, invalidation rules, and Prometheus metrics, see **[docs/RESULT_CACHE.md](docs/RESULT_CACHE.md)**.
 
 &#128216; **[Configuration](https://docs.pgdog.dev/configuration/)**
 

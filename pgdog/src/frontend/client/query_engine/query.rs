@@ -265,7 +265,8 @@ impl QueryEngine {
 
             // Store cached payload at the end of a successful exchange.
             if let Some(capture) = self.result_cache_capture.take() {
-                if !capture.errored {
+                let success = !capture.errored && !capture.bytes.is_empty();
+                if success {
                     if let Some(ref cache) = self.result_cache {
                         cache
                             .set_with_table_tags(
@@ -277,6 +278,17 @@ impl QueryEngine {
                             .await;
                         crate::stats::ResultCache::store(capture.bytes.len());
                     }
+                }
+                if let Some(ref cache) = self.result_cache {
+                    cache.release_distributed_lock(&capture.key.redis_key).await;
+                }
+                if let Some(guard) = capture.singleflight_guard {
+                    let result = if success {
+                        crate::result_cache::singleflight::SingleflightResult::Success(capture.bytes)
+                    } else {
+                        crate::result_cache::singleflight::SingleflightResult::Error
+                    };
+                    guard.finish(result).await;
                 }
             }
         }
