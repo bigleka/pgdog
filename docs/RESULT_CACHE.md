@@ -85,9 +85,22 @@ Default `expire_seconds` is **30** if omitted.
 
 ## XFetch
 
-`xfetch_enabled` / `xfetch_beta` evaluate a probabilistic “refresh soon” condition on hits (XFetch: `-beta * delta * ln(u) > remaining_ttl`).
+`xfetch_enabled` / `xfetch_beta` / `xfetch_delta_secs` evaluate the optimal probabilistic early refresh algorithm (Vattani et al.):
 
-**Current behavior:** when the condition fires, PgDog increments the `result_cache_xfetch_triggers` metric only. It does **not** yet recompute the query in the background. The client still receives the cached payload.
+$$- \beta \times \delta \times \ln(u) > T_{\text{remaining}}$$
+
+- `xfetch_beta` (default `1.0`): aggressiveness multiplier.
+- `xfetch_delta_secs` (default `0.2`): estimated query compute duration in seconds.
+
+### How Early Refresh Works (Zero Latency for Concurrent Readers)
+
+1. When a cache hit occurs, PgDog measures the remaining TTL ($T_{\text{remaining}}$).
+2. If the XFetch condition fires:
+   - PgDog increments the `result_cache_xfetch_triggers` metric.
+   - It attempts to acquire a singleflight leadership and Redis distributed lock for the key.
+   - **If the lock is acquired**: This specific connection acts as the designated **Refresher**. It recomputes the query against PostgreSQL, updates Redis with the fresh payload and reset TTL, and releases the lock.
+   - **If the lock is already held** (another connection or node is already refreshing): The request **does not wait** and does **not** hit PostgreSQL; it immediately serves the existing cached payload with **0ms added latency**.
+3. **The cached key is never deleted prematurely**. All concurrent requests continue to enjoy cache hits while the single leader performs the background refresh.
 
 ## Encryption
 

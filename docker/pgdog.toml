@@ -24,6 +24,7 @@ adaptive_ttl_enabled = true
 max_expire_seconds = 300
 xfetch_enabled = true
 xfetch_beta = 1.0
+xfetch_delta_secs = 0.2
 distributed_singleflight_enabled = true
 distributed_singleflight_timeout_ms = 3000
 read_after_write_consistency_enabled = true

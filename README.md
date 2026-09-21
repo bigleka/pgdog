@@ -58,11 +58,20 @@ SELECT * FROM payments WHERE user_id = 1;
 
 ## Features
 
-### Result Cache (Redis)
+### Result Cache (Redis / Valkey)
 
-PgDog can cache **read** results in Redis (or Valkey/Dragonfly) and replay the PostgreSQL wire response on a hit. Writes invalidate tagged keys per table; optional AES-256-GCM encryption, singleflight, adaptive TTL, and read-after-write bypass are available.
+PgDog includes a high-performance **L7 Wire-Level Result Cache** backed by Redis or Valkey/Dragonfly. On cache hits, PgDog directly replays raw PostgreSQL protocol wire packets, bypassing query parsing, routing, and database execution entirely (achieving sub-millisecond latencies).
 
-Minimal config:
+**Key Capabilities:**
+- ⚡ **Wire Replay Engine**: Stores PostgreSQL backend messages directly in Redis for 0ms execution overhead.
+- 🏷️ **Tag-based DML Invalidation**: Automatically parses write queries (`INSERT`, `UPDATE`, `DELETE`) and flushes cache keys associated with affected tables.
+- 🛡️ **Tiered Singleflight Protection**: Eliminates cache stampedes using in-memory request coalescing within instances and Redis distributed locks across multi-instance PgDog clusters.
+- 🔄 **Probabilistic Early Recomputation (XFetch)**: Pre-refreshes hot keys before expiration (Vattani et al. algorithm) without evicting cached values, guaranteeing zero latency for concurrent readers.
+- 📈 **Adaptive Dynamic TTL**: Dynamically scales expiration time for frequently requested keys up to a configurable ceiling.
+- 🔍 **Read-After-Write (RAW) Consistency**: Bypasses cache within a configurable session window (e.g. 2s) for tables modified in the same client session, guaranteeing read-your-own-writes consistency.
+- 🔒 **At-Rest AES-256-GCM Encryption**: Secure wire payloads stored in Redis using authenticated symmetric encryption.
+
+Example configuration:
 
 ```toml
 [result_cache]
@@ -71,10 +80,19 @@ redis_url = "redis://127.0.0.1:6379"
 expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
+singleflight_enabled = true
+adaptive_ttl_enabled = true
+max_expire_seconds = 300
+xfetch_enabled = true
+xfetch_beta = 1.0
+xfetch_delta_secs = 0.2
+distributed_singleflight_enabled = true
+read_after_write_consistency_enabled = true
+read_after_write_window_ms = 2000
 # encryption_key = "a-long-random-secret"
 ```
 
-Full options, invalidation behavior, metrics, and limitations: **[docs/RESULT_CACHE.md](docs/RESULT_CACHE.md)**.
+For complete architectural details, invalidation rules, and Prometheus metrics, see **[docs/RESULT_CACHE.md](docs/RESULT_CACHE.md)**.
 
 &#128216; **[Configuration](https://docs.pgdog.dev/configuration/)**
 

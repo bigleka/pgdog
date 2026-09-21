@@ -17,8 +17,8 @@ pub fn should_refresh(rem_ttl_secs: f64, delta_secs: f64, beta: f64) -> bool {
         return false;
     }
 
-    let mut rng = rand::thread_rng();
-    let u: f64 = rng.gen_range(0.0001..1.0); // Avoid ln(0.0)
+    let mut rng = rand::rng();
+    let u: f64 = rng.random_range(0.0001..1.0); // Avoid ln(0.0)
 
     let threshold = -beta * delta_secs * u.ln();
     threshold > rem_ttl_secs

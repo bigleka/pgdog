@@ -286,9 +286,10 @@ singleflight_timeout_ms = 5000
 # Extend TTL on hit, capped by max_expire_seconds.
 adaptive_ttl_enabled = true
 max_expire_seconds = 300
-# XFetch probabilistic refresh condition (currently metric-only).
+# XFetch probabilistic early refresh before expiration.
 xfetch_enabled = true
 xfetch_beta = 1.0
+xfetch_delta_secs = 0.2
 # Cross-process stampede protection via Redis NX lock.
 distributed_singleflight_enabled = true
 distributed_singleflight_timeout_ms = 3000

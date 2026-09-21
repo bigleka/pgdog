@@ -42,6 +42,9 @@ pub struct ResultCache {
     /// Aggressiveness factor beta for XFetch probabilistic early recomputation. Defaults to 1.0.
     pub xfetch_beta: Option<f64>,
 
+    /// Estimated query computation duration in seconds for XFetch early recomputation. Defaults to 0.2s.
+    pub xfetch_delta_secs: Option<f64>,
+
     /// Enable distributed singleflight across cluster nodes via Redis. Defaults to true if not specified.
     pub distributed_singleflight_enabled: Option<bool>,
 

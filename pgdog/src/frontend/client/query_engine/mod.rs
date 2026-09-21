@@ -229,90 +229,110 @@ impl QueryEngine {
                                 .build_key(cluster.name(), user, context.params, &req)
                                 .await
                         {
+                            let mut singleflight_guard = None;
+                            let rc_cfg = crate::result_cache::redis::ResultCacheConfig::from_global_config();
+
                             if let Some((payload, rem_ttl_opt)) = cache.get_with_ttl(&key).await {
-                                let xfetch_enabled =
-                                    crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                        .map(|cfg| cfg.xfetch_enabled)
-                                        .unwrap_or(true);
+                                let xfetch_enabled = rc_cfg.as_ref().map(|c| c.xfetch_enabled).unwrap_or(true);
+                                let mut become_refresher = false;
 
                                 if xfetch_enabled {
                                     if let Some(rem_ttl) = rem_ttl_opt {
-                                        let beta =
-                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                                .map(|cfg| cfg.xfetch_beta)
-                                                .unwrap_or(1.0);
-                                        if crate::result_cache::xfetch::should_refresh(rem_ttl as f64, 0.1, beta) {
+                                        let beta = rc_cfg.as_ref().map(|c| c.xfetch_beta).unwrap_or(1.0);
+                                        let delta = rc_cfg.as_ref().map(|c| c.xfetch_delta_secs).unwrap_or(0.2);
+                                        if crate::result_cache::xfetch::should_refresh(rem_ttl as f64, delta, beta) {
                                             crate::stats::ResultCache::xfetch_trigger();
+
+                                            // Attempt to become the single designated refresher.
+                                            // 1. Enter local in-memory singleflight.
+                                            // 2. If Leader, acquire the Redis distributed lock.
+                                            let singleflight_enabled = rc_cfg.as_ref().map(|c| c.singleflight_enabled).unwrap_or(true);
+                                            if singleflight_enabled {
+                                                if let crate::result_cache::singleflight::SingleflightStatus::Leader(guard) =
+                                                    cache.singleflight().enter(&key.redis_key).await
+                                                {
+                                                    let dist_enabled = rc_cfg.as_ref().map(|c| c.distributed_singleflight_enabled).unwrap_or(true);
+                                                    let acquired = if dist_enabled {
+                                                        let lock_timeout_ms = rc_cfg.as_ref().map(|c| c.distributed_singleflight_timeout_ms).unwrap_or(3000);
+                                                        cache.acquire_distributed_lock(&key.redis_key, lock_timeout_ms).await
+                                                    } else {
+                                                        true
+                                                    };
+
+                                                    if acquired {
+                                                        singleflight_guard = Some(guard);
+                                                        become_refresher = true;
+                                                        debug!("xfetch: designated as early refresher for key: {}", key.redis_key);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
 
-                                crate::stats::ResultCache::hit(payload.len());
-                                let bytes_sent = context.stream.send_raw_flush(&payload).await?;
-                                self.stats.sent(bytes_sent);
-                                self.set_state(State::Idle);
-                                return Ok(());
-                            }
+                                if !become_refresher {
+                                    // If not refreshing, apply adaptive TTL / sliding expiration
+                                    if let Some(rem_ttl) = rem_ttl_opt {
+                                        cache.extend_ttl(&key, rem_ttl).await;
+                                    }
 
-                            crate::stats::ResultCache::miss();
+                                    crate::stats::ResultCache::hit(payload.len());
+                                    let bytes_sent = context.stream.send_raw_flush(&payload).await?;
+                                    self.stats.sent(bytes_sent);
+                                    self.set_state(State::Idle);
+                                    return Ok(());
+                                }
+                            } else {
+                                crate::stats::ResultCache::miss();
 
-                            let singleflight_enabled =
-                                crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                    .map(|cfg| cfg.singleflight_enabled)
-                                    .unwrap_or(true);
+                                let singleflight_enabled =
+                                    rc_cfg.as_ref().map(|c| c.singleflight_enabled).unwrap_or(true);
 
-                            let mut singleflight_guard = None;
+                                if singleflight_enabled {
+                                    let status = cache.singleflight().enter(&key.redis_key).await;
+                                    match status {
+                                        crate::result_cache::singleflight::SingleflightStatus::Leader(guard) => {
+                                            let dist_enabled =
+                                                rc_cfg.as_ref().map(|c| c.distributed_singleflight_enabled).unwrap_or(true);
 
-                            if singleflight_enabled {
-                                let status = cache.singleflight().enter(&key.redis_key).await;
-                                match status {
-                                    crate::result_cache::singleflight::SingleflightStatus::Leader(guard) => {
-                                        let dist_enabled =
-                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                                .map(|cfg| cfg.distributed_singleflight_enabled)
-                                                .unwrap_or(true);
+                                            if dist_enabled {
+                                                let lock_timeout_ms =
+                                                    rc_cfg.as_ref().map(|c| c.distributed_singleflight_timeout_ms).unwrap_or(3000);
+                                                let acquired =
+                                                    cache.acquire_distributed_lock(&key.redis_key, lock_timeout_ms).await;
+                                                if !acquired {
+                                                    let wait_timeout = std::time::Duration::from_millis(lock_timeout_ms);
+                                                    if let Some(dist_payload) =
+                                                        cache.wait_for_distributed_key(&key, wait_timeout).await
+                                                    {
+                                                        crate::stats::ResultCache::distributed_singleflight_joined(dist_payload.len());
+                                                        guard.finish(crate::result_cache::singleflight::SingleflightResult::Success(dist_payload.clone())).await;
+                                                        let bytes_sent = context.stream.send_raw_flush(&dist_payload).await?;
+                                                        self.stats.sent(bytes_sent);
+                                                        self.set_state(State::Idle);
+                                                        return Ok(());
+                                                    }
+                                                }
+                                            }
 
-                                        if dist_enabled {
-                                            let lock_timeout_ms =
-                                                crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                                    .map(|cfg| cfg.distributed_singleflight_timeout_ms)
-                                                    .unwrap_or(3000);
-                                            let acquired =
-                                                cache.acquire_distributed_lock(&key.redis_key, lock_timeout_ms).await;
-                                            if !acquired {
-                                                let wait_timeout = std::time::Duration::from_millis(lock_timeout_ms);
-                                                if let Some(dist_payload) =
-                                                    cache.wait_for_distributed_key(&key, wait_timeout).await
-                                                {
-                                                    crate::stats::ResultCache::distributed_singleflight_joined(dist_payload.len());
-                                                    guard.finish(crate::result_cache::singleflight::SingleflightResult::Success(dist_payload.clone())).await;
-                                                    let bytes_sent = context.stream.send_raw_flush(&dist_payload).await?;
+                                            singleflight_guard = Some(guard);
+                                        }
+                                        crate::result_cache::singleflight::SingleflightStatus::Follower(mut rx) => {
+                                            let timeout_ms =
+                                                rc_cfg.as_ref().map(|c| c.singleflight_timeout_ms).unwrap_or(5000);
+                                            let timeout = std::time::Duration::from_millis(timeout_ms);
+                                            match tokio::time::timeout(timeout, rx.recv()).await {
+                                                Ok(Ok(crate::result_cache::singleflight::SingleflightResult::Success(payload))) => {
+                                                    crate::stats::ResultCache::singleflight_joined(payload.len());
+                                                    let bytes_sent = context.stream.send_raw_flush(&payload).await?;
                                                     self.stats.sent(bytes_sent);
                                                     self.set_state(State::Idle);
                                                     return Ok(());
                                                 }
-                                            }
-                                        }
-
-                                        singleflight_guard = Some(guard);
-                                    }
-                                    crate::result_cache::singleflight::SingleflightStatus::Follower(mut rx) => {
-                                        let timeout_ms =
-                                            crate::result_cache::redis::ResultCacheConfig::from_global_config()
-                                                .map(|cfg| cfg.singleflight_timeout_ms)
-                                                .unwrap_or(5000);
-                                        let timeout = std::time::Duration::from_millis(timeout_ms);
-                                        match tokio::time::timeout(timeout, rx.recv()).await {
-                                            Ok(Ok(crate::result_cache::singleflight::SingleflightResult::Success(payload))) => {
-                                                crate::stats::ResultCache::singleflight_joined(payload.len());
-                                                let bytes_sent = context.stream.send_raw_flush(&payload).await?;
-                                                self.stats.sent(bytes_sent);
-                                                self.set_state(State::Idle);
-                                                return Ok(());
-                                            }
-                                            _ => {
-                                                crate::stats::ResultCache::singleflight_timeout();
-                                                // Fallback to normal execution on DB
+                                                _ => {
+                                                    crate::stats::ResultCache::singleflight_timeout();
+                                                    // Fallback to normal execution on DB
+                                                }
                                             }
                                         }
                                     }
