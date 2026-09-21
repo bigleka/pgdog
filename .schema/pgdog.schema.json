@@ -21,17 +21,6 @@
         "$ref": "#/$defs/Database"
       }
     },
-    "result_cache": {
-      "description": "Redis-backed query result cache (MVP).\n\nCaches results of cacheable SELECT queries (simple protocol only).\nConservative invalidation: any write/DDL bumps a per-db generation,\neffectively invalidating all cached entries for that database.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ResultCache"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "general": {
       "description": "General settings are relevant to the operations of the pooler itself, or apply to all database pools.\n\nhttps://docs.pgdog.dev/configuration/pgdog.toml/general/",
       "$ref": "#/$defs/General",
@@ -194,6 +183,18 @@
       "default": {
         "pg_dump_path": "pg_dump"
       }
+    },
+    "result_cache": {
+      "description": "Result cache settings control Redis-backed caching of SELECT results.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultCache"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "rewrite": {
       "description": "Controls PgDog's automatic SQL rewrites for sharded databases. It affects sharding key updates and multi-tuple inserts.\n\n**Note:** Consider enabling two-phase commit when either feature is set to `rewrite`. Without it, rewrites are committed shard-by-shard and can leave partial changes if a transaction fails.\n\nhttps://docs.pgdog.dev/configuration/pgdog.toml/rewrite/",
@@ -499,39 +500,6 @@
       "additionalProperties": false,
       "required": [
         "name",
-      "host"
-    ]
-  },
-  "ResultCache": {
-    "description": "Redis-backed query result cache (MVP).",
-    "type": "object",
-    "properties": {
-      "enabled": {
-        "type": "boolean"
-      },
-      "redis_url": {
-        "type": "string"
-      },
-      "expire_seconds": {
-        "type": [ "integer", "null" ], "format": "uint64"
-      },
-      "max_entry_bytes": {
-        "type": [ "integer", "null" ], "format": "uint"
-      },
-      "encryption_key": {
-        "description": "Optional: A secret key for encrypting cached values in Redis. If set, values will be encrypted using AES-256-GCM. The key can be any string; it will be hashed to a 256-bit key. It is recommended to use a long, random string.",
-        "type": [ "string", "null" ]
-      },
-      "key_prefix": {
-        "type": [ "string", "null" ]
-      },
-      "cache_safe_schema_list": { "type": "array", "items": { "type": "string" } },
-      "cache_unsafe_schema_list": { "type": "array", "items": { "type": "string" } },
-      "cache_safe_table_list": { "type": "array", "items": { "type": "string" } },
-      "cache_unsafe_table_list": { "type": "array", "items": { "type": "string" } }
-    },
-    "required": [
-      "enabled",
         "host"
       ]
     },
@@ -1558,6 +1526,180 @@
           "default": "pg_dump"
         }
       }
+    },
+    "ResultCache": {
+      "type": "object",
+      "properties": {
+        "adaptive_ttl_enabled": {
+          "description": "Enable adaptive dynamic TTL for frequently requested keys. Defaults to true if not specified.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "cache_safe_schema_list": {
+          "description": "Optional allow-list of schemas whose tables can be cached.\n\nEach entry is treated as a regular expression.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_safe_table_list": {
+          "description": "Optional allow-list of tables whose results can be cached.\n\nEach entry is treated as a regular expression and matched against\neither `table` or `schema.table` when schema is present.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_unsafe_schema_list": {
+          "description": "Optional deny-list of schemas whose tables should never be cached.\n\nTakes precedence over `cache_safe_schema_list`.\nEach entry is treated as a regular expression.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_unsafe_table_list": {
+          "description": "Optional deny-list of tables whose results should never be cached.\n\nTakes precedence over `cache_safe_table_list`.\nEach entry is treated as a regular expression and matched against\neither `table` or `schema.table` when schema is present.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "distributed_singleflight_enabled": {
+          "description": "Enable distributed singleflight across cluster nodes via Redis. Defaults to true if not specified.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "distributed_singleflight_timeout_ms": {
+          "description": "Timeout in milliseconds for distributed singleflight waiters. Defaults to 3000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "enabled": {
+          "description": "Enable Redis/RESP result cache.",
+          "type": "boolean",
+          "default": false
+        },
+        "encryption_key": {
+          "description": "Optional secret key for encryption.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expire_seconds": {
+          "description": "Optional expiration time for cached entries (seconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "granular_invalidation_enabled": {
+          "description": "Enable granular row/key-level cache invalidation. Reserved for future use.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key_prefix": {
+          "description": "Key prefix in Redis.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_entry_bytes": {
+          "description": "Maximum entry size to cache (bytes). If not set, PgDog uses a safe default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_expire_seconds": {
+          "description": "Maximum expiration time for cached entries under adaptive TTL (seconds). Defaults to 300s.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "read_after_write_consistency_enabled": {
+          "description": "Enable read-after-write session consistency. Defaults to true if not specified.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "read_after_write_window_ms": {
+          "description": "Window in milliseconds for session consistency after a DML. Defaults to 2000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redis_url": {
+          "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
+          "type": "string",
+          "default": ""
+        },
+        "singleflight_enabled": {
+          "description": "Enable singleflight (cache stampede protection). Defaults to true if not specified.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "singleflight_timeout_ms": {
+          "description": "Timeout in milliseconds for singleflight waiters. Defaults to 5000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "xfetch_beta": {
+          "description": "Aggressiveness factor beta for XFetch probabilistic early recomputation. Defaults to 1.0.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "xfetch_delta_secs": {
+          "description": "Estimated query computation duration in seconds for XFetch early recomputation. Defaults to 0.2s.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "xfetch_enabled": {
+          "description": "Enable XFetch probabilistic early recomputation. Defaults to true if not specified.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "Rewrite": {
       "description": "Controls PgDog's automatic SQL rewrites for sharded databases. It affects sharding key updates and multi-tuple inserts.\n\n**Note:** Consider enabling [two-phase commit](https://docs.pgdog.dev/features/sharding/2pc/) when either feature is set to `rewrite`. Without it, rewrites are committed shard-by-shard and can leave partial changes if a transaction fails.\n\nhttps://docs.pgdog.dev/configuration/pgdog.toml/rewrite/",
