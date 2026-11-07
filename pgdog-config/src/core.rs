@@ -9,8 +9,8 @@ use crate::sharding::ShardedSchema;
 use crate::util::random_string;
 use crate::{
     system_catalogs, EnumeratedDatabase, Memory, OmnishardedTable, PassthroughAuth,
-    PreparedStatements, QueryParserEngine, QueryParserLevel, ReadWriteSplit, RewriteMode, Role,
-    ResultCache, SystemCatalogsBehavior,
+    PreparedStatements, QueryParserEngine, QueryParserLevel, ReadWriteSplit, ResultCache,
+    RewriteMode, Role, SystemCatalogsBehavior,
 };
 
 use super::database::Database;

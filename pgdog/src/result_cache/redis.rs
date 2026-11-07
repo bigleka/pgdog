@@ -1,20 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
 // Additions for encryption
+use aes_gcm::aead::OsRng;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use parking_lot::RwLock;
-use aes_gcm::aead::OsRng;
 use redis::AsyncCommands;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::{
-    config::config,
-    frontend::router::parser::OwnedTable,
-    net::Parameters,
-};
+use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
 use super::{CacheableRequest, ResultCacheKey};
 
@@ -47,7 +43,9 @@ impl ResultCacheConfig {
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
             encryption_key: rc.encryption_key,
-            key_prefix: rc.key_prefix.unwrap_or_else(|| "pgdog:result_cache".to_string()),
+            key_prefix: rc
+                .key_prefix
+                .unwrap_or_else(|| "pgdog:result_cache".to_string()),
             safe_schema_list: compile_list(&rc.cache_safe_schema_list),
             unsafe_schema_list: compile_list(&rc.cache_unsafe_schema_list),
             safe_table_list: compile_list(&rc.cache_safe_table_list),
@@ -165,7 +163,10 @@ impl RedisResultCache {
 
         // Session signature (conservative MVP):
         // include search_path and role-ish identity (user already included).
-        let search_path = params.get("search_path").map(|v| v.to_string()).unwrap_or_default();
+        let search_path = params
+            .get("search_path")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let session_sig = format!("{:x}", md5::compute(format!("search_path={}", search_path)));
 
         // Query fingerprint: normalize to make cache key stable.
@@ -274,8 +275,12 @@ impl RedisResultCache {
 
         let res: redis::RedisResult<()> = match key.ttl {
             Some(ttl) if ttl > Duration::ZERO => {
-                conn.set_ex(&key.redis_key, final_payload.as_slice(), ttl.as_secs() as u64)
-                    .await
+                conn.set_ex(
+                    &key.redis_key,
+                    final_payload.as_slice(),
+                    ttl.as_secs() as u64,
+                )
+                .await
             }
             _ => conn.set(&key.redis_key, final_payload.as_slice()).await,
         };
@@ -408,10 +413,7 @@ fn decrypt(key_str: &str, ciphertext_with_nonce: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn compile_list(patterns: &[String]) -> Vec<Regex> {
-    patterns
-        .iter()
-        .filter_map(|p| Regex::new(p).ok())
-        .collect()
+    patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
 }
 
 fn matches_any(patterns: &[Regex], value: &str) -> bool {

@@ -52,4 +52,3 @@ pub struct ResultCache {
     #[serde(default)]
     pub cache_unsafe_table_list: Vec<String>,
 }
-
