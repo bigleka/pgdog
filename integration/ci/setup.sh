@@ -29,6 +29,10 @@ done
 
 sudo pg_ctlcluster "$PSQL_VERSION" main start
 
+# Result cache tests. The apt package usually starts it already.
+redis-cli ping >/dev/null 2>&1 \
+    || redis-server --daemonize yes --bind 127.0.0.1 --save "" --appendonly no
+
 USER_NAME="$(id -un)"
 sudo -u postgres createuser --superuser --login "$USER_NAME"
 sudo -u postgres createdb "$USER_NAME"

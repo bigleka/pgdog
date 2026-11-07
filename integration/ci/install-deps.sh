@@ -20,6 +20,12 @@ if ! dpkg -s mold >/dev/null 2>&1; then
     sudo apt-get install -y --no-install-recommends mold
 fi
 
+# Result cache tests need a Redis server on 127.0.0.1:6379.
+if ! dpkg -s redis-server >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends redis-server
+fi
+
 # The protocol_version smoke test needs a psql >= 18 client. The runner
 # image ships psql 16, so pull the v18 client from PGDG. pg_wrapper picks
 # the highest installed major, so /usr/bin/psql will resolve to 18.
