@@ -1,8 +1,4 @@
-use crate::{
-    frontend::ClientRequest,
-    net::messages::{Protocol, Query as QueryMsg},
-    net::ProtocolMessage,
-};
+use crate::{frontend::ClientRequest, net::messages::Query as QueryMsg, net::ProtocolMessage};
 
 use super::CacheableRequest;
 
@@ -15,4 +11,3 @@ fn cacheable_request_only_simple_select_read_route() {
     // Default route is write, so not cacheable.
     assert!(CacheableRequest::from_client_request(&req).is_none());
 }
-

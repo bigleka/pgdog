@@ -11,9 +11,16 @@ PgDog supports an **experimental** Redis/RESP-backed **query result cache** insp
 
 To avoid stale results while still being precise, PgDog uses **table-based invalidation**:
 
-- On `DML/DDL` (outside an explicit transaction), PgDog extracts touched tables from the parsed AST.
+- On `DML/DDL`, PgDog extracts touched tables from the parsed AST.
 - Each cached entry is tagged into Redis sets keyed by table name.
 - When a table changes, PgDog deletes only the keys referenced by that table tag set.
+- Invalidation happens when the write's transaction ends (right after an autocommit
+  statement, or at `COMMIT`/`ROLLBACK` of an explicit transaction), before the client
+  receives `ReadyForQuery`.
+- Enabling the result cache turns on the query parser when `query_parser = "auto"`,
+  since both caching and invalidation need the parsed query.
+- Writes that don't go through PgDog are not seen; their results stay cached until
+  `expire_seconds` passes.
 
 ## Configuration
 

@@ -85,6 +85,7 @@ pub struct Cluster {
     resharding_copy_retry_max_attempts: usize,
     resharding_copy_retry_min_delay: Duration,
     regex_parser: RegexParser,
+    result_cache: bool,
 }
 
 /// Sharding configuration from the cluster.
@@ -165,6 +166,7 @@ pub struct ClusterConfig<'a> {
     pub resharding_copy_retry_min_delay: u64,
     pub regex_parser_limit: usize,
     pub pub_sub_enabled: bool,
+    pub result_cache: bool,
 }
 
 impl<'a> ClusterConfig<'a> {
@@ -222,6 +224,10 @@ impl<'a> ClusterConfig<'a> {
             resharding_copy_retry_min_delay: general.resharding_copy_retry_min_delay,
             regex_parser_limit: general.regex_parser_limit,
             pub_sub_enabled: general.pub_sub_enabled(),
+            result_cache: config
+                .result_cache
+                .as_ref()
+                .is_some_and(|result_cache| result_cache.enabled),
         }
     }
 }
@@ -263,6 +269,7 @@ impl Cluster {
             resharding_copy_retry_min_delay,
             regex_parser_limit,
             pub_sub_enabled,
+            result_cache,
         } = config;
 
         let identifier = Arc::new(DatabaseUser {
@@ -316,6 +323,7 @@ impl Cluster {
             resharding_copy_retry_max_attempts,
             resharding_copy_retry_min_delay: Duration::from_millis(resharding_copy_retry_min_delay),
             regex_parser: RegexParser::new(regex_parser_limit, query_parser),
+            result_cache,
         }
     }
 
@@ -492,6 +500,7 @@ impl Cluster {
                     || self.dry_run()
                     || self.prepared_statements() == &PreparedStatements::Full
                     || self.pub_sub_enabled()
+                    || self.result_cache
                     || self.regex_parser.use_parser(request)
             }
         }

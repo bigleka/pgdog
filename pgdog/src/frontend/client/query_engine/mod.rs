@@ -1,3 +1,5 @@
+use std::mem;
+
 use crate::{
     backend::pool::{Connection, Request},
     config::config,
@@ -61,7 +63,6 @@ pub struct QueryEngine {
     advisory_locks: AdvisoryLocks,
     result_cache: Option<RedisResultCache>,
     result_cache_capture: Option<ResultCacheCapture>,
-    query_errored: bool,
     pending_invalidations: Vec<crate::frontend::router::parser::OwnedTable>,
 }
 
@@ -96,7 +97,6 @@ impl QueryEngine {
             advisory_locks: AdvisoryLocks::default(),
             result_cache: None,
             result_cache_capture: None,
-            query_errored: false,
             pending_invalidations: Vec::new(),
         })
     }
@@ -158,19 +158,22 @@ impl QueryEngine {
             self.result_cache = RedisResultCache::global().await;
         }
 
-        // Table-based invalidation: invalidate cache entries dependent on touched tables.
-        if let (Some(ref cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
-            let route = context.client_request.route();
-            if route.is_write() && context.client_request.is_executable() && !context.in_transaction()
-            {
-                let tables = context
-                    .client_request
-                    .ast
-                    .as_ref()
-                    .map(|ast| ast.tables().into_iter().map(|t| t.to_owned()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                if !tables.is_empty() {
-                    cache.invalidate_tables(cluster.name(), &tables).await;
+        // Table-based invalidation: remember tables touched by writes. Their cache
+        // entries are dropped once the writes are visible to other sessions, i.e.
+        // when the transaction (explicit or implicit) ends.
+        if self.result_cache.is_some()
+            && context.client_request.route().is_write()
+            && context.client_request.is_executable()
+        {
+            if let Some(ast) = context.client_request.ast.as_ref() {
+                for table in ast.tables() {
+                    // Cache tags ignore aliases, so dedup on schema + name only.
+                    let seen = self.pending_invalidations.iter().any(|pending| {
+                        pending.name == table.name && pending.schema.as_deref() == table.schema
+                    });
+                    if !seen {
+                        self.pending_invalidations.push(table.to_owned());
+                    }
                 }
             }
         }
@@ -180,10 +183,9 @@ impl QueryEngine {
             if !context.in_transaction() && context.client_request.is_executable() {
                 if let Some(req) = CacheableRequest::from_client_request(context.client_request) {
                     let user = context.params.get_required("user").unwrap_or("unknown");
-                    if let Some(key) =
-                        cache
-                            .build_key(cluster.name(), user, context.params, &req)
-                            .await
+                    if let Some(key) = cache
+                        .build_key(cluster.name(), user, context.params, &req)
+                        .await
                     {
                         if let Some(payload) = cache.get(&key).await {
                             crate::stats::ResultCache::hit(payload.len());
@@ -322,6 +324,21 @@ impl QueryEngine {
         self.update_stats(context);
 
         Ok(())
+    }
+
+    /// Drop result cache entries for tables written by this client.
+    ///
+    /// Call only once the client is outside a transaction, so the writes are
+    /// visible to everyone reading from the database.
+    async fn invalidate_pending(&mut self) {
+        if self.pending_invalidations.is_empty() {
+            return;
+        }
+
+        let tables = mem::take(&mut self.pending_invalidations);
+        if let (Some(cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
+            cache.invalidate_tables(cluster.name(), &tables).await;
+        }
     }
 
     fn update_stats(&mut self, context: &mut QueryEngineContext<'_>) {
