@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install CI deps
@@ -22,13 +22,13 @@ jobs:
         run: echo "key=pgdog-bin-${{ runner.os }}-$(bash integration/ci/cache-key.sh)" >> "$GITHUB_OUTPUT"
       - name: Cache pgdog binaries
         id: pgdog-bin
-        uses: useblacksmith/cache@v5
+        uses: actions/cache@v4
         with:
           path: |
             target/debug/pgdog
             target/release/pgdog
           key: ${{ steps.cache-key.outputs.key }}
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
         if: steps.pgdog-bin.outputs.cache-hit != 'true'
         with:
           prefix-key: build-v1
@@ -40,7 +40,7 @@ jobs:
         run: cargo build --release --bin pgdog
 
   ci:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     needs: [build]
     timeout-minutes: 30
     continue-on-error: ${{ matrix.continue_on_error == true }}
@@ -77,7 +77,7 @@ jobs:
         id: cache-key
         run: echo "key=pgdog-bin-${{ runner.os }}-$(bash integration/ci/cache-key.sh)" >> "$GITHUB_OUTPUT"
       - name: Restore pgdog binaries
-        uses: useblacksmith/cache/restore@v5
+        uses: actions/cache/restore@v4
         with:
           path: |
             target/debug/pgdog
@@ -86,7 +86,7 @@ jobs:
           fail-on-cache-miss: true
       - name: Restore Rust cache for plugin builds
         if: matrix.needs_rust_cache
-        uses: useblacksmith/rust-cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
           prefix-key: build-v1
       - name: Setup dependencies
