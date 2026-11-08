@@ -11,6 +11,8 @@ static REDIS_ERRORS: AtomicU64 = AtomicU64::new(0);
 static COALESCED: AtomicU64 = AtomicU64::new(0);
 static EARLY_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static TTL_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_WAITS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_COALESCED: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
     name: String,
@@ -56,6 +58,17 @@ impl ResultCache {
         TTL_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A miss found another PgDog running the same query and waited for it.
+    pub fn remote_wait() {
+        REMOTE_WAITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A miss answered with the result another PgDog computed.
+    pub fn remote_coalesced(bytes: usize) {
+        REMOTE_COALESCED.fetch_add(1, Ordering::Relaxed);
+        BYTES_SERVED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn metrics() -> Vec<Metric> {
         vec![
             Metric::new(ResultCacheMetric {
@@ -92,6 +105,19 @@ impl ResultCache {
                 name: "result_cache_coalesced".into(),
                 help: "Result cache misses served from another client's in-flight query".into(),
                 value: COALESCED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_remote_waits".into(),
+                help: "Result cache misses that waited for another PgDog running the same query"
+                    .into(),
+                value: REMOTE_WAITS.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_remote_coalesced".into(),
+                help: "Result cache misses served from the result of another PgDog".into(),
+                value: REMOTE_COALESCED.load(Ordering::Relaxed),
                 gauge: false,
             }),
             Metric::new(ResultCacheMetric {

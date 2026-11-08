@@ -54,9 +54,20 @@ When several clients of the same PgDog process miss on the same cache key at onc
 - The result is stored in Redis before waiting clients are released, so clients arriving afterwards hit the cache.
 - If the first client gets no result to share (the query fails, the result can't be cached, or it disconnects), waiting clients run the query themselves.
 - Waiting has no timeout of its own: it lasts as long as the first client's query.
-- Coalescing is per PgDog process. Separate PgDog instances each run the query once.
 
 All clients of a process share one result cache and one Redis connection.
+
+### Between PgDogs sharing Redis
+
+Several PgDogs (e.g. replicas of a Kubernetes deployment) pointing at the same Redis coalesce misses with each other too:
+
+- Before running the query, the PgDog that missed takes a lock on the key in Redis (`SET {key}:lock <token> NX PX`). The others find it held and wait, checking the cache every 20 ms, then serve the result stored there.
+- The lock is renewed while the query runs, so long queries keep it. `singleflight_lock_ms` (default `1000`) is how long the lock lasts once its holder stops renewing it: if a PgDog dies mid-query, the others run the query themselves about that long after.
+- If the query fails or its result can't be cached, the lock is released right away and the next PgDog runs it.
+- The lock is released only by its holder (compare-and-delete, sent with `EVAL` so it works through twemproxy).
+- An XFetch early refresh is skipped while another PgDog is already refreshing the entry: the hit serves the cached result.
+- Each miss costs one more Redis round trip (two for the PgDog that runs the query). `singleflight_lock_ms = 0` turns this off, leaving only coalescing within each PgDog.
+- Works on every supported topology.
 
 ## Early refresh (XFetch)
 
@@ -64,7 +75,7 @@ Singleflight stops a stampede once an entry has expired. XFetch avoids most of t
 
 - Each entry stores how long its query took to compute (`delta`, in microseconds). A hit refreshes it when `-delta * xfetch_beta * ln(rand)` reaches the entry's remaining TTL, so slow queries and entries near expiry refresh earlier (Vattani, Chierichetti, Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", VLDB 2015).
 - The refreshing client runs the query and gets the fresh result; it pays the query latency.
-- Only one client per PgDog process refreshes a given entry at a time. Hits on it during the refresh are served the current entry immediately.
+- Only one client at a time refreshes a given entry, across all PgDogs sharing Redis. Hits on it during the refresh are served the current entry immediately.
 - `xfetch_beta` tunes it: above `1.0` refreshes earlier, below later, `0` disables it. Default `1.0`.
 
 ## Adaptive TTL
@@ -85,6 +96,8 @@ Exposed in OpenMetrics format on the PgDog metrics endpoint:
 | `result_cache_hits` | Cached results served |
 | `result_cache_misses` | Cacheable queries not found in the cache |
 | `result_cache_coalesced` | Misses answered with another client's in-flight result (singleflight) |
+| `result_cache_remote_waits` | Misses that waited for another PgDog running the same query |
+| `result_cache_remote_coalesced` | Misses served from the result another PgDog computed |
 | `result_cache_early_refreshes` | Entries recomputed before expiry (XFetch) |
 | `result_cache_ttl_extensions` | Entries kept alive longer by a hit (adaptive TTL) |
 | `result_cache_stores` | Entries written |
@@ -109,6 +122,7 @@ max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
 xfetch_beta = 1.0
 # adaptive_ttl_max_seconds = 300  # off by default
+singleflight_lock_ms = 1000       # 0 = don't coalesce between PgDogs
 
 # Optional allow/deny lists (regex). Unsafe lists take precedence.
 cache_safe_schema_list = []

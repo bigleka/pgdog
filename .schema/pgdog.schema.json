@@ -1653,6 +1653,15 @@
             "type": "string"
           }
         },
+        "singleflight_lock_ms": {
+          "description": "Coalesce misses between PgDogs sharing Redis: the first one to miss\non a query takes a lock in Redis and runs it, the others wait for its\nresult instead of running the same query.\n\nThe lock is renewed while the query runs and expires this many\nmilliseconds after the PgDog holding it stops renewing it, e.g. when\nit dies. That's how long the others wait before running the query\nthemselves.\n\n`0` disables the lock: each PgDog only coalesces its own clients.\n\n_Default:_ `1000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "xfetch_beta": {
           "description": "How eagerly hits refresh entries before they expire (XFetch).\n\nA hit refreshes its entry when `-compute_time * xfetch_beta * ln(rand)`\nreaches the entry's remaining TTL, so hot and slow queries are\nrecomputed by one client ahead of expiry instead of by every client\nafter it. Values above `1.0` refresh earlier, below later; `0` disables\nearly refresh.\n\n_Default:_ `1.0`",
           "type": [

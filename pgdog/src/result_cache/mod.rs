@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod entry;
+pub mod lock;
 pub mod redis;
 pub mod singleflight;
 pub mod ttl;

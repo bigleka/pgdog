@@ -61,6 +61,20 @@ pub struct ResultCache {
     /// _Default:_ disabled
     pub adaptive_ttl_max_seconds: Option<u64>,
 
+    /// Coalesce misses between PgDogs sharing Redis: the first one to miss
+    /// on a query takes a lock in Redis and runs it, the others wait for its
+    /// result instead of running the same query.
+    ///
+    /// The lock is renewed while the query runs and expires this many
+    /// milliseconds after the PgDog holding it stops renewing it, e.g. when
+    /// it dies. That's how long the others wait before running the query
+    /// themselves.
+    ///
+    /// `0` disables the lock: each PgDog only coalesces its own clients.
+    ///
+    /// _Default:_ `1000`
+    pub singleflight_lock_ms: Option<u64>,
+
     /// Optional allow-list of schemas whose tables can be cached.
     ///
     /// Each entry is treated as a regular expression.
