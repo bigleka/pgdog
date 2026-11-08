@@ -230,9 +230,13 @@ async fn test_redis_sentinel_failover() {
         Some("1")
     );
 
+    // Sentinel sometimes takes longer than the client's default timeout to
+    // answer, e.g. while it's still settling after startup.
+    let patient = redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(std::time::Duration::from_secs(5)));
     let mut sentinel = redis::Client::open("redis://127.0.0.1:26379")
         .unwrap()
-        .get_multiplexed_async_connection()
+        .get_multiplexed_async_connection_with_config(&patient)
         .await
         .unwrap();
     let primary = |sentinel: &mut redis::aio::MultiplexedConnection| {
