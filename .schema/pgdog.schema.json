@@ -1603,6 +1603,14 @@
           "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
           "type": "string",
           "default": ""
+        },
+        "xfetch_beta": {
+          "description": "How eagerly hits refresh entries before they expire (XFetch).\n\nA hit refreshes its entry when `-compute_time * xfetch_beta * ln(rand)`\nreaches the entry's remaining TTL, so hot and slow queries are\nrecomputed by one client ahead of expiry instead of by every client\nafter it. Values above `1.0` refresh earlier, below later; `0` disables\nearly refresh.\n\n_Default:_ `1.0`",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         }
       },
       "additionalProperties": false

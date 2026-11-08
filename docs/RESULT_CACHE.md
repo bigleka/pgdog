@@ -37,6 +37,29 @@ When several clients of the same PgDog process miss on the same cache key at onc
 
 All clients of a process share one result cache and one Redis connection.
 
+## Early refresh (XFetch)
+
+Singleflight stops a stampede once an entry has expired. XFetch avoids most of them in the first place: a hit close to expiry may recompute the entry ahead of time, while it's still being served.
+
+- Each entry stores how long its query took to compute (`delta`). A hit refreshes it when `-delta * xfetch_beta * ln(rand)` reaches the entry's remaining TTL, so slow queries and entries near expiry refresh earlier (Vattani, Chierichetti, Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", VLDB 2015).
+- The refreshing client runs the query and gets the fresh result; it pays the query latency.
+- Only one client per PgDog process refreshes a given entry at a time. Hits on it during the refresh are served the current entry immediately.
+- `xfetch_beta` tunes it: above `1.0` refreshes earlier, below later, `0` disables it. Default `1.0`.
+
+## Metrics
+
+Exposed in OpenMetrics format on the PgDog metrics endpoint:
+
+| Metric | Meaning |
+|---|---|
+| `result_cache_hits` | Cached results served |
+| `result_cache_misses` | Cacheable queries not found in the cache |
+| `result_cache_coalesced` | Misses answered with another client's in-flight result (singleflight) |
+| `result_cache_early_refreshes` | Entries recomputed before expiry (XFetch) |
+| `result_cache_stores` | Entries written |
+| `result_cache_bytes_served` / `result_cache_bytes_stored` | Bytes served from / written to the cache |
+| `result_cache_redis_errors` | Failed Redis calls |
+
 ## Configuration
 
 Add this section to `pgdog.toml`:
@@ -48,6 +71,7 @@ redis_url = "redis://127.0.0.1:6379"
 expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
+xfetch_beta = 1.0
 
 # Optional allow/deny lists (regex). Unsafe lists take precedence.
 cache_safe_schema_list = []

@@ -8,6 +8,8 @@ static STORES: AtomicU64 = AtomicU64::new(0);
 static BYTES_SERVED: AtomicU64 = AtomicU64::new(0);
 static BYTES_STORED: AtomicU64 = AtomicU64::new(0);
 static REDIS_ERRORS: AtomicU64 = AtomicU64::new(0);
+static COALESCED: AtomicU64 = AtomicU64::new(0);
+static EARLY_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
     name: String,
@@ -35,6 +37,17 @@ impl ResultCache {
 
     pub fn redis_error() {
         REDIS_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A miss answered with another client's in-flight result.
+    pub fn coalesced(bytes: usize) {
+        COALESCED.fetch_add(1, Ordering::Relaxed);
+        BYTES_SERVED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// A hit picked by XFetch to recompute its entry before expiry.
+    pub fn early_refresh() {
+        EARLY_REFRESHES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics() -> Vec<Metric> {
@@ -67,6 +80,18 @@ impl ResultCache {
                 name: "result_cache_bytes_stored".into(),
                 help: "Bytes stored into result cache".into(),
                 value: BYTES_STORED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_coalesced".into(),
+                help: "Result cache misses served from another client's in-flight query".into(),
+                value: COALESCED.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_early_refreshes".into(),
+                help: "Result cache entries recomputed before expiry (XFetch)".into(),
+                value: EARLY_REFRESHES.load(Ordering::Relaxed),
                 gauge: false,
             }),
             Metric::new(ResultCacheMetric {

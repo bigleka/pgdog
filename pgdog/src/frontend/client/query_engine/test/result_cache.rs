@@ -18,7 +18,7 @@ use super::prelude::*;
 const REDIS_URL: &str = "redis://127.0.0.1:6379";
 
 /// Enable the result cache, using a key prefix unique to this test run.
-fn enable_result_cache(query_parser: QueryParserLevel) {
+pub(super) fn enable_result_cache(query_parser: QueryParserLevel) {
     load_test();
 
     let mut config = config().deref().clone();
@@ -39,13 +39,13 @@ async fn result_cache_client(query_parser: QueryParserLevel) -> TestClient {
     TestClient::new(Parameters::default()).await
 }
 
-async fn simple(client: &mut TestClient, query: &str) -> Vec<Message> {
+pub(super) async fn simple(client: &mut TestClient, query: &str) -> Vec<Message> {
     client.send_simple(Query::new(query)).await;
     client.read_until('Z').await.unwrap()
 }
 
 /// Value of the first column of the first row returned by `query`.
-async fn select_value(client: &mut TestClient, query: &str) -> Option<String> {
+pub(super) async fn select_value(client: &mut TestClient, query: &str) -> Option<String> {
     simple(client, query)
         .await
         .into_iter()
@@ -265,13 +265,13 @@ async fn test_concurrent_misses_on_failing_query_dont_hang() {
 }
 
 /// Table `(id INT PRIMARY KEY, v INT)` holding the row `(1, 1)`, created directly in Postgres.
-struct TestTable {
+pub(super) struct TestTable {
     name: String,
     direct: Server,
 }
 
 impl TestTable {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let name = format!("result_cache_{}", rng().random::<u32>());
         let mut direct = test_server().await;
         direct
@@ -285,19 +285,19 @@ impl TestTable {
         Self { name, direct }
     }
 
-    fn select(&self) -> String {
+    pub(super) fn select(&self) -> String {
         format!("SELECT v FROM {} WHERE id = 1", self.name)
     }
 
     /// Write that bypasses PgDog, so it can't invalidate anything.
-    async fn update_directly(&mut self, value: i32) {
+    pub(super) async fn update_directly(&mut self, value: i32) {
         self.direct
             .execute(format!("UPDATE {} SET v = {value} WHERE id = 1", self.name))
             .await
             .unwrap();
     }
 
-    async fn drop(mut self) {
+    pub(super) async fn drop(mut self) {
         self.direct
             .execute(format!("DROP TABLE {}", self.name))
             .await

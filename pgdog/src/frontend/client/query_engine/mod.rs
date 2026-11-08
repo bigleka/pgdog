@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, time::Instant};
 
 use crate::{
     backend::pool::{Connection, Request},
@@ -70,7 +70,7 @@ pub struct QueryEngine {
     pending_invalidations: Vec<crate::frontend::router::parser::OwnedTable>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ResultCacheCapture {
     key: crate::result_cache::ResultCacheKey,
     db: String,
@@ -80,6 +80,8 @@ struct ResultCacheCapture {
     /// Set when this client runs the query for others waiting on the same key.
     /// Dropping it without a result releases them.
     leader: Option<Leader>,
+    /// When the query started, to record how long it takes to compute.
+    started: Instant,
 }
 
 impl QueryEngine {
@@ -194,31 +196,53 @@ impl QueryEngine {
                         .build_key(cluster.name(), user, context.params, &req)
                         .await
                     {
-                        if let Some(payload) = cache.get(&key).await {
-                            crate::stats::ResultCache::hit(payload.len());
-                            let bytes_sent = context.stream.send_raw_flush(&payload).await?;
-                            self.stats.sent(bytes_sent);
-                            self.set_state(State::Idle);
-                            return Ok(());
-                        }
+                        let leader = match cache.get(&key).await {
+                            Some(cached) => {
+                                // XFetch: lead an early refresh unless someone already is.
+                                let leader = cached
+                                    .refresh_early
+                                    .then(|| cache.singleflight().join(&key.redis_key))
+                                    .and_then(|flight| match flight {
+                                        Flight::Leader(leader) => Some(leader),
+                                        Flight::Follower(_) => None,
+                                    });
 
-                        crate::stats::ResultCache::miss();
-
-                        // Coalesce concurrent misses: one client runs the query,
-                        // the others wait for its result.
-                        let leader = match cache.singleflight().join(&key.redis_key) {
-                            Flight::Leader(leader) => Some(leader),
-                            Flight::Follower(follower) => {
-                                if let Some(payload) = follower.wait().await {
-                                    crate::stats::ResultCache::hit(payload.len());
-                                    let bytes_sent =
-                                        context.stream.send_raw_flush(&payload).await?;
-                                    self.stats.sent(bytes_sent);
-                                    self.set_state(State::Idle);
-                                    return Ok(());
+                                match leader {
+                                    Some(leader) => {
+                                        crate::stats::ResultCache::early_refresh();
+                                        Some(leader)
+                                    }
+                                    None => {
+                                        let payload = &cached.entry.payload;
+                                        crate::stats::ResultCache::hit(payload.len());
+                                        let bytes_sent =
+                                            context.stream.send_raw_flush(payload).await?;
+                                        self.stats.sent(bytes_sent);
+                                        self.set_state(State::Idle);
+                                        return Ok(());
+                                    }
                                 }
-                                // Leader got no result to share: run the query ourselves.
-                                None
+                            }
+                            None => {
+                                crate::stats::ResultCache::miss();
+
+                                // Coalesce concurrent misses: one client runs the query,
+                                // the others wait for its result.
+                                match cache.singleflight().join(&key.redis_key) {
+                                    Flight::Leader(leader) => Some(leader),
+                                    Flight::Follower(follower) => {
+                                        if let Some(payload) = follower.wait().await {
+                                            crate::stats::ResultCache::coalesced(payload.len());
+                                            let bytes_sent =
+                                                context.stream.send_raw_flush(&payload).await?;
+                                            self.stats.sent(bytes_sent);
+                                            self.set_state(State::Idle);
+                                            return Ok(());
+                                        }
+                                        // Leader got no result to share: run the query ourselves.
+                                        None
+                                    }
+                                }
                             }
                         };
 
@@ -229,6 +253,7 @@ impl QueryEngine {
                             bytes: Vec::new(),
                             errored: false,
                             leader,
+                            started: Instant::now(),
                         });
                     }
                 }
