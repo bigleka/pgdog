@@ -368,9 +368,7 @@ func TestBatch(t *testing.T) {
 
 	results = tx2.SendBatch(context.Background(), &batch)
 
-	// A transação `tx` original já foi commitada. Esta chamada deveria ser para `tx2`.
-	// Como os resultados não são verificados, um Rollback é mais seguro aqui.
-	tx2.Rollback(context.Background())
+	tx.Commit(context.Background())
 }
 
 func TestLimitOffset(t *testing.T) {

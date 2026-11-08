@@ -31,27 +31,11 @@ impl QueryEngine {
         &mut self,
         context: &mut QueryEngineContext<'_>,
     ) -> Result<bool, Error> {
-        let mut use_parser = self
+        let use_parser = self
             .backend
             .cluster()
             .map(|cluster| cluster.use_query_parser(context.client_request))
             .unwrap_or(false);
-
-        // Force parser for SELECTs and DMLs (INSERT, UPDATE, DELETE) if result cache is enabled,
-        // so we can identify tables for caching and table-based invalidation.
-        if !use_parser && self.result_cache.is_some() {
-            if let Ok(Some(q)) = context.client_request.query() {
-                let trimmed = q.query().trim_start();
-                let first_word = trimmed.split_whitespace().next().unwrap_or_default();
-                if first_word.eq_ignore_ascii_case("select")
-                    || first_word.eq_ignore_ascii_case("insert")
-                    || first_word.eq_ignore_ascii_case("update")
-                    || first_word.eq_ignore_ascii_case("delete")
-                {
-                    use_parser = true;
-                }
-            }
-        }
 
         if !use_parser {
             return Ok(true);

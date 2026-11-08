@@ -105,16 +105,20 @@ impl ClientRequest {
                     return Ok(Some(BufferedQuery::Prepared(parse.clone())))
                 }
                 ProtocolMessage::Bind(bind) => {
-                    return Ok(PreparedStatements::global()
-                        .read()
-                        .parse(bind.statement())
-                        .map(BufferedQuery::Prepared));
+                    if !bind.anonymous() {
+                        return Ok(PreparedStatements::global()
+                            .read()
+                            .parse(bind.statement())
+                            .map(BufferedQuery::Prepared));
+                    }
                 }
                 ProtocolMessage::Describe(describe) => {
-                    return Ok(PreparedStatements::global()
-                        .read()
-                        .parse(describe.statement())
-                        .map(BufferedQuery::Prepared));
+                    if !describe.anonymous() {
+                        return Ok(PreparedStatements::global()
+                            .read()
+                            .parse(describe.statement())
+                            .map(BufferedQuery::Prepared));
+                    }
                 }
                 _ => (),
             }

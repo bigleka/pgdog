@@ -1,8 +1,4 @@
 pub mod redis;
-pub mod singleflight;
-pub mod xfetch;
-
-
 
 use std::time::Duration;
 
@@ -21,18 +17,20 @@ pub struct CacheableRequest {
     pub query: String,
     pub route_sig: &'static str,
     pub tables: Vec<OwnedTable>,
-    pub parameters: Vec<Vec<u8>>,
 }
 
 impl CacheableRequest {
     pub fn from_client_request(client_request: &ClientRequest) -> Option<Self> {
-        // Must be an executable unit (Query or Execute).
-        if !client_request.is_executable() {
+        // MVP: only simple query protocol, exactly one Query message.
+        if client_request.messages.len() != 1 {
             return None;
         }
 
         let buffered = client_request.query().ok()??;
-        let query = buffered.query().to_string();
+        let query = match buffered {
+            crate::frontend::BufferedQuery::Query(q) => q.query().to_string(),
+            _ => return None,
+        };
 
         let route = client_request.route();
         if !route.is_read() {
@@ -46,22 +44,10 @@ impl CacheableRequest {
             .map(|ast| ast.tables().into_iter().map(|t| t.to_owned()).collect())
             .unwrap_or_default();
 
-        let parameters = client_request
-            .parameters()
-            .ok()?
-            .map(|bind| {
-                bind.params_raw()
-                    .iter()
-                    .map(|p| p.data.to_vec())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
         Some(Self {
             query,
             route_sig,
             tables,
-            parameters,
         })
     }
 }

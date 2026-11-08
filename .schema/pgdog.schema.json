@@ -1530,13 +1530,6 @@
     "ResultCache": {
       "type": "object",
       "properties": {
-        "adaptive_ttl_enabled": {
-          "description": "Enable adaptive dynamic TTL for frequently requested keys. Defaults to true if not specified.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "cache_safe_schema_list": {
           "description": "Optional allow-list of schemas whose tables can be cached.\n\nEach entry is treated as a regular expression.",
           "type": "array",
@@ -1569,22 +1562,6 @@
             "type": "string"
           }
         },
-        "distributed_singleflight_enabled": {
-          "description": "Enable distributed singleflight across cluster nodes via Redis. Defaults to true if not specified.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "distributed_singleflight_timeout_ms": {
-          "description": "Timeout in milliseconds for distributed singleflight waiters. Defaults to 3000ms.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
         "enabled": {
           "description": "Enable Redis/RESP result cache.",
           "type": "boolean",
@@ -1606,13 +1583,6 @@
           "format": "uint64",
           "minimum": 0
         },
-        "granular_invalidation_enabled": {
-          "description": "Enable granular row/key-level cache invalidation. Reserved for future use.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "key_prefix": {
           "description": "Key prefix in Redis.",
           "type": [
@@ -1629,74 +1599,10 @@
           "format": "uint",
           "minimum": 0
         },
-        "max_expire_seconds": {
-          "description": "Maximum expiration time for cached entries under adaptive TTL (seconds). Defaults to 300s.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "read_after_write_consistency_enabled": {
-          "description": "Enable read-after-write session consistency. Defaults to true if not specified.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "read_after_write_window_ms": {
-          "description": "Window in milliseconds for session consistency after a DML. Defaults to 2000ms.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
         "redis_url": {
           "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
           "type": "string",
           "default": ""
-        },
-        "singleflight_enabled": {
-          "description": "Enable singleflight (cache stampede protection). Defaults to true if not specified.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "singleflight_timeout_ms": {
-          "description": "Timeout in milliseconds for singleflight waiters. Defaults to 5000ms.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "xfetch_beta": {
-          "description": "Aggressiveness factor beta for XFetch probabilistic early recomputation. Defaults to 1.0.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "xfetch_delta_secs": {
-          "description": "Estimated query computation duration in seconds for XFetch early recomputation. Defaults to 0.2s.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "xfetch_enabled": {
-          "description": "Enable XFetch probabilistic early recomputation. Defaults to true if not specified.",
-          "type": [
-            "boolean",
-            "null"
-          ]
         }
       },
       "additionalProperties": false
