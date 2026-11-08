@@ -285,6 +285,10 @@ impl TestTable {
         Self { name, direct }
     }
 
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn select(&self) -> String {
         format!("SELECT v FROM {} WHERE id = 1", self.name)
     }

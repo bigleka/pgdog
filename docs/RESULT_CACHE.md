@@ -26,6 +26,24 @@ To avoid stale results while still being precise, PgDog uses **table-based inval
 - Writes that don't go through PgDog are not seen; their results stay cached until
   `expire_seconds` passes.
 
+## Redis topologies
+
+| Topology | Config |
+|---|---|
+| One Redis / Valkey / Dragonfly server | `redis_url = "redis://host:6379"` |
+| Proxy in front of several servers (twemproxy, Envoy) | `redis_url = "redis://proxy:22121"` |
+| Redis Cluster | `redis_mode = "cluster"`, `redis_urls = ["redis://node1:6379", ...]` (or a single node in `redis_url`; the rest is discovered) |
+
+PgDog only sends commands that work on all of them: no `MULTI`, no `CLIENT` commands (twemproxy closes the connection on them), and multi-key commands only where the client splits them per cluster node.
+
+## When Redis is down or slow
+
+The cache never holds a query up for long:
+
+- Connecting and every Redis command time out after 500ms.
+- After a failed connection, a timeout, or a network error, PgDog skips the cache for 5 seconds: queries go straight to Postgres without waiting on Redis. It then reconnects on the next query.
+- Writes made while Redis is unreachable can't invalidate anything. Once Redis is back, entries of the tables they changed may be served until they expire (`expire_seconds`, or `adaptive_ttl_max_seconds` with adaptive TTL).
+
 ## Stampede protection (singleflight)
 
 When several clients of the same PgDog process miss on the same cache key at once (e.g. a hot entry just expired), only the first one runs the query. The others wait for its result and get it as a cache hit, so the database sees one query instead of one per client.
@@ -78,6 +96,8 @@ Add this section to `pgdog.toml`:
 [result_cache]
 enabled = true
 redis_url = "redis://127.0.0.1:6379"
+# redis_mode = "cluster"
+# redis_urls = ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
 expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"

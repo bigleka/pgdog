@@ -20,10 +20,11 @@ if ! dpkg -s mold >/dev/null 2>&1; then
     sudo apt-get install -y --no-install-recommends mold
 fi
 
-# Result cache tests need a Redis server on 127.0.0.1:6379.
-if ! dpkg -s redis-server >/dev/null 2>&1; then
+# Result cache tests run against every supported Redis topology
+# (integration/ci/redis-topologies.sh): Redis, Sentinel and twemproxy.
+if ! dpkg -s redis-server redis-sentinel nutcracker >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends redis-server
+    sudo apt-get install -y --no-install-recommends redis-server redis-sentinel nutcracker
 fi
 
 # The protocol_version smoke test needs a psql >= 18 client. The runner

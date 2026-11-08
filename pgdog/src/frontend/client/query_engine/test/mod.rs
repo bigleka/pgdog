@@ -24,6 +24,7 @@ mod prepared_syntax_error;
 mod replicas;
 mod result_cache;
 mod result_cache_adaptive_ttl;
+mod result_cache_topologies;
 mod result_cache_xfetch;
 mod rewrite_extended;
 mod rewrite_insert_split;

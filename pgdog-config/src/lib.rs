@@ -31,7 +31,7 @@ pub use networking::{MultiTenant, Tcp, TlsVerifyMode};
 pub use overrides::Overrides;
 pub use pooling::{PoolerMode, PreparedStatements};
 pub use replication::*;
-pub use result_cache::ResultCache;
+pub use result_cache::{RedisMode, ResultCache};
 pub use rewrite::{Rewrite, RewriteMode};
 pub use sharding::*;
 pub use system_catalogs::system_catalogs;
