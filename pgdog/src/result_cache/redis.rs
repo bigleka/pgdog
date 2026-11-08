@@ -13,7 +13,11 @@ use tracing::warn;
 
 use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
-use super::{singleflight::Singleflight, CacheableRequest, ResultCacheKey};
+use super::{
+    singleflight::Singleflight,
+    xfetch::{self, Entry},
+    CacheableRequest, ResultCacheKey,
+};
 
 #[derive(Debug, Clone)]
 pub struct ResultCacheConfig {
@@ -22,6 +26,7 @@ pub struct ResultCacheConfig {
     pub expire_seconds: Option<u64>,
     pub max_entry_bytes: usize,
     pub encryption_key: Option<String>,
+    pub xfetch_beta: f64,
     pub key_prefix: String,
     pub safe_schema_list: Vec<Regex>,
     pub unsafe_schema_list: Vec<Regex>,
@@ -44,6 +49,7 @@ impl ResultCacheConfig {
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
             encryption_key: rc.encryption_key,
+            xfetch_beta: rc.xfetch_beta.unwrap_or(1.0),
             key_prefix: rc
                 .key_prefix
                 .unwrap_or_else(|| "pgdog:result_cache".to_string()),
@@ -95,6 +101,14 @@ struct Shared {
     current_url: Option<String>,
     manager: Option<redis::aio::ConnectionManager>,
     prefix: String,
+}
+
+/// A cache hit.
+#[derive(Debug)]
+pub struct Cached {
+    pub entry: Entry,
+    /// XFetch picked this hit to recompute the entry ahead of expiry.
+    pub refresh_early: bool,
 }
 
 /// Result cache shared by all clients of this process.
@@ -236,7 +250,7 @@ impl RedisResultCache {
         );
 
         let key = format!(
-            "{}:v1:{}:{}:{}:{}:{}",
+            "{}:v2:{}:{}:{}:{}:{}",
             cfg.key_prefix, db, user, session_sig, req.route_sig, fingerprint
         );
 
@@ -247,57 +261,73 @@ impl RedisResultCache {
         })
     }
 
-    pub async fn get(&self, key: &ResultCacheKey) -> Option<Vec<u8>> {
-        let Some(cfg) = ResultCacheConfig::from_global_config() else {
-            return None;
-        };
+    /// Cached entry for `key`, if any, and whether this hit should refresh it early.
+    pub async fn get(&self, key: &ResultCacheKey) -> Option<Cached> {
+        let cfg = ResultCacheConfig::from_global_config()?;
         self.ensure_connected(&cfg).await?;
-
         let mut conn = self.connection()?;
 
-        let res: redis::RedisResult<Vec<u8>> = conn.get(&key.redis_key).await;
-
-        match res {
-            Ok(bytes) if !bytes.is_empty() => {
-                if let Some(enc_key) = &cfg.encryption_key {
-                    // Decrypt the value
-                    match decrypt(enc_key, &bytes) {
-                        Some(plaintext) => Some(plaintext),
-                        None => {
-                            warn!(
-                                "result_cache: failed to decrypt value for key: {}",
-                                key.redis_key
-                            );
-                            // Treat as a cache miss.
-                            None
-                        }
-                    }
-                } else {
-                    // No encryption key, return as is
-                    Some(bytes)
-                }
-            }
-            Ok(_) => None,
+        // Value and remaining TTL in one round trip.
+        let (bytes, pttl): (Vec<u8>, i64) = match redis::pipe()
+            .get(&key.redis_key)
+            .pttl(&key.redis_key)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(reply) => reply,
             Err(err) => {
                 crate::stats::ResultCache::redis_error();
                 warn!("result_cache get failed: {}", err);
-                None
+                return None;
             }
+        };
+        if bytes.is_empty() {
+            return None;
         }
+
+        let bytes = match &cfg.encryption_key {
+            Some(enc_key) => {
+                let Some(plaintext) = decrypt(enc_key, &bytes) else {
+                    warn!(
+                        "result_cache: failed to decrypt value for key: {}",
+                        key.redis_key
+                    );
+                    return None;
+                };
+                plaintext
+            }
+            None => bytes,
+        };
+        let entry = Entry::decode(&bytes)?;
+
+        // PTTL is negative when the key has no expiry (or just expired).
+        let refresh_early = u64::try_from(pttl).is_ok_and(|remaining| {
+            xfetch::should_refresh(
+                Duration::from_millis(remaining),
+                entry.delta,
+                cfg.xfetch_beta,
+                xfetch::draw(),
+            )
+        });
+
+        Some(Cached {
+            entry,
+            refresh_early,
+        })
     }
 
-    pub async fn set(&self, key: &ResultCacheKey, payload: &[u8]) {
+    pub async fn set(&self, key: &ResultCacheKey, entry: &Entry) {
         let Some(cfg) = ResultCacheConfig::from_global_config() else {
             return;
         };
 
-        if payload.is_empty() {
+        if entry.payload.is_empty() {
             return;
         }
 
-        // Encrypt payload if key is provided
+        let encoded = entry.encode();
         let final_payload = if let Some(enc_key) = &cfg.encryption_key {
-            match encrypt(enc_key, payload) {
+            match encrypt(enc_key, &encoded) {
                 Some(encrypted) => encrypted,
                 None => {
                     warn!(
@@ -308,7 +338,7 @@ impl RedisResultCache {
                 }
             }
         } else {
-            payload.to_vec()
+            encoded
         };
 
         if final_payload.len() > key.max_entry_bytes {
@@ -345,7 +375,7 @@ impl RedisResultCache {
         &self,
         db: &str,
         key: &ResultCacheKey,
-        payload: &[u8],
+        entry: &Entry,
         tables: &[OwnedTable],
     ) {
         let Some(cfg) = ResultCacheConfig::from_global_config() else {
@@ -356,9 +386,9 @@ impl RedisResultCache {
             return;
         }
 
-        self.set(key, payload).await;
+        self.set(key, entry).await;
 
-        if payload.is_empty() {
+        if entry.payload.is_empty() {
             return;
         }
 

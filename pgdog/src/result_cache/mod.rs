@@ -1,5 +1,6 @@
 pub mod redis;
 pub mod singleflight;
+pub mod xfetch;
 
 use std::time::Duration;
 

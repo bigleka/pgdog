@@ -24,6 +24,17 @@ pub struct ResultCache {
     /// Optional secret key for encryption.
     pub encryption_key: Option<String>,
 
+    /// How eagerly hits refresh entries before they expire (XFetch).
+    ///
+    /// A hit refreshes its entry when `-compute_time * xfetch_beta * ln(rand)`
+    /// reaches the entry's remaining TTL, so hot and slow queries are
+    /// recomputed by one client ahead of expiry instead of by every client
+    /// after it. Values above `1.0` refresh earlier, below later; `0` disables
+    /// early refresh.
+    ///
+    /// _Default:_ `1.0`
+    pub xfetch_beta: Option<f64>,
+
     /// Optional allow-list of schemas whose tables can be cached.
     ///
     /// Each entry is treated as a regular expression.

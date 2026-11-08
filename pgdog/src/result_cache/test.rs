@@ -15,6 +15,8 @@ fn cacheable_request_only_simple_select_read_route() {
 mod redis {
     //! Require Redis on 127.0.0.1:6379.
 
+    use std::time::Duration;
+
     use pgdog_config::ResultCache;
     use rand::{rng, Rng};
 
@@ -22,7 +24,9 @@ mod redis {
         config::{set, ConfigAndUsers},
         frontend::router::parser::OwnedTable,
         net::Parameters,
-        result_cache::{redis::RedisResultCache, singleflight::Flight, CacheableRequest},
+        result_cache::{
+            redis::RedisResultCache, singleflight::Flight, xfetch::Entry, CacheableRequest,
+        },
     };
 
     async fn cache() -> RedisResultCache {
@@ -36,6 +40,13 @@ mod redis {
         set(config).unwrap();
 
         RedisResultCache::global().await.expect("redis reachable")
+    }
+
+    fn entry(payload: &[u8]) -> Entry {
+        Entry {
+            delta: Duration::from_millis(5),
+            payload: payload.to_vec(),
+        }
     }
 
     fn request(table: &OwnedTable) -> CacheableRequest {
@@ -82,15 +93,17 @@ mod redis {
         assert!(cache.get(&key).await.is_none());
 
         // ...meanwhile a write commits and invalidates the table...
-        cache.invalidate_tables("db", &[table.clone()]).await;
+        cache
+            .invalidate_tables("db", std::slice::from_ref(&table))
+            .await;
 
         // ...then the slow read stores its (now stale) result.
         cache
-            .set_with_table_tags("db", &key, b"stale", &req.tables)
+            .set_with_table_tags("db", &key, &entry(b"stale"), &req.tables)
             .await;
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
-        assert_eq!(cache.get(&key).await, None);
+        assert!(cache.get(&key).await.is_none());
     }
 
     #[tokio::test]
@@ -105,10 +118,15 @@ mod redis {
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         cache
-            .set_with_table_tags("db", &key, b"fresh", &req.tables)
+            .set_with_table_tags("db", &key, &entry(b"fresh"), &req.tables)
             .await;
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
-        assert_eq!(cache.get(&key).await.as_deref(), Some(&b"fresh"[..]));
+        let cached = cache.get(&key).await.unwrap();
+        assert_eq!(cached.entry, entry(b"fresh"));
+        assert!(
+            !cached.refresh_early,
+            "fresh entry of a fast query refreshed early"
+        );
     }
 }

@@ -10,6 +10,7 @@ use crate::{
         DataRow, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
         RowDescription, ToBytes, TransactionState,
     },
+    result_cache::xfetch::Entry,
     state::State,
 };
 
@@ -272,21 +273,25 @@ impl QueryEngine {
             // Store cached payload at the end of a successful exchange.
             if let Some(capture) = self.result_cache_capture.take() {
                 if !capture.errored && !context.in_transaction() {
+                    let entry = Entry {
+                        delta: capture.started.elapsed(),
+                        payload: capture.bytes,
+                    };
                     if let Some(ref cache) = self.result_cache {
                         cache
                             .set_with_table_tags(
                                 capture.db.as_str(),
                                 &capture.key,
-                                &capture.bytes,
+                                &entry,
                                 &capture.tables,
                             )
                             .await;
-                        crate::stats::ResultCache::store(capture.bytes.len());
+                        crate::stats::ResultCache::store(entry.payload.len());
                     }
 
                     // Stored first, so clients arriving after the flight ends hit the cache.
                     if let Some(leader) = capture.leader {
-                        leader.finish(capture.bytes);
+                        leader.finish(entry.payload);
                     }
                 }
             }
