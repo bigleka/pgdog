@@ -171,7 +171,7 @@
           "minimum": 0
         },
         "pooler_mode": {
-          "description": "Overrides [`pooler_mode`](https://docs.pgdog.dev/configuration/pgdog.toml/general/) for this user. This allows users in [session mode](https://docs.pgdog.dev/features/session-mode/) to connect to the same PgDog instance as users in [transaction mode](https://docs.pgdog.dev/features/transaction-mode/).\n\nhttps://docs.pgdog.dev/configuration/users.toml/users/#pooler_mode",
+          "description": "Overrides [`pooler_mode`](https://docs.pgdog.dev/configuration/pgdog.toml/general/) for this user. This allows users in [session mode](https://docs.pgdog.dev/features/session-mode/) to connect to the same PgDog instance as users in [transaction mode](https://docs.pgdog.dev/features/transaction-mode/).\n\n**Note:** takes precedence over the database's `pooler_mode` in `pgdog.toml`.\n\nhttps://docs.pgdog.dev/configuration/users.toml/users/#pooler_mode",
           "anyOf": [
             {
               "$ref": "#/$defs/PoolerMode"

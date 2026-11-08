@@ -18,6 +18,7 @@ mod idle_in_transaction_recovery;
 mod lock_session;
 mod multi_binding;
 mod omni;
+mod pooler_mode_per_database;
 pub mod prelude;
 mod prepared_syntax_error;
 mod replicas;

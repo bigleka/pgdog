@@ -167,6 +167,8 @@ pub struct Database {
     pub min_pool_size: Option<usize>,
     /// Overrides the `pooler_mode` setting. Connections to this database will use this connection pool mode.
     ///
+    /// **Note:** a `pooler_mode` set on the user in `users.toml` takes precedence over this one.
+    ///
     /// https://docs.pgdog.dev/configuration/pgdog.toml/databases/#pooler_mode
     pub pooler_mode: Option<PoolerMode>,
     /// This setting configures the `statement_timeout` connection parameter on all connections to Postgres for this database.
