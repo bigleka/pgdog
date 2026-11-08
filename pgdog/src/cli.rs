@@ -18,7 +18,7 @@ use crate::frontend::router::cli::RouterCli;
 
 /// PgDog is a PostgreSQL pooler, proxy, load balancer and query router.
 #[derive(Parser, Debug)]
-#[command(name = "", version = concat!("PgDog v", env!("GIT_HASH")))]
+#[command(name = "", version = concat!("PgDog v", env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"))]
 pub struct Cli {
     /// Path to the configuration file. Default: "pgdog.toml"
     #[arg(short, long, default_value = "pgdog.toml")]
@@ -442,4 +442,26 @@ pub async fn route(commands: Commands) -> Result<(), Box<dyn std::error::Error>>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// Packages are versioned by `CARGO_PKG_VERSION`: `--version` must show it.
+    #[test]
+    fn test_version_shows_package_version() {
+        let version = Cli::command().get_version().map(str::to_owned);
+
+        assert_eq!(
+            version,
+            Some(format!(
+                "PgDog v{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_HASH")
+            ))
+        );
+    }
 }

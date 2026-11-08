@@ -1,0 +1,46 @@
+[Unit]
+Description=PgDog, PostgreSQL connection pooler, load balancer and sharder
+Documentation=https://docs.pgdog.dev/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgdog
+Group=pgdog
+Environment=RUST_LOG=info
+# Extra environment, e.g. PGDOG_* overrides.
+EnvironmentFile=-/etc/default/pgdog
+EnvironmentFile=-/etc/sysconfig/pgdog
+ExecStart=/usr/bin/pgdog --config /etc/pgdog/pgdog.toml --users /etc/pgdog/users.toml
+# SIGHUP reloads pgdog.toml and users.toml without dropping clients.
+# /bin/kill: procps (deb) or util-linux (rpm), both package dependencies.
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGINT drains clients for up to general.shutdown_timeout (default 60 s).
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
