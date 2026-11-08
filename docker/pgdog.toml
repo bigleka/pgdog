@@ -1,33 +1,33 @@
 [[databases]]
 name = "postgres"
 host = "shard_0"
-port = 5432
 role = "primary"
+shard = 0
 
+[[databases]]
+name = "postgres"
+host = "shard_1"
+role = "primary"
+shard = 1
 
-#[[databases]]
-#name = "database_name"
-#host = "server_address"
-#role = "primary"
-#shard = 1
+[[databases]]
+name = "postgres"
+host = "shard_2"
+role = "primary"
+shard = 2
+
+[[sharded_tables]]
+database = "postgres"
+name = "users"
+column = "id"
+
+[[sharded_tables]]
+database = "postgres"
+column = "user_id"
 
 [result_cache]
 enabled = true
 redis_url = "redis://redis:6379"
-expire_seconds = 60
+expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
-encryption_key = "uma-chave-secreta-muito-longa-e-dificil-de-adivinhar-aqui-321"
-singleflight_enabled = true
-singleflight_timeout_ms = 5000
-adaptive_ttl_enabled = true
-max_expire_seconds = 300
-xfetch_enabled = true
-xfetch_beta = 1.0
-xfetch_delta_secs = 0.2
-distributed_singleflight_enabled = true
-distributed_singleflight_timeout_ms = 3000
-read_after_write_consistency_enabled = true
-read_after_write_window_ms = 2000
-
-

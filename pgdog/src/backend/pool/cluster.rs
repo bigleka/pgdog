@@ -579,13 +579,6 @@ impl Cluster {
 
     /// Launch the connection pools.
     pub(crate) fn launch(&self) {
-        let already_online = self.readiness.online.swap(true, Ordering::SeqCst);
-        if already_online {
-            return;
-        }
-
-        info!("launching cluster: {} [{}]", self.user(), self.name());
-
         for shard in self.shards() {
             shard.launch();
         }
@@ -629,6 +622,8 @@ impl Cluster {
                 });
             }
         }
+
+        self.readiness.online.store(true, Ordering::Relaxed);
     }
 
     /// Shutdown the connection pools.
