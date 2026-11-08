@@ -415,3 +415,41 @@ async fn test_unavailable_backoff_is_configurable() {
         "cache didn't resume once the configured backoff passed"
     );
 }
+
+/// Value of `result_cache_redis_up`.
+fn redis_up() -> Option<String> {
+    gauge("result_cache_redis_up")
+}
+
+fn gauge(name: &str) -> Option<String> {
+    let prefix = format!("{name} ");
+    crate::stats::ResultCache::metrics()
+        .into_iter()
+        .map(|metric| metric.to_string())
+        .flat_map(|metric| metric.lines().map(str::to_owned).collect::<Vec<_>>())
+        .find_map(|line| line.strip_prefix(prefix.as_str()).map(str::to_owned))
+}
+
+/// Tells whether the cache can use Redis right now, for alerting.
+#[tokio::test]
+async fn test_redis_up_metric() {
+    use_redis(RedisMode::Standalone, "redis://127.0.0.1:6379", &[]);
+    let table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+    select_value(&mut client, &table.select()).await;
+    let up = redis_up();
+
+    use_redis(RedisMode::Standalone, "redis://127.0.0.1:1", &[]);
+    select_value(&mut client, &table.select()).await;
+    let down = redis_up();
+
+    use_redis(RedisMode::Standalone, "redis://127.0.0.1:6379", &[]);
+    select_value(&mut client, &table.select()).await;
+    let back = redis_up();
+    table.drop().await;
+
+    assert_eq!(up.as_deref(), Some("1"));
+    assert_eq!(gauge("result_cache_enabled").as_deref(), Some("1"));
+    assert_eq!(down.as_deref(), Some("0"), "Redis unreachable");
+    assert_eq!(back.as_deref(), Some("1"), "Redis reachable again");
+}

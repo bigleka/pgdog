@@ -165,6 +165,41 @@ async fn test_session_reads_its_write() {
         Some("2"),
         "read went to the stale replica"
     );
+    assert_eq!(primary_reads(), 1);
+}
+
+/// Each test runs in its own process: counters start at 0.
+fn primary_reads() -> u64 {
+    crate::stats::ResultCache::metrics()
+        .into_iter()
+        .map(|metric| metric.to_string())
+        .find_map(|metric| {
+            metric
+                .lines()
+                .find_map(|line| line.strip_prefix("result_cache_read_after_write_primary_reads "))
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap()
+}
+
+/// Without replicas every read already goes to the primary: nothing to
+/// count.
+#[tokio::test]
+async fn test_no_replicas_no_primary_reads_counted() {
+    super::result_cache::enable_result_cache(QueryParserLevel::Auto);
+    let table = super::result_cache::TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    simple(
+        &mut client,
+        &format!("UPDATE {} SET v = 2 WHERE id = 1", table.name()),
+    )
+    .await;
+    let value = select_value(&mut client, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(value.as_deref(), Some("2"));
+    assert_eq!(primary_reads(), 0, "counted reads without replicas");
 }
 
 /// Another client right after the write reads from the primary, so the

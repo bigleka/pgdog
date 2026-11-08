@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
@@ -13,6 +13,7 @@ static EARLY_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static TTL_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_WAITS: AtomicU64 = AtomicU64::new(0);
 static READ_PRIMARY: AtomicU64 = AtomicU64::new(0);
+static REDIS_UP: AtomicBool = AtomicBool::new(false);
 static REMOTE_COALESCED: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
@@ -73,6 +74,11 @@ impl ResultCache {
     /// A read sent to the primary because a table it reads was just written.
     pub fn read_primary() {
         READ_PRIMARY.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the cache can use Redis right now.
+    pub fn redis_up(up: bool) {
+        REDIS_UP.store(up, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics() -> Vec<Metric> {
@@ -143,6 +149,24 @@ impl ResultCache {
                 help: "Reads sent to the primary because a table they read was just written".into(),
                 value: READ_PRIMARY.load(Ordering::Relaxed),
                 gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_enabled".into(),
+                help: "1 if the result cache is enabled in the configuration".into(),
+                value: u64::from(
+                    crate::config::config()
+                        .config
+                        .result_cache
+                        .as_ref()
+                        .is_some_and(|result_cache| result_cache.enabled),
+                ),
+                gauge: true,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_redis_up".into(),
+                help: "1 while the result cache is connected to Redis, 0 while it's skipped because Redis is unavailable (or before the first connection)".into(),
+                value: u64::from(REDIS_UP.load(Ordering::Relaxed)),
+                gauge: true,
             }),
             Metric::new(ResultCacheMetric {
                 name: "result_cache_redis_errors".into(),

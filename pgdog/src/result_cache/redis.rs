@@ -217,6 +217,7 @@ impl RedisResultCache {
                 crate::stats::ResultCache::redis_error();
                 warn!("result_cache: can't connect to {:?}: {}", cfg.target, err);
                 self.shared.write().failed = Some((Instant::now(), cfg.target.clone()));
+                crate::stats::ResultCache::redis_up(false);
                 return None;
             }
         };
@@ -225,6 +226,7 @@ impl RedisResultCache {
         shared.connection = Some(connection);
         shared.prefix = cfg.key_prefix.clone();
         shared.failed = None;
+        crate::stats::ResultCache::redis_up(true);
         Some(())
     }
 
@@ -242,6 +244,7 @@ impl RedisResultCache {
             shared.failed = Some((Instant::now(), target));
         }
         shared.connection = None;
+        crate::stats::ResultCache::redis_up(false);
     }
 
     /// Handle to the shared Redis connection. Cheap to clone.

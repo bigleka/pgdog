@@ -141,6 +141,8 @@ Off by default. With `adaptive_ttl_max_seconds` set, every hit pushes its entry'
 
 ## Metrics
 
+A Grafana dashboard and Prometheus alerts for these metrics are in [examples/grafana](../examples/grafana).
+
 Exposed in OpenMetrics format on the PgDog metrics endpoint:
 
 | Metric | Meaning |
@@ -155,6 +157,8 @@ Exposed in OpenMetrics format on the PgDog metrics endpoint:
 | `result_cache_stores` | Entries written |
 | `result_cache_bytes_served` / `result_cache_bytes_stored` | Bytes served from / written to the cache |
 | `result_cache_read_after_write_primary_reads` | Reads sent to the primary because a table they read was just written |
+| `result_cache_enabled` | `1` if the cache is enabled in the configuration |
+| `result_cache_redis_up` | `1` while the cache is using Redis, `0` while it's skipped because Redis is unavailable |
 | `result_cache_redis_errors` | Failed Redis calls |
 
 ## Configuration
