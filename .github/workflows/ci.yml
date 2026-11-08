@@ -20,9 +20,9 @@ jobs:
       - name: Compute cache key
         id: cache-key
         run: echo "key=pgdog-bin-${{ runner.os }}-$(bash integration/ci/cache-key.sh)" >> "$GITHUB_OUTPUT"
-      - name: Cache pgdog binaries
+      - name: Restore pgdog binaries
         id: pgdog-bin
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             target/debug/pgdog
@@ -38,6 +38,16 @@ jobs:
       - name: Build (release)
         if: steps.pgdog-bin.outputs.cache-hit != 'true'
         run: cargo build --release --bin pgdog
+      # Save explicitly instead of in a post-job step: rust-cache's post step
+      # runs first and cleans target/, deleting the binaries before they're saved.
+      - name: Save pgdog binaries
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/debug/pgdog
+            target/release/pgdog
+          key: ${{ steps.cache-key.outputs.key }}
 
   ci:
     runs-on: ubuntu-latest
