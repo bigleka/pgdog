@@ -12,11 +12,25 @@ use redis::{
     RedisResult, Value,
 };
 
-/// The cache must never hold a query up for long: past these, Redis is
-/// treated as unavailable and the query goes straight to Postgres.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
-const CONNECT_RETRIES: usize = 1;
+/// How long the cache waits on Redis. Past these, Redis is treated as
+/// unavailable and the query goes straight to Postgres.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub connect_timeout: Duration,
+    pub response_timeout: Duration,
+    pub connect_retries: u32,
+}
+
+impl Default for Limits {
+    /// The cache must never hold a query up for long.
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_millis(500),
+            response_timeout: Duration::from_millis(500),
+            connect_retries: 1,
+        }
+    }
+}
 
 /// Where the cache's Redis lives. A change means reconnecting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +42,7 @@ pub struct Target {
     /// credentials (they usually differ from the Sentinels').
     pub sentinel_master: Option<String>,
     pub primary_url: String,
+    pub limits: Limits,
 }
 
 impl Target {
@@ -42,6 +57,7 @@ impl Target {
             urls,
             sentinel_master: sentinel_master.map(str::to_owned),
             primary_url: url.to_owned(),
+            limits: Limits::default(),
         }
     }
 }
@@ -59,6 +75,7 @@ pub enum Connection {
 
 impl Connection {
     pub async fn open(target: &Target) -> RedisResult<Self> {
+        let limits = target.limits;
         let nodes = target
             .urls
             .iter()
@@ -69,9 +86,9 @@ impl Connection {
             RedisMode::Standalone => {
                 let node = nodes.into_iter().next().ok_or_else(no_nodes)?;
                 let config = ConnectionManagerConfig::new()
-                    .set_connection_timeout(Some(CONNECT_TIMEOUT))
-                    .set_response_timeout(Some(RESPONSE_TIMEOUT))
-                    .set_number_of_retries(CONNECT_RETRIES);
+                    .set_connection_timeout(Some(limits.connect_timeout))
+                    .set_response_timeout(Some(limits.response_timeout))
+                    .set_number_of_retries(limits.connect_retries as usize);
                 let client = redis::Client::open(node)?;
                 Ok(Self::Standalone(
                     client.get_connection_manager_with_config(config).await?,
@@ -79,9 +96,9 @@ impl Connection {
             }
             RedisMode::Cluster => {
                 let client = ClusterClient::builder(nodes)
-                    .connection_timeout(CONNECT_TIMEOUT)
-                    .response_timeout(RESPONSE_TIMEOUT)
-                    .retries(CONNECT_RETRIES as u32)
+                    .connection_timeout(limits.connect_timeout)
+                    .response_timeout(limits.response_timeout)
+                    .retries(limits.connect_retries)
                     .build()?;
                 Ok(Self::Cluster(client.get_async_connection().await?))
             }
@@ -103,8 +120,8 @@ impl Connection {
                     SentinelServerType::Master,
                 )?;
                 let config = AsyncConnectionConfig::new()
-                    .set_connection_timeout(Some(CONNECT_TIMEOUT))
-                    .set_response_timeout(Some(RESPONSE_TIMEOUT));
+                    .set_connection_timeout(Some(limits.connect_timeout))
+                    .set_response_timeout(Some(limits.response_timeout));
                 Ok(Self::Sentinel(
                     client.get_async_connection_with_config(&config).await?,
                 ))

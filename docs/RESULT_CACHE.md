@@ -43,9 +43,29 @@ PgDog only sends commands that work on all of them: no `MULTI`, no `CLIENT` comm
 
 The cache never holds a query up for long:
 
-- Connecting and every Redis command time out after 500ms.
-- After a failed connection, a timeout, or a network error, PgDog skips the cache for 5 seconds: queries go straight to Postgres without waiting on Redis. It then reconnects on the next query.
+- Connecting and every Redis command time out after 500ms (`redis_connect_timeout_ms`, `redis_response_timeout_ms`).
+- After a failed connection, a timeout, or a network error, PgDog skips the cache for 5 seconds (`redis_unavailable_backoff_ms`): queries go straight to Postgres without waiting on Redis. It then reconnects on the next query.
 - Writes made while Redis is unreachable can't invalidate anything. Once Redis is back, entries of the tables they changed may be served until they expire (`expire_seconds`, or `adaptive_ttl_max_seconds` with adaptive TTL).
+
+### Redis timeouts
+
+The defaults suit a Redis in the same datacenter as PgDog. **Keep them unless you've measured a reason not to.** The cache only speeds reads up; Postgres always has the answer. A timeout too long makes queries wait on a sick Redis; one too short marks a healthy Redis as down, and the cache keeps switching off.
+
+| Option | Default | What it bounds |
+|---|---|---|
+| `redis_connect_timeout_ms` | `500` | Opening a connection (TCP, TLS, AUTH). |
+| `redis_response_timeout_ms` | `500` | Each Redis command. The most a slow Redis adds to a query before PgDog gives up on it. |
+| `redis_connect_retries` | `1` | Extra connection attempts before Redis counts as down. Each one can cost a query another `redis_connect_timeout_ms`. |
+| `redis_unavailable_backoff_ms` | `5000` | How long the cache is skipped once Redis counts as down. |
+
+Before changing them:
+
+1. **Measure Redis latency from the PgDog host**, under normal load: `redis-cli -h <host> --latency-history`, plus `SLOWLOG GET` and `INFO commandstats` on Redis. Behind twemproxy, Envoy or TLS, measure through it.
+2. **Response timeout:** keep it at 5 to 10 times the p99 you measured, never below it. Keep it well below your applications' query timeouts and Postgres `statement_timeout`: when Redis hangs, a query can wait this long before going to Postgres.
+3. **Connect timeout:** raise it only for a remote Redis (another region, TLS handshakes), to a few round trips. Worst case for the query that reconnects: `redis_connect_timeout_ms × (redis_connect_retries + 1)`.
+4. **Backoff:** shorter brings the cache back sooner after an outage, but while Redis stays down, each attempt to reconnect costs the queries running at that moment one connect timeout. Keep it at a few seconds or more in production. `0` (reconnect on every query) is only for testing.
+5. **Sentinel:** the time to move to a new primary is set in Sentinel, not here: `down-after-milliseconds` (Redis default 30000) plus the failover itself. Until then PgDog skips the cache and serves from Postgres. Lower `down-after-milliseconds` in `sentinel.conf` if that's too long, keeping it above your network's normal hiccups.
+6. **Check after each change**, one option at a time: `result_cache_redis_errors` and "Redis unavailable" warnings in the logs should stay at zero while Redis is healthy, and the hit rate (`result_cache_hits` vs `result_cache_misses`) shouldn't drop. Changing these settings reconnects to Redis on the next query.
 
 ## Stampede protection (singleflight)
 
@@ -123,6 +143,12 @@ key_prefix = "pgdog:result_cache"
 xfetch_beta = 1.0
 # adaptive_ttl_max_seconds = 300  # off by default
 singleflight_lock_ms = 1000       # 0 = don't coalesce between PgDogs
+
+# Redis timeouts: read "Redis timeouts" above before changing them.
+# redis_connect_timeout_ms = 500
+# redis_response_timeout_ms = 500
+# redis_connect_retries = 1
+# redis_unavailable_backoff_ms = 5000
 
 # Optional allow/deny lists (regex). Unsafe lists take precedence.
 cache_safe_schema_list = []

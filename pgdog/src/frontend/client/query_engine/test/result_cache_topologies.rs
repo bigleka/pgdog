@@ -313,3 +313,101 @@ async fn test_redis_sentinel_failover() {
     }
     table.drop().await;
 }
+
+fn configure_redis(edit: impl FnOnce(&mut pgdog_config::ResultCache)) {
+    let mut config = config().deref().clone();
+    if let Some(result_cache) = config.config.result_cache.as_mut() {
+        edit(result_cache);
+    }
+    set(config).unwrap();
+}
+
+/// A DBA can give a slow Redis more time before it counts as down.
+#[tokio::test]
+async fn test_response_timeout_is_configurable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    use_redis(
+        RedisMode::Standalone,
+        &format!("redis://127.0.0.1:{port}"),
+        &[],
+    );
+    configure_redis(|result_cache| result_cache.redis_response_timeout_ms = Some(1500));
+    let table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    let start = std::time::Instant::now();
+    assert_eq!(
+        select_value(&mut client, &table.select()).await.as_deref(),
+        Some("1")
+    );
+    let elapsed = start.elapsed();
+    table.drop().await;
+    silent.abort();
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1400),
+        "gave up on Redis after {elapsed:?}, before the configured timeout"
+    );
+}
+
+/// How long the cache is skipped after Redis fails is configurable.
+#[tokio::test]
+async fn test_unavailable_backoff_is_configurable() {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    use_redis(
+        RedisMode::Standalone,
+        &format!("redis://127.0.0.1:{port}"),
+        &[],
+    );
+    configure_redis(|result_cache| result_cache.redis_unavailable_backoff_ms = Some(200));
+    let mut table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    // Redis down.
+    assert_eq!(
+        select_value(&mut client, &table.select()).await.as_deref(),
+        Some("1")
+    );
+
+    // Back on the same address, forwarded to the real one.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let forwarder = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut outbound = tokio::net::TcpStream::connect("127.0.0.1:6379")
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    assert_eq!(
+        select_value(&mut client, &table.select()).await.as_deref(),
+        Some("1")
+    );
+    table.update_directly(2).await;
+    let value = select_value(&mut client, &table.select()).await;
+    table.drop().await;
+    forwarder.abort();
+
+    assert_eq!(
+        value.as_deref(),
+        Some("1"),
+        "cache didn't resume once the configured backoff passed"
+    );
+}
