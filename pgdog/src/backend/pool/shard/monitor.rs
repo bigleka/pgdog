@@ -1,8 +1,7 @@
-use crate::backend::pool::lsn_monitor::ReplicaLag;
+use crate::{backend::pool::lsn_monitor::ReplicaLag, util::safe_interval};
 
 use super::*;
 
-use tokio::time::interval;
 use tracing::{info, warn};
 
 /// Shard communication primitives.
@@ -44,7 +43,7 @@ impl ShardMonitor {
     async fn spawn(&self) {
         let maintenance = (self.shard.comms().lsn_check_interval / 2)
             .clamp(Duration::from_millis(333), Duration::MAX);
-        let mut maintenance = interval(maintenance);
+        let mut maintenance = safe_interval(maintenance);
 
         debug!(
             "shard {} monitor running [{}]",
