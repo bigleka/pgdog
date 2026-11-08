@@ -21,6 +21,7 @@ mod omni;
 pub mod prelude;
 mod prepared_syntax_error;
 mod replicas;
+mod result_cache;
 mod rewrite_extended;
 mod rewrite_insert_split;
 mod rewrite_offset;

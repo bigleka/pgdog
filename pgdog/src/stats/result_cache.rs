@@ -103,4 +103,3 @@ impl OpenMetric for ResultCacheMetric {
         }]
     }
 }
-

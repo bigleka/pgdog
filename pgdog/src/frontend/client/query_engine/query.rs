@@ -247,6 +247,12 @@ impl QueryEngine {
             }
         }
 
+        // Invalidate before the client sees ReadyForQuery, so any session
+        // reading after the write completed gets fresh results.
+        if code == 'Z' && !context.in_transaction() {
+            self.invalidate_pending().await;
+        }
+
         self.stats.sent(message.len());
 
         // Do this before flushing, because flushing can take time.

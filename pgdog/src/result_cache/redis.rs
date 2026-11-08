@@ -1,20 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
 // Additions for encryption
+use aes_gcm::aead::OsRng;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use parking_lot::RwLock;
-use aes_gcm::aead::OsRng;
-use redis::AsyncCommands;
+use redis::{aio::ConnectionManager, AsyncCommands};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::{
-    config::config,
-    frontend::router::parser::OwnedTable,
-    net::Parameters,
-};
+use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
 use super::{CacheableRequest, ResultCacheKey};
 
@@ -47,7 +43,9 @@ impl ResultCacheConfig {
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
             encryption_key: rc.encryption_key,
-            key_prefix: rc.key_prefix.unwrap_or_else(|| "pgdog:result_cache".to_string()),
+            key_prefix: rc
+                .key_prefix
+                .unwrap_or_else(|| "pgdog:result_cache".to_string()),
             safe_schema_list: compile_list(&rc.cache_safe_schema_list),
             unsafe_schema_list: compile_list(&rc.cache_unsafe_schema_list),
             safe_table_list: compile_list(&rc.cache_safe_table_list),
@@ -143,9 +141,54 @@ impl RedisResultCache {
         Some(())
     }
 
+    /// Handle to the shared Redis connection. Cloning a `ConnectionManager` is cheap.
+    fn connection(&self) -> Option<ConnectionManager> {
+        self.shared.read().manager.clone()
+    }
+
     fn tag_set_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
         let schema = table.schema.as_deref().unwrap_or("_");
         format!("{prefix}:tbl:{db}:{schema}.{}", table.name)
+    }
+
+    /// Counter bumped on every invalidation of the table. Never expires: if it
+    /// did, the counter would restart and old entries would match again.
+    fn generation_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
+        let schema = table.schema.as_deref().unwrap_or("_");
+        format!("{prefix}:gen:{db}:{schema}.{}", table.name)
+    }
+
+    /// Current generation of each table, joined into a single string.
+    ///
+    /// It's part of the cache key, so a result computed before a table was
+    /// invalidated is stored under a key no reader will look up again.
+    async fn generations(&self, prefix: &str, db: &str, tables: &[OwnedTable]) -> Option<String> {
+        if tables.is_empty() {
+            return Some(String::new());
+        }
+
+        let keys: Vec<_> = tables
+            .iter()
+            .map(|table| Self::generation_key(prefix, db, table))
+            .collect();
+        let mut conn = self.connection()?;
+        let generations: Vec<Option<u64>> =
+            match redis::cmd("MGET").arg(&keys).query_async(&mut conn).await {
+                Ok(generations) => generations,
+                Err(err) => {
+                    crate::stats::ResultCache::redis_error();
+                    warn!("result_cache generation lookup failed: {}", err);
+                    return None;
+                }
+            };
+
+        Some(
+            generations
+                .iter()
+                .map(|generation| generation.unwrap_or(0).to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 
     pub async fn build_key(
@@ -165,11 +208,18 @@ impl RedisResultCache {
 
         // Session signature (conservative MVP):
         // include search_path and role-ish identity (user already included).
-        let search_path = params.get("search_path").map(|v| v.to_string()).unwrap_or_default();
+        let search_path = params
+            .get("search_path")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let session_sig = format!("{:x}", md5::compute(format!("search_path={}", search_path)));
 
-        // Query fingerprint: normalize to make cache key stable.
-        let fingerprint = format!("{:x}", md5::compute(&req.query));
+        // Query fingerprint, tied to the current generation of every table it reads.
+        let generations = self.generations(&cfg.key_prefix, db, &req.tables).await?;
+        let fingerprint = format!(
+            "{:x}",
+            md5::compute(format!("{}\0{}", req.query, generations))
+        );
 
         let key = format!(
             "{}:v1:{}:{}:{}:{}:{}",
@@ -274,8 +324,12 @@ impl RedisResultCache {
 
         let res: redis::RedisResult<()> = match key.ttl {
             Some(ttl) if ttl > Duration::ZERO => {
-                conn.set_ex(&key.redis_key, final_payload.as_slice(), ttl.as_secs() as u64)
-                    .await
+                conn.set_ex(
+                    &key.redis_key,
+                    final_payload.as_slice(),
+                    ttl.as_secs() as u64,
+                )
+                .await
             }
             _ => conn.set(&key.redis_key, final_payload.as_slice()).await,
         };
@@ -352,6 +406,16 @@ impl RedisResultCache {
         };
 
         for table in tables {
+            // Bump the generation first: it's what keeps results computed
+            // before this write from being served. Deleting tagged keys
+            // below only frees memory sooner.
+            let generation_key = Self::generation_key(&cfg.key_prefix, db, table);
+            let bumped: redis::RedisResult<u64> = conn.incr(&generation_key, 1).await;
+            if let Err(err) = bumped {
+                crate::stats::ResultCache::redis_error();
+                warn!("result_cache generation bump failed: {}", err);
+            }
+
             let set_key = Self::tag_set_key(&cfg.key_prefix, db, table);
             let keys: redis::RedisResult<Vec<String>> = conn.smembers(&set_key).await;
             match keys {
@@ -408,10 +472,7 @@ fn decrypt(key_str: &str, ciphertext_with_nonce: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn compile_list(patterns: &[String]) -> Vec<Regex> {
-    patterns
-        .iter()
-        .filter_map(|p| Regex::new(p).ok())
-        .collect()
+    patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
 }
 
 fn matches_any(patterns: &[Regex], value: &str) -> bool {

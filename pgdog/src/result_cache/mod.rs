@@ -2,8 +2,8 @@ pub mod redis;
 
 use std::time::Duration;
 
-use crate::frontend::ClientRequest;
 use crate::frontend::router::parser::OwnedTable;
+use crate::frontend::ClientRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResultCacheKey {
@@ -37,7 +37,11 @@ impl CacheableRequest {
             return None;
         }
 
-        let route_sig = if route.is_cross_shard() { "cross" } else { "direct" };
+        let route_sig = if route.is_cross_shard() {
+            "cross"
+        } else {
+            "direct"
+        };
         let tables = client_request
             .ast
             .as_ref()
@@ -54,4 +58,3 @@ impl CacheableRequest {
 
 #[cfg(test)]
 mod test;
-
