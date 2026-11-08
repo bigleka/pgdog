@@ -15,7 +15,10 @@ fn cacheable_request_only_simple_select_read_route() {
 /// Redis-level behaviour, run against every supported Redis topology.
 /// Require the topologies from the dev container (see `redis-topologies.sh`).
 mod redis {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        ops::Deref,
+        time::{Duration, SystemTime},
+    };
 
     use pgdog_config::{RedisMode, ResultCache};
     use rand::{rng, Rng};
@@ -25,7 +28,11 @@ mod redis {
         frontend::router::parser::OwnedTable,
         net::Parameters,
         result_cache::{
-            entry::Entry, redis::RedisResultCache, singleflight::Flight, CacheableRequest,
+            entry::Entry,
+            lock::{Lock, Remote},
+            redis::RedisResultCache,
+            singleflight::Flight,
+            CacheableRequest, ResultCacheKey,
         },
     };
 
@@ -114,6 +121,12 @@ mod redis {
         store_after_invalidation_is_not_served,
         invalidation_drops_entries_reading_the_table,
         invalidation_keeps_entries_of_other_tables,
+        lock_is_exclusive_between_instances,
+        lock_is_released_only_by_its_owner,
+        waiter_gets_result_of_lock_holder,
+        waiter_leads_when_holder_gives_up,
+        waiter_leads_when_lock_expires,
+        lock_is_kept_while_holder_runs,
     );
 
     fn entry(payload: &[u8]) -> Entry {
@@ -253,6 +266,159 @@ mod redis {
         assert!(
             cache.get(&key).await.is_some(),
             "unrelated write dropped the entry"
+        );
+    }
+
+    /// Another PgDog sharing the same Redis: its own connection and its
+    /// own in-process singleflight.
+    fn other_pgdog() -> RedisResultCache {
+        RedisResultCache::default()
+    }
+
+    fn set_lock_ms(ms: u64) {
+        let mut config = crate::config::config().deref().clone();
+        if let Some(result_cache) = config.config.result_cache.as_mut() {
+            result_cache.singleflight_lock_ms = Some(ms);
+        }
+        set(config).unwrap();
+    }
+
+    async fn some_key(cache: &RedisResultCache) -> ResultCacheKey {
+        let req = request(&[table("users")]);
+        cache
+            .build_key("db", "user", &Parameters::default(), &req)
+            .await
+            .unwrap()
+    }
+
+    fn acquired(lock: Lock) -> crate::result_cache::lock::RemoteLock {
+        match lock {
+            Lock::Acquired(lock) => lock,
+            other => panic!("expected to acquire the lock, got {other:?}"),
+        }
+    }
+
+    async fn lock_is_exclusive_between_instances(topology: Topology) {
+        let first = cache(topology).await;
+        let second = other_pgdog();
+        let key = some_key(&first).await;
+
+        let lock = acquired(first.lock(&key).await);
+        assert!(
+            matches!(second.lock(&key).await, Lock::Held),
+            "two PgDogs hold the lock on the same key"
+        );
+
+        lock.release().await;
+        acquired(second.lock(&key).await);
+    }
+
+    /// A lock that expired (its holder couldn't renew it, e.g. cut off from
+    /// Redis) and was taken by another PgDog isn't released by its former
+    /// holder.
+    async fn lock_is_released_only_by_its_owner(topology: Topology) {
+        let first = cache(topology).await;
+        set_lock_ms(200);
+        let second = other_pgdog();
+        let key = some_key(&first).await;
+
+        let stale = acquired(first.lock(&key).await);
+        stale.stop_renewing();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _current = acquired(second.lock(&key).await);
+
+        stale.release().await;
+        assert!(
+            matches!(other_pgdog().lock(&key).await, Lock::Held),
+            "former owner released someone else's lock"
+        );
+    }
+
+    async fn waiter_gets_result_of_lock_holder(topology: Topology) {
+        let holder = cache(topology).await;
+        let waiter = other_pgdog();
+        let key = some_key(&holder).await;
+        let lock = acquired(holder.lock(&key).await);
+
+        let waiting = {
+            let key = key.clone();
+            tokio::spawn(async move { waiter.lock_or_wait(&key).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "waiter didn't wait for the holder");
+
+        let stored = entry(b"computed once");
+        holder.set(&key, &stored).await;
+        lock.release().await;
+
+        match waiting.await.unwrap() {
+            Remote::Served(cached) => assert_eq!(cached, stored),
+            Remote::Lead(_) => panic!("waiter ran the query itself"),
+        }
+    }
+
+    /// The holder failed (query error, client gone) and stored nothing.
+    async fn waiter_leads_when_holder_gives_up(topology: Topology) {
+        let holder = cache(topology).await;
+        let waiter = other_pgdog();
+        let key = some_key(&holder).await;
+        let lock = acquired(holder.lock(&key).await);
+
+        let waiting = {
+            let key = key.clone();
+            tokio::spawn(async move { waiter.lock_or_wait(&key).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(lock);
+
+        let waited = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("waiter hung after the holder gave up")
+            .unwrap();
+        assert!(
+            matches!(waited, Remote::Lead(Some(_))),
+            "waiter should take the lock over, got {waited:?}"
+        );
+    }
+
+    /// The holder died without releasing: the lock expires and a waiter
+    /// takes over.
+    async fn waiter_leads_when_lock_expires(topology: Topology) {
+        let holder = cache(topology).await;
+        set_lock_ms(300);
+        let waiter = other_pgdog();
+        let key = some_key(&holder).await;
+        acquired(holder.lock(&key).await).abandon();
+
+        let start = std::time::Instant::now();
+        let waited = tokio::time::timeout(Duration::from_secs(3), waiter.lock_or_wait(&key))
+            .await
+            .expect("waiter hung on an expired lock");
+        assert!(
+            matches!(waited, Remote::Lead(Some(_))),
+            "waiter should take the lock over, got {waited:?}"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "waiter didn't wait for the lock to expire"
+        );
+    }
+
+    /// A query running longer than the lock's expiry keeps the lock: other
+    /// PgDogs keep waiting instead of running it too.
+    async fn lock_is_kept_while_holder_runs(topology: Topology) {
+        let holder = cache(topology).await;
+        set_lock_ms(300);
+        let key = some_key(&holder).await;
+        let lock = acquired(holder.lock(&key).await);
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let other = other_pgdog().lock(&key).await;
+        lock.release().await;
+
+        assert!(
+            matches!(other, Lock::Held),
+            "lock expired while its holder was still running, got {other:?}"
         );
     }
 }

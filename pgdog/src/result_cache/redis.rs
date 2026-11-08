@@ -32,6 +32,8 @@ pub struct ResultCacheConfig {
     pub encryption_key: Option<String>,
     pub xfetch_beta: f64,
     pub adaptive_ttl_max: Option<Duration>,
+    /// Lock shared by PgDogs computing the same result. `None` disables it.
+    pub singleflight_lock: Option<Duration>,
     pub key_prefix: String,
     pub safe_schema_list: Vec<Regex>,
     pub unsafe_schema_list: Vec<Regex>,
@@ -61,6 +63,10 @@ impl ResultCacheConfig {
             encryption_key: rc.encryption_key,
             xfetch_beta: rc.xfetch_beta.unwrap_or(1.0),
             adaptive_ttl_max: rc.adaptive_ttl_max_seconds.map(Duration::from_secs),
+            singleflight_lock: Some(Duration::from_millis(
+                rc.singleflight_lock_ms.unwrap_or(1000),
+            ))
+            .filter(|lock| !lock.is_zero()),
             key_prefix: rc
                 .key_prefix
                 .unwrap_or_else(|| "pgdog:result_cache".to_string()),
@@ -167,7 +173,7 @@ impl RedisResultCache {
         &self.singleflight
     }
 
-    async fn ensure_connected(&self, cfg: &ResultCacheConfig) -> Option<()> {
+    pub(super) async fn ensure_connected(&self, cfg: &ResultCacheConfig) -> Option<()> {
         {
             let shared = self.shared.read();
             if shared.target.as_ref() == Some(&cfg.target)
@@ -203,7 +209,7 @@ impl RedisResultCache {
     /// After a timeout, a connection error, or a write refused by a former
     /// primary, stop using Redis for
     /// `RECONNECT_BACKOFF`, so queries don't each wait on it.
-    fn unavailable(&self, err: &redis::RedisError) {
+    pub(super) fn unavailable(&self, err: &redis::RedisError) {
         if !makes_unavailable(err) {
             return;
         }
@@ -217,7 +223,7 @@ impl RedisResultCache {
     }
 
     /// Handle to the shared Redis connection. Cheap to clone.
-    fn connection(&self) -> Option<Connection> {
+    pub(super) fn connection(&self) -> Option<Connection> {
         self.shared.read().connection.clone()
     }
 

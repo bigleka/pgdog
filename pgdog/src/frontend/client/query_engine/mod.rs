@@ -10,6 +10,7 @@ use crate::{
     },
     net::{ErrorResponse, Message, Parameters},
     result_cache::{
+        lock::{Lock, Remote, RemoteLock},
         redis::RedisResultCache,
         singleflight::{Flight, Leader},
         CacheableRequest,
@@ -80,6 +81,9 @@ struct ResultCacheCapture {
     /// Set when this client runs the query for others waiting on the same key.
     /// Dropping it without a result releases them.
     leader: Option<Leader>,
+    /// Lock making other PgDogs wait for this result. Dropping it without a
+    /// result lets them run the query.
+    remote_lock: Option<RemoteLock>,
     /// When the query started, to record how long it takes to compute.
     started: Instant,
 }
@@ -196,21 +200,26 @@ impl QueryEngine {
                         .build_key(cluster.name(), user, context.params, &req)
                         .await
                     {
-                        let leader = match cache.get(&key).await {
+                        let (leader, remote_lock) = match cache.get(&key).await {
                             Some(cached) => {
-                                // XFetch: lead an early refresh unless someone already is.
-                                let leader = cached
+                                // XFetch: lead an early refresh unless someone,
+                                // here or in another PgDog, already is.
+                                let refresh = match cached
                                     .refresh_early
                                     .then(|| cache.singleflight().join(&key.redis_key))
-                                    .and_then(|flight| match flight {
-                                        Flight::Leader(leader) => Some(leader),
-                                        Flight::Follower(_) => None,
-                                    });
+                                {
+                                    Some(Flight::Leader(leader)) => match cache.lock(&key).await {
+                                        Lock::Acquired(lock) => Some((leader, Some(lock))),
+                                        Lock::Unavailable => Some((leader, None)),
+                                        Lock::Held => None,
+                                    },
+                                    _ => None,
+                                };
 
-                                match leader {
-                                    Some(leader) => {
+                                match refresh {
+                                    Some((leader, lock)) => {
                                         crate::stats::ResultCache::early_refresh();
-                                        Some(leader)
+                                        (Some(leader), lock)
                                     }
                                     None => {
                                         let payload = &cached.entry.payload;
@@ -229,7 +238,25 @@ impl QueryEngine {
                                 // Coalesce concurrent misses: one client runs the query,
                                 // the others wait for its result.
                                 match cache.singleflight().join(&key.redis_key) {
-                                    Flight::Leader(leader) => Some(leader),
+                                    // Same between PgDogs sharing Redis.
+                                    Flight::Leader(leader) => {
+                                        match cache.lock_or_wait(&key).await {
+                                            Remote::Lead(lock) => (Some(leader), lock),
+                                            Remote::Served(entry) => {
+                                                crate::stats::ResultCache::remote_coalesced(
+                                                    entry.payload.len(),
+                                                );
+                                                let bytes_sent = context
+                                                    .stream
+                                                    .send_raw_flush(&entry.payload)
+                                                    .await?;
+                                                self.stats.sent(bytes_sent);
+                                                self.set_state(State::Idle);
+                                                leader.finish(entry.payload);
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
                                     Flight::Follower(follower) => {
                                         if let Some(payload) = follower.wait().await {
                                             crate::stats::ResultCache::coalesced(payload.len());
@@ -240,7 +267,7 @@ impl QueryEngine {
                                             return Ok(());
                                         }
                                         // Leader got no result to share: run the query ourselves.
-                                        None
+                                        (None, None)
                                     }
                                 }
                             }
@@ -253,6 +280,7 @@ impl QueryEngine {
                             bytes: Vec::new(),
                             errored: false,
                             leader,
+                            remote_lock,
                             started: Instant::now(),
                         });
                     }

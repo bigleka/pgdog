@@ -22,7 +22,7 @@ use super::{
 /// Large enough that any hit refreshes the entry.
 const ALWAYS: f64 = 1e9;
 
-fn set_xfetch_beta(beta: f64) {
+pub(super) fn set_xfetch_beta(beta: f64) {
     let mut config = config().deref().clone();
     if let Some(result_cache) = config.config.result_cache.as_mut() {
         result_cache.xfetch_beta = Some(beta);

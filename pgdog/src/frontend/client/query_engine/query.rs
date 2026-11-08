@@ -300,6 +300,9 @@ impl QueryEngine {
                     if let Some(leader) = capture.leader {
                         leader.finish(entry.payload);
                     }
+                    if let Some(lock) = capture.remote_lock {
+                        lock.release().await;
+                    }
                 }
             }
         }
