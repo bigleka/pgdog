@@ -341,3 +341,63 @@ mod test {
         assert_eq!(node_id(), Ok(1));
     }
 }
+
+/// Longest timer period armed. Longer ones, like `Duration::MAX` for
+/// "disabled", can't be added to a clock reading.
+const MAX_TIMER_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// [`tokio::time::interval`] that never ticks instead of panicking with
+/// "overflow when adding duration to instant" when `period` is too long
+/// (or zero) to schedule. Same name and behaviour as upstream PgDog's.
+pub(crate) fn safe_interval(period: Duration) -> SafeInterval {
+    SafeInterval(
+        (!period.is_zero() && period < MAX_TIMER_PERIOD).then(|| tokio::time::interval(period)),
+    )
+}
+
+/// Interval from [`safe_interval`]: disabled when its period wasn't usable.
+#[derive(Debug)]
+pub(crate) struct SafeInterval(Option<tokio::time::Interval>);
+
+impl SafeInterval {
+    pub(crate) async fn tick(&mut self) -> tokio::time::Instant {
+        match &mut self.0 {
+            Some(interval) => interval.tick().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod safe_interval_test {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::safe_interval;
+
+    /// `lsn_check_interval = Duration::MAX` (lsn checks off) used to panic
+    /// the shard monitor: "overflow when adding duration to instant".
+    #[tokio::test]
+    async fn test_huge_period_disables_the_timer() {
+        let mut interval = safe_interval(Duration::MAX / 2);
+        for _ in 0..2 {
+            assert!(
+                timeout(Duration::from_millis(20), interval.tick())
+                    .await
+                    .is_err(),
+                "disabled interval ticked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_regular_period_ticks() {
+        let mut interval = safe_interval(Duration::from_millis(5));
+        for _ in 0..3 {
+            timeout(Duration::from_secs(1), interval.tick())
+                .await
+                .expect("interval should tick");
+        }
+    }
+}
