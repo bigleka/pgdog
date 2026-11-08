@@ -9,8 +9,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  BUILDER_BASE: ghcr.io/${{ github.repository }}-base-builder:latest
-  RUNTIME_BASE: ghcr.io/${{ github.repository }}-base-runtime:latest
+  # Public base images from upstream. This fork doesn't publish its own:
+  # package-base is disabled in forks.
+  BUILDER_BASE: ghcr.io/pgdogdev/pgdog-base-builder:latest
+  RUNTIME_BASE: ghcr.io/pgdogdev/pgdog-base-runtime:latest
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
