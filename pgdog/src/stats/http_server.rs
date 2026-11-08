@@ -12,7 +12,8 @@ use tracing::info;
 
 use super::{Clients, MirrorStatsMetrics, Pools, QueryCache, ResultCache};
 
-async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// Everything the OpenMetrics endpoint serves.
+pub(crate) fn render() -> String {
     let clients = Clients::load();
     let pools = Pools::load();
     let mirror_stats: Vec<_> = MirrorStatsMetrics::load()
@@ -31,7 +32,7 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         .map(|m| m.to_string())
         .collect();
     let result_cache = result_cache.join("\n");
-    let metrics_data = clients.to_string()
+    clients.to_string()
         + "\n"
         + &pools.to_string()
         + "\n"
@@ -39,7 +40,11 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         + "\n"
         + &query_cache
         + "\n"
-        + &result_cache;
+        + &result_cache
+}
+
+async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let metrics_data = render();
     let response = Response::builder()
         .header(
             hyper::header::CONTENT_TYPE,

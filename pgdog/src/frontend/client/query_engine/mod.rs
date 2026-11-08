@@ -209,7 +209,7 @@ impl QueryEngine {
                     {
                         // Read-after-write: a table it reads was just written,
                         // here or through another PgDog.
-                        if key.read_primary {
+                        if key.read_primary && has_replicas(cluster) {
                             read_primary(context);
                         }
 
@@ -462,7 +462,7 @@ impl QueryEngine {
                 })
             })
         });
-        if reads_recent_write {
+        if reads_recent_write && self.backend.cluster().is_ok_and(has_replicas) {
             read_primary(context);
         }
     }
@@ -507,6 +507,11 @@ fn same_table(
     b: &crate::frontend::router::parser::OwnedTable,
 ) -> bool {
     a.name == b.name && a.schema == b.schema
+}
+
+/// Without replicas every read already runs on the primary.
+fn has_replicas(cluster: &crate::backend::Cluster) -> bool {
+    cluster.shards().iter().any(|shard| shard.has_replicas())
 }
 
 /// Run this read on the primary.

@@ -1,0 +1,62 @@
+# The rules of ../prometheus/alerts.yml for the Prometheus Operator. Keep
+# both in sync: a test compares their alerts (pgdog/src/stats/grafana.rs).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pgdog
+  labels:
+    release: prometheus # the label your Prometheus selects rules by
+spec:
+  groups:
+    - name: pgdog
+      rules:
+        - alert: PgDogDown
+          expr: up{job="pgdog"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PgDog {{ $labels.instance }} isn't answering metrics scrapes"
+
+        - alert: PgDogClientsWaiting
+          expr: sum by (instance, database) (cl_waiting) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Clients waiting for a connection on {{ $labels.database }} ({{ $labels.instance }})"
+            description: "Pools are too small for the load, or queries hold connections too long."
+
+        - alert: PgDogLongWait
+          expr: max by (instance, database) (maxwait) > 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A client waited over 1s for a connection on {{ $labels.database }} ({{ $labels.instance }})"
+
+        - alert: PgDogServerErrors
+          expr: sum by (instance, database) (rate(total_server_errors[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Postgres errors through PgDog on {{ $labels.database }} ({{ $labels.instance }})"
+
+        - alert: PgDogResultCacheRedisDown
+          expr: max by (instance) (result_cache_enabled) == 1 and min by (instance) (result_cache_redis_up) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PgDog {{ $labels.instance }} is skipping the result cache: Redis unavailable"
+            description: "Queries go straight to Postgres. Writes made meanwhile can't invalidate entries: they may be served until they expire once Redis is back."
+
+        - alert: PgDogResultCacheRedisErrors
+          expr: sum by (instance) (rate(result_cache_redis_errors[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis errors in the result cache of PgDog {{ $labels.instance }}"
+            description: "If Redis is healthy, check redis_response_timeout_ms isn't below its latency (docs/RESULT_CACHE.md#redis-timeouts)."

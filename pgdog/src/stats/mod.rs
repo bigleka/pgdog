@@ -1,5 +1,7 @@
 //! Statistics.
 pub mod clients;
+#[cfg(test)]
+mod grafana;
 pub mod http_server;
 pub mod mirror_stats;
 pub mod open_metric;
