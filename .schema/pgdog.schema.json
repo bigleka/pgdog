@@ -1530,6 +1530,15 @@
     "ResultCache": {
       "type": "object",
       "properties": {
+        "adaptive_ttl_max_seconds": {
+          "description": "Enable adaptive TTL: each hit pushes the entry's expiry to\n`expire_seconds` from now, so frequently read entries stay cached,\nbut never longer than this many seconds after the query ran.\n\n**Note:** changes made outside PgDog can stay invisible for up to\nthis long, instead of `expire_seconds`. Writes through PgDog still\ninvalidate entries immediately.\n\n_Default:_ disabled",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "cache_safe_schema_list": {
           "description": "Optional allow-list of schemas whose tables can be cached.\n\nEach entry is treated as a regular expression.",
           "type": "array",

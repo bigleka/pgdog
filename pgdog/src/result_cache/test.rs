@@ -15,7 +15,7 @@ fn cacheable_request_only_simple_select_read_route() {
 mod redis {
     //! Require Redis on 127.0.0.1:6379.
 
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use pgdog_config::ResultCache;
     use rand::{rng, Rng};
@@ -25,7 +25,7 @@ mod redis {
         frontend::router::parser::OwnedTable,
         net::Parameters,
         result_cache::{
-            redis::RedisResultCache, singleflight::Flight, xfetch::Entry, CacheableRequest,
+            entry::Entry, redis::RedisResultCache, singleflight::Flight, CacheableRequest,
         },
     };
 
@@ -43,8 +43,14 @@ mod redis {
     }
 
     fn entry(payload: &[u8]) -> Entry {
+        // Entries store milliseconds.
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         Entry {
             delta: Duration::from_millis(5),
+            computed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms as u64),
             payload: payload.to_vec(),
         }
     }
@@ -117,13 +123,14 @@ mod redis {
         let req = request(&table);
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
+        let stored = entry(b"fresh");
         cache
-            .set_with_table_tags("db", &key, &entry(b"fresh"), &req.tables)
+            .set_with_table_tags("db", &key, &stored, &req.tables)
             .await;
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         let cached = cache.get(&key).await.unwrap();
-        assert_eq!(cached.entry, entry(b"fresh"));
+        assert_eq!(cached.entry, stored);
         assert!(
             !cached.refresh_early,
             "fresh entry of a fast query refreshed early"

@@ -41,10 +41,19 @@ All clients of a process share one result cache and one Redis connection.
 
 Singleflight stops a stampede once an entry has expired. XFetch avoids most of them in the first place: a hit close to expiry may recompute the entry ahead of time, while it's still being served.
 
-- Each entry stores how long its query took to compute (`delta`). A hit refreshes it when `-delta * xfetch_beta * ln(rand)` reaches the entry's remaining TTL, so slow queries and entries near expiry refresh earlier (Vattani, Chierichetti, Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", VLDB 2015).
+- Each entry stores how long its query took to compute (`delta`, in microseconds). A hit refreshes it when `-delta * xfetch_beta * ln(rand)` reaches the entry's remaining TTL, so slow queries and entries near expiry refresh earlier (Vattani, Chierichetti, Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", VLDB 2015).
 - The refreshing client runs the query and gets the fresh result; it pays the query latency.
 - Only one client per PgDog process refreshes a given entry at a time. Hits on it during the refresh are served the current entry immediately.
 - `xfetch_beta` tunes it: above `1.0` refreshes earlier, below later, `0` disables it. Default `1.0`.
+
+## Adaptive TTL
+
+Off by default. With `adaptive_ttl_max_seconds` set, every hit pushes its entry's expiry to `expire_seconds` from now, so entries that keep being read stay cached and cold ones expire as usual. No entry lives longer than `adaptive_ttl_max_seconds` after its query ran.
+
+- Writes through PgDog still invalidate entries immediately.
+- Changes made **outside** PgDog (another application, a migration, `psql` straight to Postgres) can stay invisible for up to `adaptive_ttl_max_seconds` instead of `expire_seconds`. Pick the cap with that in mind.
+- The TTL update is sent to Redis in the background; the client doesn't wait for it.
+- Near the cap the remaining TTL shrinks again, so XFetch refreshes hot entries before they expire.
 
 ## Metrics
 
@@ -56,6 +65,7 @@ Exposed in OpenMetrics format on the PgDog metrics endpoint:
 | `result_cache_misses` | Cacheable queries not found in the cache |
 | `result_cache_coalesced` | Misses answered with another client's in-flight result (singleflight) |
 | `result_cache_early_refreshes` | Entries recomputed before expiry (XFetch) |
+| `result_cache_ttl_extensions` | Entries kept alive longer by a hit (adaptive TTL) |
 | `result_cache_stores` | Entries written |
 | `result_cache_bytes_served` / `result_cache_bytes_stored` | Bytes served from / written to the cache |
 | `result_cache_redis_errors` | Failed Redis calls |
@@ -72,6 +82,7 @@ expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
 xfetch_beta = 1.0
+# adaptive_ttl_max_seconds = 300  # off by default
 
 # Optional allow/deny lists (regex). Unsafe lists take precedence.
 cache_safe_schema_list = []

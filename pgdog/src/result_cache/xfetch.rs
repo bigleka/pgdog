@@ -11,47 +11,6 @@ use std::time::Duration;
 
 use rand::{rng, Rng};
 
-/// Format version of stored entries.
-pub const ENTRY_VERSION: u8 = 1;
-
-/// Version byte + compute time in milliseconds (u32, big endian).
-const HEADER_LEN: usize = 5;
-
-/// A cached result with the time it took to compute.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// How long the query took. Slower queries are refreshed earlier.
-    pub delta: Duration,
-    /// Postgres protocol messages sent to the client.
-    pub payload: Vec<u8>,
-}
-
-impl Entry {
-    pub fn encode(&self) -> Vec<u8> {
-        let delta_ms = u32::try_from(self.delta.as_millis()).unwrap_or(u32::MAX);
-        let mut bytes = Vec::with_capacity(HEADER_LEN + self.payload.len());
-        bytes.push(ENTRY_VERSION);
-        bytes.extend_from_slice(&delta_ms.to_be_bytes());
-        bytes.extend_from_slice(&self.payload);
-        bytes
-    }
-
-    /// `None` if `bytes` isn't an entry in the current format.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (header, payload) = bytes.split_at_checked(HEADER_LEN)?;
-        let (&version, delta_ms) = header.split_first()?;
-        if version != ENTRY_VERSION {
-            return None;
-        }
-        let delta_ms = u32::from_be_bytes(delta_ms.try_into().ok()?);
-
-        Some(Self {
-            delta: Duration::from_millis(delta_ms.into()),
-            payload: payload.to_vec(),
-        })
-    }
-}
-
 /// Whether a hit should refresh the entry now, given `u` drawn uniformly from (0, 1].
 ///
 /// Refresh when `-delta * beta * ln(u) >= remaining`. `beta` > 1 refreshes
@@ -108,22 +67,5 @@ mod test {
             let u = draw();
             assert!(u > 0.0 && u <= 1.0, "u = {u}");
         }
-    }
-
-    #[test]
-    fn test_entry_round_trip() {
-        let entry = Entry {
-            delta: Duration::from_millis(1234),
-            payload: b"rows".to_vec(),
-        };
-        let decoded = Entry::decode(&entry.encode()).unwrap();
-        assert_eq!(decoded, entry);
-    }
-
-    #[test]
-    fn test_entry_decode_rejects_malformed() {
-        assert_eq!(Entry::decode(b""), None);
-        assert_eq!(Entry::decode(&[ENTRY_VERSION, 0, 0]), None);
-        assert_eq!(Entry::decode(&[ENTRY_VERSION + 1, 0, 0, 0, 0, b'x']), None);
     }
 }

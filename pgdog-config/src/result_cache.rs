@@ -35,6 +35,17 @@ pub struct ResultCache {
     /// _Default:_ `1.0`
     pub xfetch_beta: Option<f64>,
 
+    /// Enable adaptive TTL: each hit pushes the entry's expiry to
+    /// `expire_seconds` from now, so frequently read entries stay cached,
+    /// but never longer than this many seconds after the query ran.
+    ///
+    /// **Note:** changes made outside PgDog can stay invisible for up to
+    /// this long, instead of `expire_seconds`. Writes through PgDog still
+    /// invalidate entries immediately.
+    ///
+    /// _Default:_ disabled
+    pub adaptive_ttl_max_seconds: Option<u64>,
+
     /// Optional allow-list of schemas whose tables can be cached.
     ///
     /// Each entry is treated as a regular expression.
