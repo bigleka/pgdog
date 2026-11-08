@@ -10,6 +10,7 @@ static BYTES_STORED: AtomicU64 = AtomicU64::new(0);
 static REDIS_ERRORS: AtomicU64 = AtomicU64::new(0);
 static COALESCED: AtomicU64 = AtomicU64::new(0);
 static EARLY_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static TTL_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
     name: String,
@@ -48,6 +49,11 @@ impl ResultCache {
     /// A hit picked by XFetch to recompute its entry before expiry.
     pub fn early_refresh() {
         EARLY_REFRESHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A hit pushed its entry's expiry forward (adaptive TTL).
+    pub fn ttl_extension() {
+        TTL_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics() -> Vec<Metric> {
@@ -92,6 +98,12 @@ impl ResultCache {
                 name: "result_cache_early_refreshes".into(),
                 help: "Result cache entries recomputed before expiry (XFetch)".into(),
                 value: EARLY_REFRESHES.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_ttl_extensions".into(),
+                help: "Result cache entries kept alive longer by a hit (adaptive TTL)".into(),
+                value: TTL_EXTENSIONS.load(Ordering::Relaxed),
                 gauge: false,
             }),
             Metric::new(ResultCacheMetric {

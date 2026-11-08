@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 // Additions for encryption
 use aes_gcm::aead::OsRng;
@@ -14,9 +17,7 @@ use tracing::warn;
 use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
 use super::{
-    singleflight::Singleflight,
-    xfetch::{self, Entry},
-    CacheableRequest, ResultCacheKey,
+    entry::Entry, singleflight::Singleflight, ttl, xfetch, CacheableRequest, ResultCacheKey,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub struct ResultCacheConfig {
     pub max_entry_bytes: usize,
     pub encryption_key: Option<String>,
     pub xfetch_beta: f64,
+    pub adaptive_ttl_max: Option<Duration>,
     pub key_prefix: String,
     pub safe_schema_list: Vec<Regex>,
     pub unsafe_schema_list: Vec<Regex>,
@@ -50,6 +52,7 @@ impl ResultCacheConfig {
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
             encryption_key: rc.encryption_key,
             xfetch_beta: rc.xfetch_beta.unwrap_or(1.0),
+            adaptive_ttl_max: rc.adaptive_ttl_max_seconds.map(Duration::from_secs),
             key_prefix: rc
                 .key_prefix
                 .unwrap_or_else(|| "pgdog:result_cache".to_string()),
@@ -172,6 +175,22 @@ impl RedisResultCache {
     /// Handle to the shared Redis connection. Cloning a `ConnectionManager` is cheap.
     fn connection(&self) -> Option<ConnectionManager> {
         self.shared.read().manager.clone()
+    }
+
+    /// Set the key's TTL in the background, so the client doesn't wait on it.
+    fn extend(&self, redis_key: &str, ttl: Duration, mut conn: ConnectionManager) {
+        let redis_key = redis_key.to_owned();
+        let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        tokio::spawn(async move {
+            let extended: redis::RedisResult<bool> = conn.pexpire(&redis_key, ttl_ms).await;
+            match extended {
+                Ok(_) => crate::stats::ResultCache::ttl_extension(),
+                Err(err) => {
+                    crate::stats::ResultCache::redis_error();
+                    warn!("result_cache ttl extension failed: {}", err);
+                }
+            }
+        });
     }
 
     fn tag_set_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
@@ -301,14 +320,20 @@ impl RedisResultCache {
         let entry = Entry::decode(&bytes)?;
 
         // PTTL is negative when the key has no expiry (or just expired).
-        let refresh_early = u64::try_from(pttl).is_ok_and(|remaining| {
-            xfetch::should_refresh(
-                Duration::from_millis(remaining),
-                entry.delta,
-                cfg.xfetch_beta,
-                xfetch::draw(),
-            )
+        let remaining = u64::try_from(pttl).ok().map(Duration::from_millis);
+        let refresh_early = remaining.is_some_and(|remaining| {
+            xfetch::should_refresh(remaining, entry.delta, cfg.xfetch_beta, xfetch::draw())
         });
+
+        // Adaptive TTL. Skipped when this hit refreshes the entry anyway.
+        if let (false, Some(remaining), Some(ttl), Some(max_age)) =
+            (refresh_early, remaining, key.ttl, cfg.adaptive_ttl_max)
+        {
+            let age = entry.age(SystemTime::now());
+            if let Some(extended) = ttl::extended_ttl(age, remaining, ttl, max_age) {
+                self.extend(&key.redis_key, extended, conn);
+            }
+        }
 
         Some(Cached {
             entry,
@@ -396,8 +421,10 @@ impl RedisResultCache {
             return;
         }
 
+        // Outlive the entries it points to, including adaptive TTL extensions.
         let ttl = key.ttl.unwrap_or_else(|| Duration::from_secs(30));
-        let set_ttl_secs = (ttl.as_secs().saturating_mul(2)).max(60);
+        let lifetime = cfg.adaptive_ttl_max.map_or(ttl, |max_age| max_age.max(ttl));
+        let set_ttl_secs = (lifetime.as_secs().saturating_mul(2)).max(60);
 
         let Some(mut conn) = self.connection() else {
             return;

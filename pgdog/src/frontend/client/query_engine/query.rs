@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use tokio::time::timeout;
 use tracing::{info, trace};
 
@@ -10,7 +12,7 @@ use crate::{
         DataRow, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
         RowDescription, ToBytes, TransactionState,
     },
-    result_cache::xfetch::Entry,
+    result_cache::entry::Entry,
     state::State,
 };
 
@@ -273,8 +275,13 @@ impl QueryEngine {
             // Store cached payload at the end of a successful exchange.
             if let Some(capture) = self.result_cache_capture.take() {
                 if !capture.errored && !context.in_transaction() {
+                    let delta = capture.started.elapsed();
                     let entry = Entry {
-                        delta: capture.started.elapsed(),
+                        delta,
+                        // When the query started: the data is as of then.
+                        computed_at: SystemTime::now()
+                            .checked_sub(delta)
+                            .unwrap_or_else(SystemTime::now),
                         payload: capture.bytes,
                     };
                     if let Some(ref cache) = self.result_cache {
