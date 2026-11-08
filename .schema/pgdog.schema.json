@@ -1498,6 +1498,21 @@
         }
       ]
     },
+    "RedisMode": {
+      "description": "How the result cache connects to Redis.",
+      "oneOf": [
+        {
+          "description": "One Redis server at `redis_url`, or a proxy such as twemproxy or Envoy in front of several.",
+          "type": "string",
+          "const": "standalone"
+        },
+        {
+          "description": "Redis Cluster, discovered from `redis_urls`.",
+          "type": "string",
+          "const": "cluster"
+        }
+      ]
+    },
     "ReplicaLag": {
       "description": "Replica lag banning configuration. When a replica's replication lag exceeds the threshold, it is banned from serving read queries.",
       "type": "object",
@@ -1608,10 +1623,23 @@
           "format": "uint",
           "minimum": 0
         },
+        "redis_mode": {
+          "description": "How PgDog connects to Redis.\n\n_Default:_ `standalone`",
+          "$ref": "#/$defs/RedisMode",
+          "default": "standalone"
+        },
         "redis_url": {
           "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
           "type": "string",
           "default": ""
+        },
+        "redis_urls": {
+          "description": "Redis nodes for `redis_mode = \"cluster\"`: one or more cluster nodes to\ndiscover the cluster from. Falls back to `redis_url` when empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "xfetch_beta": {
           "description": "How eagerly hits refresh entries before they expire (XFetch).\n\nA hit refreshes its entry when `-compute_time * xfetch_beta * ln(rand)`\nreaches the entry's remaining TTL, so hot and slow queries are\nrecomputed by one client ahead of expiry instead of by every client\nafter it. Values above `1.0` refresh earlier, below later; `0` disables\nearly refresh.\n\n_Default:_ `1.0`",

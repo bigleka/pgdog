@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 // Additions for encryption
@@ -9,7 +9,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use redis::{aio::ConnectionManager, AsyncCommands};
+use redis::AsyncCommands;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -17,13 +17,16 @@ use tracing::warn;
 use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
 use super::{
-    entry::Entry, singleflight::Singleflight, ttl, xfetch, CacheableRequest, ResultCacheKey,
+    connection::{Connection, Target},
+    entry::Entry,
+    singleflight::Singleflight,
+    ttl, xfetch, CacheableRequest, ResultCacheKey,
 };
 
 #[derive(Debug, Clone)]
 pub struct ResultCacheConfig {
     pub enabled: bool,
-    pub redis_url: String,
+    pub target: Target,
     pub expire_seconds: Option<u64>,
     pub max_entry_bytes: usize,
     pub encryption_key: Option<String>,
@@ -46,7 +49,7 @@ impl ResultCacheConfig {
 
         Some(Self {
             enabled: rc.enabled,
-            redis_url: rc.redis_url,
+            target: Target::new(rc.redis_mode, &rc.redis_url, &rc.redis_urls),
             // Apply a default TTL when not provided.
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
@@ -99,11 +102,17 @@ impl ResultCacheConfig {
     }
 }
 
+/// After failing to connect, how long to leave Redis alone. Queries skip the
+/// cache meanwhile instead of each one waiting on a connection attempt.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 struct Shared {
-    current_url: Option<String>,
-    manager: Option<redis::aio::ConnectionManager>,
+    target: Option<Target>,
+    connection: Option<Connection>,
     prefix: String,
+    /// Last failed connection attempt, and what it was for.
+    failed: Option<(Instant, Target)>,
 }
 
 /// A cache hit.
@@ -127,9 +136,10 @@ impl Default for RedisResultCache {
     fn default() -> Self {
         Self {
             shared: Arc::new(RwLock::new(Shared {
-                current_url: None,
-                manager: None,
+                target: None,
+                connection: None,
                 prefix: "pgdog:result_cache".into(),
+                failed: None,
             })),
             singleflight: Singleflight::default(),
         }
@@ -155,30 +165,62 @@ impl RedisResultCache {
     async fn ensure_connected(&self, cfg: &ResultCacheConfig) -> Option<()> {
         {
             let shared = self.shared.read();
-            if shared.current_url.as_deref() == Some(cfg.redis_url.as_str())
-                && shared.manager.is_some()
+            if shared.target.as_ref() == Some(&cfg.target)
+                && shared.connection.is_some()
                 && shared.prefix == cfg.key_prefix
             {
                 return Some(());
             }
+            if let Some((at, target)) = &shared.failed {
+                if target == &cfg.target && at.elapsed() < RECONNECT_BACKOFF {
+                    return None;
+                }
+            }
         }
 
-        let client = redis::Client::open(cfg.redis_url.as_str()).ok()?;
-        let manager = client.get_connection_manager().await.ok()?;
+        let connection = match Connection::open(&cfg.target).await {
+            Ok(connection) => connection,
+            Err(err) => {
+                crate::stats::ResultCache::redis_error();
+                warn!("result_cache: can't connect to {:?}: {}", cfg.target, err);
+                self.shared.write().failed = Some((Instant::now(), cfg.target.clone()));
+                return None;
+            }
+        };
         let mut shared = self.shared.write();
-        shared.current_url = Some(cfg.redis_url.clone());
-        shared.manager = Some(manager);
+        shared.target = Some(cfg.target.clone());
+        shared.connection = Some(connection);
         shared.prefix = cfg.key_prefix.clone();
+        shared.failed = None;
         Some(())
     }
 
-    /// Handle to the shared Redis connection. Cloning a `ConnectionManager` is cheap.
-    fn connection(&self) -> Option<ConnectionManager> {
-        self.shared.read().manager.clone()
+    /// After a timeout or connection error, stop using Redis for
+    /// `RECONNECT_BACKOFF`, so queries don't each wait on it.
+    fn unavailable(&self, err: &redis::RedisError) {
+        if !(err.is_timeout()
+            || err.is_io_error()
+            || err.is_connection_dropped()
+            || err.is_connection_refusal())
+        {
+            return;
+        }
+
+        let mut shared = self.shared.write();
+        if let Some(target) = shared.target.take() {
+            warn!("result_cache: Redis unavailable, skipping the cache for {RECONNECT_BACKOFF:?}");
+            shared.failed = Some((Instant::now(), target));
+        }
+        shared.connection = None;
+    }
+
+    /// Handle to the shared Redis connection. Cheap to clone.
+    fn connection(&self) -> Option<Connection> {
+        self.shared.read().connection.clone()
     }
 
     /// Set the key's TTL in the background, so the client doesn't wait on it.
-    fn extend(&self, redis_key: &str, ttl: Duration, mut conn: ConnectionManager) {
+    fn extend(&self, redis_key: &str, ttl: Duration, mut conn: Connection) {
         let redis_key = redis_key.to_owned();
         let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
         tokio::spawn(async move {
@@ -224,6 +266,7 @@ impl RedisResultCache {
                 Ok(generations) => generations,
                 Err(err) => {
                     crate::stats::ResultCache::redis_error();
+                    self.unavailable(&err);
                     warn!("result_cache generation lookup failed: {}", err);
                     return None;
                 }
@@ -296,6 +339,7 @@ impl RedisResultCache {
             Ok(reply) => reply,
             Err(err) => {
                 crate::stats::ResultCache::redis_error();
+                self.unavailable(&err);
                 warn!("result_cache get failed: {}", err);
                 return None;
             }
@@ -392,6 +436,7 @@ impl RedisResultCache {
 
         if let Err(err) = res {
             crate::stats::ResultCache::redis_error();
+            self.unavailable(&err);
             warn!("result_cache set failed: {}", err);
         }
     }
@@ -457,6 +502,7 @@ impl RedisResultCache {
             let bumped: redis::RedisResult<u64> = conn.incr(&generation_key, 1).await;
             if let Err(err) = bumped {
                 crate::stats::ResultCache::redis_error();
+                self.unavailable(&err);
                 warn!("result_cache generation bump failed: {}", err);
             }
 
@@ -471,6 +517,7 @@ impl RedisResultCache {
                 }
                 Err(err) => {
                     crate::stats::ResultCache::redis_error();
+                    self.unavailable(&err);
                     warn!("result_cache invalidate failed: {}", err);
                 }
             }

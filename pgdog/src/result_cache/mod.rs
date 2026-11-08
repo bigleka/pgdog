@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod entry;
 pub mod redis;
 pub mod singleflight;

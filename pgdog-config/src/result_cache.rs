@@ -12,6 +12,17 @@ pub struct ResultCache {
     #[serde(default)]
     pub redis_url: String,
 
+    /// How PgDog connects to Redis.
+    ///
+    /// _Default:_ `standalone`
+    #[serde(default)]
+    pub redis_mode: RedisMode,
+
+    /// Redis nodes for `redis_mode = "cluster"`: one or more cluster nodes to
+    /// discover the cluster from. Falls back to `redis_url` when empty.
+    #[serde(default)]
+    pub redis_urls: Vec<String>,
+
     /// Optional expiration time for cached entries (seconds).
     pub expire_seconds: Option<u64>,
 
@@ -73,4 +84,15 @@ pub struct ResultCache {
     /// either `table` or `schema.table` when schema is present.
     #[serde(default)]
     pub cache_unsafe_table_list: Vec<String>,
+}
+
+/// How the result cache connects to Redis.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisMode {
+    /// One Redis server at `redis_url`, or a proxy such as twemproxy or Envoy in front of several.
+    #[default]
+    Standalone,
+    /// Redis Cluster, discovered from `redis_urls`.
+    Cluster,
 }
