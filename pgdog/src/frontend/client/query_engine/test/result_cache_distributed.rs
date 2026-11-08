@@ -58,7 +58,7 @@ async fn cached_entry(client: &mut TestClient, table: &TestTable) -> (ResultCach
     );
     let mut redis = redis().await;
     let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(format!("{}:v2:*", key_prefix()))
+        .arg(format!("{}:v3:*", key_prefix()))
         .query_async(&mut redis)
         .await
         .unwrap();

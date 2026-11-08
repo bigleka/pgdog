@@ -59,6 +59,19 @@ impl Parse {
     }
 
     /// Anonymous prepared statement.
+    /// Anonymous statement with parameter types (OIDs).
+    #[cfg(test)]
+    pub fn new_anonymous_typed(query: &str, types: &[i32]) -> Self {
+        let mut data_types = (types.len() as i16).to_be_bytes().to_vec();
+        for oid in types {
+            data_types.extend_from_slice(&oid.to_be_bytes());
+        }
+        Self {
+            data_types: Bytes::from(data_types),
+            ..Self::new_anonymous(query)
+        }
+    }
+
     pub fn anonymous(&self) -> bool {
         self.name.len() == 1 // Just the null byte.
     }

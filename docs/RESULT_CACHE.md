@@ -5,6 +5,7 @@ PgDog supports an **experimental** Redis/RESP-backed **query result cache** insp
 ## What it does (MVP)
 
 - Caches **SELECT results** and returns the cached Postgres-protocol response on cache hit.
+- Over the simple protocol (`Query`) and the extended protocol (`Parse`/`Bind`/`Execute`, used by most drivers for parameterized queries). See [Extended protocol](#extended-protocol).
 - Stores a binary payload containing the response messages (e.g. `RowDescription` + `DataRow*` + `CommandComplete` + `ReadyForQuery`).
 
 ## Conservative invalidation (MVP)
@@ -67,6 +68,16 @@ Before changing them:
 5. **Sentinel:** the time to move to a new primary is set in Sentinel, not here: `down-after-milliseconds` (Redis default 30000) plus the failover itself. Until then PgDog skips the cache and serves from Postgres. Lower `down-after-milliseconds` in `sentinel.conf` if that's too long, keeping it above your network's normal hiccups.
 6. **Check after each change**, one option at a time: `result_cache_redis_errors` and "Redis unavailable" warnings in the logs should stay at zero while Redis is healthy, and the hit rate (`result_cache_hits` vs `result_cache_misses`) shouldn't drop. Changing these settings reconnects to Redis on the next query.
 
+## Extended protocol
+
+A request is cached when it runs one statement and ends with `Sync`: `[Parse] Bind [Describe] Execute Sync`, the way drivers send a parameterized query. Named and unnamed statements both work.
+
+- The key covers the query, the parameter values and types, the parameter and result formats (text or binary), and which messages were sent. A hit replies with exactly the messages a miss would have (`ParseComplete`, `BindComplete`, `ParameterDescription`, `RowDescription`), so the same SQL over the simple protocol, or with or without `Describe`, gets its own entry.
+- Statement names don't count: clients naming the same statement differently share entries.
+- A statement whose `Parse` was answered from the cache never reached Postgres. PgDog prepares it on the server when a later `Bind` needs it, as it does for any prepared statement.
+- Not cached: `Execute` with a row limit (partial results), pipelines of several statements before `Sync`, and requests ending in `Flush` instead of `Sync`.
+- Writes over the extended protocol invalidate like any other.
+
 ## Read-after-write (replicas)
 
 With replicas, a read right after a write can land on a replica that hasn't replayed the write yet. Worse, without protection, the cache would then store that stale result under the table's new generation and serve it to every client until it expires.
@@ -74,7 +85,7 @@ With replicas, a read right after a write can land on a replica that hasn't repl
 For `read_after_write_window_ms` (default `1000`) after a write to a table, reads of that table go to the primary:
 
 - **Every client and every PgDog sharing Redis.** The table's generation in Redis is the time of its last write (Redis clock, in ms), so building the cache key tells whether it was just written, with no extra round trip. Results stored meanwhile come from the primary.
-- **The session that wrote, for any read.** Reads PgDog doesn't cache (tables in the unsafe lists, the extended protocol) still go to the primary for that session's own writes.
+- **The session that wrote, for any read.** Reads PgDog doesn't cache (tables in the unsafe lists, pipelines) still go to the primary for that session's own writes.
 - Explicit transactions (other than `BEGIN READ ONLY`) already run on the primary.
 - It applies with `read_write_split = "exclude_primary"` too: these reads go to the primary anyway.
 - After the window, reads go back to the replicas. The cache keeps serving what the primary returned.
@@ -182,7 +193,7 @@ cache_unsafe_table_list = []
 
 ## Current limitations
 
-- Only caches **simple query protocol** (`Query` message) requests.
+- Over the extended protocol, only one statement per `Sync` (see [Extended protocol](#extended-protocol)).
 - Skips caching inside explicit transactions.
 - Session signature is conservative and may lead to fewer cache hits (by design).
 

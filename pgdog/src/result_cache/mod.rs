@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::frontend::router::parser::OwnedTable;
 use crate::frontend::ClientRequest;
+use crate::net::{ProtocolMessage, ToBytes};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResultCacheKey {
@@ -35,23 +36,31 @@ pub fn read_after_write_window() -> Option<Duration> {
 #[derive(Debug, Clone)]
 pub struct CacheableRequest {
     pub query: String,
+    /// Everything besides the query that changes the reply: which messages
+    /// were sent (the reply has one message per request message), parameter
+    /// types and values, and parameter and result formats.
+    pub variant: Vec<u8>,
     pub route_sig: &'static str,
     pub tables: Vec<OwnedTable>,
 }
 
 impl CacheableRequest {
     pub fn from_client_request(client_request: &ClientRequest) -> Option<Self> {
-        // MVP: only simple query protocol, exactly one Query message.
-        if client_request.messages.len() != 1 {
-            return None;
-        }
+        let variant = variant(&client_request.messages)?;
 
-        let buffered = client_request.query().ok()??;
-        let query = match buffered {
-            crate::frontend::BufferedQuery::Query(q) => q.query().to_string(),
-            _ => return None,
+        let query = match client_request.query().ok()?? {
+            crate::frontend::BufferedQuery::Query(query) => query.query().to_string(),
+            crate::frontend::BufferedQuery::Prepared(parse) => {
+                // Parameter types change how values are read.
+                let mut variant = variant;
+                variant.extend_from_slice(&parse.data_types_ref());
+                return Self::new(client_request, parse.query().to_string(), variant);
+            }
         };
+        Self::new(client_request, query, variant)
+    }
 
+    fn new(client_request: &ClientRequest, query: String, variant: Vec<u8>) -> Option<Self> {
         let route = client_request.route();
         if !route.is_read() {
             return None;
@@ -70,10 +79,53 @@ impl CacheableRequest {
 
         Some(Self {
             query,
+            variant,
             route_sig,
             tables,
         })
     }
+}
+
+/// What, besides the query, the reply depends on, if the request can be
+/// cached: one simple query, or one statement over the extended protocol
+/// (`[Parse] Bind [Describe] Execute Sync`) returning all its rows.
+fn variant(messages: &[ProtocolMessage]) -> Option<Vec<u8>> {
+    use ProtocolMessage::*;
+
+    if let [Query(_)] = messages {
+        return Some(b"Q".to_vec());
+    }
+
+    let (parse, rest) = match messages {
+        [Parse(_), rest @ ..] => (true, rest),
+        rest => (false, rest),
+    };
+    let (bind, describe, execute) = match rest {
+        [Bind(bind), Describe(describe), Execute(execute), Sync(_)] => {
+            (bind, Some(describe), execute)
+        }
+        [Bind(bind), Execute(execute), Sync(_)] => (bind, None, execute),
+        _ => return None,
+    };
+    // A row limit returns part of the result.
+    if execute.max_rows() != 0 {
+        return None;
+    }
+
+    let mut variant = Vec::new();
+    if parse {
+        variant.push(b'P');
+    }
+    variant.push(b'B');
+    if let Some(describe) = describe {
+        variant.extend_from_slice(&[b'D', describe.kind() as u8]);
+    }
+    variant.push(b'E');
+    // Formats and values, not statement names: they're the client's.
+    let mut bind = bind.clone();
+    bind.rename("");
+    variant.extend_from_slice(&bind.to_bytes().ok()?);
+    Some(variant)
 }
 
 #[cfg(test)]

@@ -154,6 +154,7 @@ mod redis {
         let names: Vec<_> = tables.iter().map(|table| table.name.as_str()).collect();
         CacheableRequest {
             query: format!("SELECT * FROM {}", names.join(", ")),
+            variant: b"Q".to_vec(),
             route_sig: "direct",
             tables: tables.to_vec(),
         }
