@@ -429,7 +429,7 @@
           "minimum": 0
         },
         "pooler_mode": {
-          "description": "Overrides the `pooler_mode` setting. Connections to this database will use this connection pool mode.\n\nhttps://docs.pgdog.dev/configuration/pgdog.toml/databases/#pooler_mode",
+          "description": "Overrides the `pooler_mode` setting. Connections to this database will use this connection pool mode.\n\n**Note:** a `pooler_mode` set on the user in `users.toml` takes precedence over this one.\n\nhttps://docs.pgdog.dev/configuration/pgdog.toml/databases/#pooler_mode",
           "anyOf": [
             {
               "$ref": "#/$defs/PoolerMode"

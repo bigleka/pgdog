@@ -227,6 +227,8 @@ pub struct User {
     pub min_pool_size: Option<usize>,
     /// Overrides [`pooler_mode`](https://docs.pgdog.dev/configuration/pgdog.toml/general/) for this user. This allows users in [session mode](https://docs.pgdog.dev/features/session-mode/) to connect to the same PgDog instance as users in [transaction mode](https://docs.pgdog.dev/features/transaction-mode/).
     ///
+    /// **Note:** takes precedence over the database's `pooler_mode` in `pgdog.toml`.
+    ///
     /// https://docs.pgdog.dev/configuration/users.toml/users/#pooler_mode
     pub pooler_mode: Option<PoolerMode>,
     /// Which user to connect with when creating backend connections from PgDog to PostgreSQL. By default, the user configured in `name` is used. This setting allows you to override this configuration and use a different user.
