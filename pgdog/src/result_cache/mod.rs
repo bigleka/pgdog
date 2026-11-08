@@ -1,4 +1,5 @@
 pub mod redis;
+pub mod singleflight;
 
 use std::time::Duration;
 

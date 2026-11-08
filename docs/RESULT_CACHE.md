@@ -26,6 +26,17 @@ To avoid stale results while still being precise, PgDog uses **table-based inval
 - Writes that don't go through PgDog are not seen; their results stay cached until
   `expire_seconds` passes.
 
+## Stampede protection (singleflight)
+
+When several clients of the same PgDog process miss on the same cache key at once (e.g. a hot entry just expired), only the first one runs the query. The others wait for its result and get it as a cache hit, so the database sees one query instead of one per client.
+
+- The result is stored in Redis before waiting clients are released, so clients arriving afterwards hit the cache.
+- If the first client gets no result to share (the query fails, the result can't be cached, or it disconnects), waiting clients run the query themselves.
+- Waiting has no timeout of its own: it lasts as long as the first client's query.
+- Coalescing is per PgDog process. Separate PgDog instances each run the query once.
+
+All clients of a process share one result cache and one Redis connection.
+
 ## Configuration
 
 Add this section to `pgdog.toml`:

@@ -1,22 +1,24 @@
 //! Result cache tests. Require Redis on 127.0.0.1:6379.
 
-use std::ops::Deref;
+use std::{ops::Deref, time::Duration};
+
+use futures::future::join_all;
 
 use pgdog_config::{QueryParserLevel, ResultCache};
 use rand::{rng, Rng};
 
 use crate::{
-    backend::{databases::reload_from_existing, server::test::test_server},
+    backend::{databases::reload_from_existing, server::test::test_server, Server},
     config::{config, load_test, set},
-    net::{DataRow, Message},
+    net::{DataRow, Message, ReadyForQuery},
 };
 
 use super::prelude::*;
 
 const REDIS_URL: &str = "redis://127.0.0.1:6379";
 
-/// Client with the result cache enabled, using a key prefix unique to this test run.
-async fn result_cache_client(query_parser: QueryParserLevel) -> TestClient {
+/// Enable the result cache, using a key prefix unique to this test run.
+fn enable_result_cache(query_parser: QueryParserLevel) {
     load_test();
 
     let mut config = config().deref().clone();
@@ -29,7 +31,11 @@ async fn result_cache_client(query_parser: QueryParserLevel) -> TestClient {
     });
     set(config).unwrap();
     reload_from_existing().unwrap();
+}
 
+/// Client with the result cache enabled, using a key prefix unique to this test run.
+async fn result_cache_client(query_parser: QueryParserLevel) -> TestClient {
+    enable_result_cache(query_parser);
     TestClient::new(Parameters::default()).await
 }
 
@@ -153,4 +159,348 @@ async fn test_pending_invalidations_dedup_until_commit() {
 
     assert_eq!(pending, 1);
     assert_eq!(pending_after_commit, 0);
+}
+
+/// Cache stampede: many clients miss on the same key at once. Only one of
+/// them should run the query; the others wait for its result.
+#[tokio::test]
+async fn test_concurrent_misses_run_query_once() {
+    const CLIENTS: usize = 8;
+    let suffix = rng().random::<u32>();
+    let hits = format!("result_cache_hits_{suffix}");
+    let function = format!("result_cache_slow_{suffix}");
+
+    let mut direct = test_server().await;
+    direct
+        .execute(format!("CREATE TABLE {hits} (id SERIAL)"))
+        .await
+        .unwrap();
+    // Records every execution and takes long enough for all clients to miss.
+    direct
+        .execute(format!(
+            "CREATE FUNCTION {function}() RETURNS INT LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {hits} DEFAULT VALUES; PERFORM pg_sleep(0.5); RETURN 42; END $$"
+        ))
+        .await
+        .unwrap();
+
+    enable_result_cache(QueryParserLevel::On);
+    let mut clients = Vec::with_capacity(CLIENTS);
+    for _ in 0..CLIENTS {
+        clients.push(TestClient::new(Parameters::default()).await);
+    }
+
+    let select = format!("SELECT {function}()");
+    let values = join_all(
+        clients
+            .iter_mut()
+            .map(|client| select_value(client, &select)),
+    )
+    .await;
+
+    let executions = direct
+        .execute(format!("SELECT count(*) FROM {hits}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.code() == 'D')
+        .and_then(|message| DataRow::try_from(message).ok())
+        .and_then(|row| row.get_int(0, true));
+    direct
+        .execute(format!("DROP FUNCTION {function}(); DROP TABLE {hits}"))
+        .await
+        .unwrap();
+
+    assert!(values.iter().all(|value| value.as_deref() == Some("42")));
+    assert_eq!(
+        executions,
+        Some(1),
+        "query should run once, not once per client"
+    );
+}
+
+/// When the leader's query fails there's nothing to share: every waiting
+/// client must get its own reply instead of hanging.
+#[tokio::test]
+async fn test_concurrent_misses_on_failing_query_dont_hang() {
+    const CLIENTS: usize = 4;
+    let function = format!("result_cache_fail_{}", rng().random::<u32>());
+
+    let mut direct = test_server().await;
+    direct
+        .execute(format!(
+            "CREATE FUNCTION {function}() RETURNS INT LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_sleep(0.3); RAISE EXCEPTION 'boom'; END $$"
+        ))
+        .await
+        .unwrap();
+
+    enable_result_cache(QueryParserLevel::On);
+    let mut clients = Vec::with_capacity(CLIENTS);
+    for _ in 0..CLIENTS {
+        clients.push(TestClient::new(Parameters::default()).await);
+    }
+
+    let select = format!("SELECT {function}()");
+    let replies = tokio::time::timeout(
+        Duration::from_secs(10),
+        join_all(clients.iter_mut().map(|client| async {
+            client.send(Query::new(select.as_str())).await;
+            client.try_process().await.unwrap();
+            client.read_until('Z').await
+        })),
+    )
+    .await;
+
+    direct
+        .execute(format!("DROP FUNCTION {function}()"))
+        .await
+        .unwrap();
+
+    let replies = replies.expect("clients waiting on a failed leader hung");
+    assert!(
+        replies.iter().all(|reply| reply.is_err()),
+        "every client should get the error"
+    );
+}
+
+/// Table `(id INT PRIMARY KEY, v INT)` holding the row `(1, 1)`, created directly in Postgres.
+struct TestTable {
+    name: String,
+    direct: Server,
+}
+
+impl TestTable {
+    async fn new() -> Self {
+        let name = format!("result_cache_{}", rng().random::<u32>());
+        let mut direct = test_server().await;
+        direct
+            .execute(format!("CREATE TABLE {name} (id INT PRIMARY KEY, v INT)"))
+            .await
+            .unwrap();
+        direct
+            .execute(format!("INSERT INTO {name} VALUES (1, 1)"))
+            .await
+            .unwrap();
+        Self { name, direct }
+    }
+
+    fn select(&self) -> String {
+        format!("SELECT v FROM {} WHERE id = 1", self.name)
+    }
+
+    /// Write that bypasses PgDog, so it can't invalidate anything.
+    async fn update_directly(&mut self, value: i32) {
+        self.direct
+            .execute(format!("UPDATE {} SET v = {value} WHERE id = 1", self.name))
+            .await
+            .unwrap();
+    }
+
+    async fn drop(mut self) {
+        self.direct
+            .execute(format!("DROP TABLE {}", self.name))
+            .await
+            .unwrap();
+    }
+}
+
+/// Fill the cache for `table.select()` and prove later reads are cache hits.
+async fn prime_cache(client: &mut TestClient, table: &mut TestTable) {
+    assert_eq!(
+        select_value(client, &table.select()).await.as_deref(),
+        Some("1")
+    );
+    table.update_directly(1000).await;
+    assert_eq!(
+        select_value(client, &table.select()).await.as_deref(),
+        Some("1"),
+        "precondition: query should be served from the cache"
+    );
+    table.update_directly(1).await;
+}
+
+/// A cached reply replays the ReadyForQuery it was captured with. Inside a
+/// transaction it must still tell the client it's in a transaction.
+#[tokio::test]
+async fn test_hit_inside_transaction_reports_transaction_status() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let mut table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+    prime_cache(&mut client, &mut table).await;
+
+    simple(&mut client, "BEGIN").await;
+    let reply = simple(&mut client, &table.select()).await;
+    simple(&mut client, "ROLLBACK").await;
+    table.drop().await;
+
+    let rfq = ReadyForQuery::try_from(reply.last().unwrap().clone()).unwrap();
+    assert_eq!(
+        rfq.status, 'T',
+        "client was told it's idle while in a transaction"
+    );
+}
+
+/// Rows written by an uncommitted (later rolled back) transaction must never
+/// reach other sessions through the cache.
+#[tokio::test]
+async fn test_uncommitted_write_not_served_to_other_sessions() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let table = TestTable::new().await;
+    let mut writer = TestClient::new(Parameters::default()).await;
+    let mut reader = TestClient::new(Parameters::default()).await;
+
+    simple(&mut writer, "BEGIN").await;
+    simple(
+        &mut writer,
+        &format!("UPDATE {} SET v = 2 WHERE id = 1", table.name),
+    )
+    .await;
+    assert_eq!(
+        select_value(&mut writer, &table.select()).await.as_deref(),
+        Some("2")
+    );
+
+    let during = select_value(&mut reader, &table.select()).await;
+    simple(&mut writer, "ROLLBACK").await;
+    let after_rollback = select_value(&mut reader, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(
+        during.as_deref(),
+        Some("1"),
+        "uncommitted row served to another session"
+    );
+    assert_eq!(
+        after_rollback.as_deref(),
+        Some("1"),
+        "rolled back row served after ROLLBACK"
+    );
+}
+
+/// Another session reading while a write transaction is open caches the old
+/// (still correct) value. COMMIT must invalidate it.
+#[tokio::test]
+async fn test_commit_invalidates_reads_cached_during_transaction() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let table = TestTable::new().await;
+    let mut writer = TestClient::new(Parameters::default()).await;
+    let mut reader = TestClient::new(Parameters::default()).await;
+
+    simple(&mut writer, "BEGIN").await;
+    simple(
+        &mut writer,
+        &format!("UPDATE {} SET v = 2 WHERE id = 1", table.name),
+    )
+    .await;
+    assert_eq!(
+        select_value(&mut reader, &table.select()).await.as_deref(),
+        Some("1")
+    );
+    simple(&mut writer, "COMMIT").await;
+
+    let after_commit = select_value(&mut reader, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(
+        after_commit.as_deref(),
+        Some("2"),
+        "stale value served after COMMIT"
+    );
+}
+
+/// Writes that aren't INSERT/UPDATE/DELETE must also invalidate.
+#[tokio::test]
+async fn test_truncate_invalidates() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let mut table = TestTable::new().await;
+    let mut writer = TestClient::new(Parameters::default()).await;
+    let mut reader = TestClient::new(Parameters::default()).await;
+    prime_cache(&mut reader, &mut table).await;
+
+    simple(&mut writer, &format!("TRUNCATE {}", table.name)).await;
+    let after = select_value(&mut reader, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(after, None, "rows served after TRUNCATE");
+}
+
+/// A cached extended-protocol reply must match the messages the client sent:
+/// Bind+Execute+Sync gets no ParseComplete.
+#[tokio::test]
+async fn test_extended_hit_matches_request_messages() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+    let param = [Parameter {
+        len: 1,
+        data: "1".as_bytes().into(),
+    }];
+
+    client
+        .send(Parse::named(
+            "stmt",
+            format!("SELECT v FROM {} WHERE id = $1", table.name),
+        ))
+        .await;
+    client.send(Bind::new_params("stmt", &param)).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+
+    client.send(Bind::new_params("stmt", &param)).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+    let reply = client.read_until('Z').await.unwrap();
+    table.drop().await;
+
+    let codes: String = reply.iter().map(|message| message.code()).collect();
+    assert_eq!(codes, "2DCZ", "reply doesn't match Bind+Execute+Sync");
+}
+
+/// Same query and parameters, different result format: the second client
+/// asked for binary and must not get the cached text rows.
+#[tokio::test]
+async fn test_extended_hit_respects_result_format() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+    let query = format!("SELECT v FROM {} WHERE id = $1", table.name);
+    let param = [Parameter {
+        len: 1,
+        data: "1".as_bytes().into(),
+    }];
+
+    for results in [&[0][..], &[1][..]] {
+        client.send(Parse::named("stmt_fmt", &query)).await;
+        client
+            .send(Bind::new_params_codes_results(
+                "stmt_fmt",
+                &param,
+                &[],
+                results,
+            ))
+            .await;
+        client.send(Execute::new()).await;
+        client.send(Sync).await;
+        client.try_process().await.unwrap();
+        let reply = client.read_until('Z').await.unwrap();
+
+        if results == [1] {
+            table.drop().await;
+            let row = reply
+                .iter()
+                .find(|message| message.code() == 'D')
+                .and_then(|message| DataRow::try_from(message.clone()).ok())
+                .unwrap();
+            assert_eq!(
+                row.column(0).unwrap().len(),
+                4,
+                "binary int4 is 4 bytes; got the cached text value"
+            );
+            return;
+        }
+    }
 }

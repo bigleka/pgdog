@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Duration};
 use aes_gcm::aead::OsRng;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use redis::{aio::ConnectionManager, AsyncCommands};
 use regex::Regex;
@@ -12,7 +13,7 @@ use tracing::warn;
 
 use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
-use super::{CacheableRequest, ResultCacheKey};
+use super::{singleflight::Singleflight, CacheableRequest, ResultCacheKey};
 
 #[derive(Debug, Clone)]
 pub struct ResultCacheConfig {
@@ -96,9 +97,13 @@ struct Shared {
     prefix: String,
 }
 
+/// Result cache shared by all clients of this process.
+static CACHE: Lazy<RedisResultCache> = Lazy::new(RedisResultCache::default);
+
 #[derive(Debug, Clone)]
 pub struct RedisResultCache {
     shared: Arc<RwLock<Shared>>,
+    singleflight: Singleflight,
 }
 
 impl Default for RedisResultCache {
@@ -109,16 +114,25 @@ impl Default for RedisResultCache {
                 manager: None,
                 prefix: "pgdog:result_cache".into(),
             })),
+            singleflight: Singleflight::default(),
         }
     }
 }
 
 impl RedisResultCache {
+    /// The process-wide cache, if enabled and Redis is reachable.
+    ///
+    /// All clients share it, along with its Redis connection and in-flight queries.
     pub async fn global() -> Option<Self> {
         let cfg = ResultCacheConfig::from_global_config()?;
-        let cache = Self::default();
+        let cache = CACHE.clone();
         cache.ensure_connected(&cfg).await?;
         Some(cache)
+    }
+
+    /// Queries in flight, to coalesce concurrent misses on the same key.
+    pub fn singleflight(&self) -> &Singleflight {
+        &self.singleflight
     }
 
     async fn ensure_connected(&self, cfg: &ResultCacheConfig) -> Option<()> {
@@ -239,18 +253,9 @@ impl RedisResultCache {
         };
         self.ensure_connected(&cfg).await?;
 
-        let mut conn = {
-            let mut shared = self.shared.write();
-            match shared.manager.take() {
-                Some(m) => m,
-                None => return None,
-            }
-        };
+        let mut conn = self.connection()?;
 
         let res: redis::RedisResult<Vec<u8>> = conn.get(&key.redis_key).await;
-
-        let mut shared = self.shared.write();
-        shared.manager = Some(conn);
 
         match res {
             Ok(bytes) if !bytes.is_empty() => {
@@ -314,12 +319,8 @@ impl RedisResultCache {
             return;
         }
 
-        let mut conn = {
-            let mut shared = self.shared.write();
-            match shared.manager.take() {
-                Some(m) => m,
-                None => return,
-            }
+        let Some(mut conn) = self.connection() else {
+            return;
         };
 
         let res: redis::RedisResult<()> = match key.ttl {
@@ -333,9 +334,6 @@ impl RedisResultCache {
             }
             _ => conn.set(&key.redis_key, final_payload.as_slice()).await,
         };
-
-        let mut shared = self.shared.write();
-        shared.manager = Some(conn);
 
         if let Err(err) = res {
             crate::stats::ResultCache::redis_error();
@@ -371,12 +369,8 @@ impl RedisResultCache {
         let ttl = key.ttl.unwrap_or_else(|| Duration::from_secs(30));
         let set_ttl_secs = (ttl.as_secs().saturating_mul(2)).max(60);
 
-        let mut conn = {
-            let mut shared = self.shared.write();
-            match shared.manager.take() {
-                Some(m) => m,
-                None => return,
-            }
+        let Some(mut conn) = self.connection() else {
+            return;
         };
 
         for table in tables {
@@ -384,9 +378,6 @@ impl RedisResultCache {
             let _: redis::RedisResult<()> = conn.sadd(&set_key, &key.redis_key).await;
             let _: redis::RedisResult<()> = conn.expire(&set_key, set_ttl_secs as i64).await;
         }
-
-        let mut shared = self.shared.write();
-        shared.manager = Some(conn);
     }
 
     pub async fn invalidate_tables(&self, db: &str, tables: &[OwnedTable]) {
@@ -397,12 +388,8 @@ impl RedisResultCache {
             return;
         }
 
-        let mut conn = {
-            let mut shared = self.shared.write();
-            match shared.manager.take() {
-                Some(m) => m,
-                None => return,
-            }
+        let Some(mut conn) = self.connection() else {
+            return;
         };
 
         for table in tables {
@@ -431,9 +418,6 @@ impl RedisResultCache {
                 }
             }
         }
-
-        let mut shared = self.shared.write();
-        shared.manager = Some(conn);
     }
 }
 
