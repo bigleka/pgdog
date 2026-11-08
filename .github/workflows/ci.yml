@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.pgdog-bin.outputs.cache-hit != 'true'
         with:
-          prefix-key: build-v1
+          prefix-key: build-v2
       - name: Build (debug)
         if: steps.pgdog-bin.outputs.cache-hit != 'true'
         run: cargo build --bin pgdog
@@ -98,7 +98,7 @@ jobs:
         if: matrix.needs_rust_cache
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: build-v1
+          prefix-key: build-v2
       - name: Setup dependencies
         run: bash integration/ci/setup.sh --with-toxi
       - name: Run ${{ matrix.name }}

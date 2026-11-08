@@ -17,6 +17,6 @@ jobs:
         run: bash integration/ci/install-deps.sh
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "plugin-unit-v1"
+          prefix-key: "plugin-unit-v2"
       - name: Run plugin unit tests
         run: cargo nextest run -E 'package(pgdog-example-plugin)' --no-fail-fast
