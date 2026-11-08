@@ -271,11 +271,15 @@ mod test {
                 "table pgdog.test_mirror shouldn't exist yet"
             );
             assert!(mirror.flush(), "mirror didn't flush");
-            sleep(Duration::from_millis(50)).await;
-            assert!(
-                conn.execute("DROP TABLE pgdog.test_mirror").await.is_ok(),
-                "pgdog.test_mirror should exist"
-            );
+            // The mirror runs it in the background: give slow runners time.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while conn.execute("DROP TABLE pgdog.test_mirror").await.is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pgdog.test_mirror should exist"
+                );
+                sleep(Duration::from_millis(20)).await;
+            }
             assert!(mirror.buffer().is_empty(), "mirror buffer should be empty");
         }
 
