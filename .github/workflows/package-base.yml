@@ -17,7 +17,7 @@ jobs:
           - suffix: base-builder
             dockerfile: docker/Dockerfile.base-builder
             platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - suffix: base-builder
             dockerfile: docker/Dockerfile.base-builder
             platform: linux/arm64
@@ -25,7 +25,7 @@ jobs:
           - suffix: base-runtime
             dockerfile: docker/Dockerfile.base-runtime
             platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - suffix: base-runtime
             dockerfile: docker/Dockerfile.base-runtime
             platform: linux/arm64
@@ -77,7 +77,7 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - build
     strategy:

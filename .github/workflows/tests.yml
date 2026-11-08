@@ -8,7 +8,7 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -17,7 +17,7 @@ jobs:
         run: bash integration/ci/install-deps.sh
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1" # Change this when updating tooling
+          prefix-key: "v2" # Change this when updating tooling or the runner image
       - name: Setup PostgreSQL
         run: bash integration/ci/setup.sh --with-toxi
       - name: Run tests with coverage
