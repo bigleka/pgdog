@@ -200,3 +200,116 @@ async fn test_cache_resumes_when_redis_returns() {
         "cache didn't resume after Redis came back"
     );
 }
+
+fn use_sentinel(master: &str) {
+    use_redis(RedisMode::Sentinel, "", &["redis://127.0.0.1:26379"]);
+    let mut config = config().deref().clone();
+    if let Some(result_cache) = config.config.result_cache.as_mut() {
+        result_cache.redis_sentinel_master = Some(master.into());
+    }
+    set(config).unwrap();
+}
+
+#[tokio::test]
+async fn test_redis_sentinel() {
+    use_sentinel("pgdog-cache");
+    cache_and_invalidate().await;
+}
+
+/// After a Sentinel failover, PgDog moves to the new primary: writes through
+/// PgDog invalidate there, and results are cached there again.
+#[tokio::test]
+async fn test_redis_sentinel_failover() {
+    use_sentinel("pgdog-failover");
+    let mut table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    // Cached on the current primary.
+    assert_eq!(
+        select_value(&mut client, &table.select()).await.as_deref(),
+        Some("1")
+    );
+
+    let mut sentinel = redis::Client::open("redis://127.0.0.1:26379")
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let primary = |sentinel: &mut redis::aio::MultiplexedConnection| {
+        let mut sentinel = sentinel.clone();
+        async move {
+            redis::cmd("SENTINEL")
+                .arg("get-master-addr-by-name")
+                .arg("pgdog-failover")
+                .query_async::<Vec<String>>(&mut sentinel)
+                .await
+                .unwrap()
+        }
+    };
+    let before = primary(&mut sentinel).await;
+    let _: () = redis::cmd("SENTINEL")
+        .arg("failover")
+        .arg("pgdog-failover")
+        .query_async(&mut sentinel)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while primary(&mut sentinel).await == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Sentinel didn't fail over"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    // Wait for the former primary to actually turn into a replica: until then
+    // it still accepts the writes of a client that didn't move. It drops its
+    // clients when demoted, so ask on a fresh connection each time.
+    let former = redis::Client::open(format!("redis://{}:{}", before[0], before[1])).unwrap();
+    loop {
+        let role = async {
+            let mut conn = former.get_multiplexed_async_connection().await?;
+            redis::cmd("ROLE")
+                .query_async::<Vec<redis::Value>>(&mut conn)
+                .await
+        }
+        .await;
+        if let Ok(role) = role {
+            if matches!(role.first(), Some(redis::Value::BulkString(role)) if role == b"slave") {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "former primary never became a replica"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Writes keep working through the switch; once reconnected, a write
+    // invalidates on the new primary and the next read is cached there.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut version = 10;
+    loop {
+        version += 1;
+        simple(
+            &mut client,
+            &format!("UPDATE {} SET v = {version} WHERE id = 1", table.name()),
+        )
+        .await;
+        assert_eq!(
+            select_value(&mut client, &table.select()).await,
+            Some(version.to_string()),
+            "stale value after a write through PgDog"
+        );
+        table.update_directly(0).await;
+        if select_value(&mut client, &table.select()).await == Some(version.to_string()) {
+            break; // Served from the cache on the new primary.
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache never resumed on the new primary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    table.drop().await;
+}

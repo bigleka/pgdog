@@ -37,6 +37,8 @@ mod redis {
         Cluster,
         /// twemproxy sharding over 2 Redis servers.
         Proxy,
+        /// Primary found through Sentinel.
+        Sentinel,
     }
 
     impl Topology {
@@ -44,6 +46,11 @@ mod redis {
             match self {
                 Self::Standalone => result_cache.redis_url = "redis://127.0.0.1:6379".into(),
                 Self::Proxy => result_cache.redis_url = "redis://127.0.0.1:22121".into(),
+                Self::Sentinel => {
+                    result_cache.redis_mode = RedisMode::Sentinel;
+                    result_cache.redis_urls = vec!["redis://127.0.0.1:26379".into()];
+                    result_cache.redis_sentinel_master = Some("pgdog-cache".into());
+                }
                 Self::Cluster => {
                     result_cache.redis_mode = RedisMode::Cluster;
                     result_cache.redis_urls = (7000..=7002)
@@ -91,6 +98,11 @@ mod redis {
                     #[tokio::test]
                     async fn proxy() {
                         super::$case(Topology::Proxy).await;
+                    }
+
+                    #[tokio::test]
+                    async fn sentinel() {
+                        super::$case(Topology::Sentinel).await;
                     }
                 }
             )+

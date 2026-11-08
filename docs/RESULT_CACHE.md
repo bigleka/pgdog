@@ -33,6 +33,9 @@ To avoid stale results while still being precise, PgDog uses **table-based inval
 | One Redis / Valkey / Dragonfly server | `redis_url = "redis://host:6379"` |
 | Proxy in front of several servers (twemproxy, Envoy) | `redis_url = "redis://proxy:22121"` |
 | Redis Cluster | `redis_mode = "cluster"`, `redis_urls = ["redis://node1:6379", ...]` (or a single node in `redis_url`; the rest is discovered) |
+| Sentinel | `redis_mode = "sentinel"`, `redis_urls = ["redis://sentinel1:26379", ...]`, `redis_sentinel_master = "mymaster"`. Put the primary's credentials in `redis_url` (e.g. `redis://:password@`) if it needs them |
+
+With Sentinel, after a failover the former primary drops its connections or refuses writes (`READONLY`). PgDog then skips the cache for the backoff below and reconnects through Sentinel to the new primary.
 
 PgDog only sends commands that work on all of them: no `MULTI`, no `CLIENT` commands (twemproxy closes the connection on them), and multi-key commands only where the client splits them per cluster node.
 
@@ -98,6 +101,9 @@ enabled = true
 redis_url = "redis://127.0.0.1:6379"
 # redis_mode = "cluster"
 # redis_urls = ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
+# redis_mode = "sentinel"
+# redis_urls = ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
+# redis_sentinel_master = "mymaster"
 expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"

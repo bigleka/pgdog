@@ -49,7 +49,12 @@ impl ResultCacheConfig {
 
         Some(Self {
             enabled: rc.enabled,
-            target: Target::new(rc.redis_mode, &rc.redis_url, &rc.redis_urls),
+            target: Target::new(
+                rc.redis_mode,
+                &rc.redis_url,
+                &rc.redis_urls,
+                rc.redis_sentinel_master.as_deref(),
+            ),
             // Apply a default TTL when not provided.
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
@@ -195,14 +200,11 @@ impl RedisResultCache {
         Some(())
     }
 
-    /// After a timeout or connection error, stop using Redis for
+    /// After a timeout, a connection error, or a write refused by a former
+    /// primary, stop using Redis for
     /// `RECONNECT_BACKOFF`, so queries don't each wait on it.
     fn unavailable(&self, err: &redis::RedisError) {
-        if !(err.is_timeout()
-            || err.is_io_error()
-            || err.is_connection_dropped()
-            || err.is_connection_refusal())
-        {
+        if !makes_unavailable(err) {
             return;
         }
 
@@ -525,6 +527,17 @@ impl RedisResultCache {
     }
 }
 
+/// Errors meaning Redis can't be used right now: it's unreachable, too slow,
+/// or the connection points at a former primary (READONLY, e.g. after a
+/// Sentinel failover). Errors about a single command don't count.
+fn makes_unavailable(err: &redis::RedisError) -> bool {
+    err.is_timeout()
+        || err.is_io_error()
+        || err.is_connection_dropped()
+        || err.is_connection_refusal()
+        || err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly)
+}
+
 fn get_cipher(key_str: &str) -> Aes256Gcm {
     // Use SHA-256 to derive a 32-byte key from the user-provided string.
     let mut hasher = Sha256::new();
@@ -565,4 +578,42 @@ fn compile_list(patterns: &[String]) -> Vec<Regex> {
 
 fn matches_any(patterns: &[Regex], value: &str) -> bool {
     patterns.iter().any(|re| re.is_match(value))
+}
+
+#[cfg(test)]
+mod test {
+    use std::io;
+
+    use redis::{ErrorKind, RedisError, ServerErrorKind};
+
+    use super::makes_unavailable;
+
+    #[test]
+    fn test_read_only_makes_redis_unavailable() {
+        let err = RedisError::from((ErrorKind::Server(ServerErrorKind::ReadOnly), "READONLY"));
+        assert!(makes_unavailable(&err));
+    }
+
+    #[test]
+    fn test_network_errors_make_redis_unavailable() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                makes_unavailable(&RedisError::from(io::Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_errors_dont_make_redis_unavailable() {
+        let err = RedisError::from((
+            ErrorKind::Server(ServerErrorKind::ResponseError),
+            "WRONGTYPE",
+        ));
+        assert!(!makes_unavailable(&err));
+    }
 }

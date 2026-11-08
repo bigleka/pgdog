@@ -4,10 +4,12 @@ use std::{fmt, time::Duration};
 
 use pgdog_config::RedisMode;
 use redis::{
-    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig},
+    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
-    Cmd, ConnectionInfo, IntoConnectionInfo, Pipeline, RedisFuture, RedisResult, Value,
+    sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType},
+    AsyncConnectionConfig, Cmd, ConnectionInfo, IntoConnectionInfo, Pipeline, RedisFuture,
+    RedisResult, Value,
 };
 
 /// The cache must never hold a query up for long: past these, Redis is
@@ -20,17 +22,27 @@ const CONNECT_RETRIES: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub mode: RedisMode,
+    /// The server or proxy, cluster nodes, or Sentinels.
     pub urls: Vec<String>,
+    /// Sentinel mode: the monitored primary's name, and `redis_url` for its
+    /// credentials (they usually differ from the Sentinels').
+    pub sentinel_master: Option<String>,
+    pub primary_url: String,
 }
 
 impl Target {
-    /// `urls` for cluster mode, falling back to `url` when empty.
-    pub fn new(mode: RedisMode, url: &str, urls: &[String]) -> Self {
+    /// `urls` for cluster and sentinel modes, falling back to `url` when empty.
+    pub fn new(mode: RedisMode, url: &str, urls: &[String], sentinel_master: Option<&str>) -> Self {
         let urls = match mode {
-            RedisMode::Cluster if !urls.is_empty() => urls.to_vec(),
+            RedisMode::Cluster | RedisMode::Sentinel if !urls.is_empty() => urls.to_vec(),
             _ => vec![url.to_owned()],
         };
-        Self { mode, urls }
+        Self {
+            mode,
+            urls,
+            sentinel_master: sentinel_master.map(str::to_owned),
+            primary_url: url.to_owned(),
+        }
     }
 }
 
@@ -40,6 +52,9 @@ pub enum Connection {
     /// One server, or a proxy (twemproxy, Envoy) in front of several.
     Standalone(ConnectionManager),
     Cluster(ClusterConnection),
+    /// The primary Sentinel pointed at when connecting. After a failover it
+    /// answers READONLY; the cache then reconnects through Sentinel.
+    Sentinel(MultiplexedConnection),
 }
 
 impl Connection {
@@ -70,6 +85,30 @@ impl Connection {
                     .build()?;
                 Ok(Self::Cluster(client.get_async_connection().await?))
             }
+            RedisMode::Sentinel => {
+                let master = target.sentinel_master.clone().ok_or_else(|| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::InvalidClientConfig,
+                        "redis_mode = \"sentinel\" needs redis_sentinel_master",
+                    ))
+                })?;
+                let primary = match target.primary_url.as_str() {
+                    "" => redis::RedisConnectionInfo::default().set_skip_set_lib_name(),
+                    url => connection_info(url)?.redis_settings().clone(),
+                };
+                let mut client = SentinelClient::build(
+                    nodes,
+                    master,
+                    Some(SentinelNodeConnectionInfo::default().set_redis_connection_info(primary)),
+                    SentinelServerType::Master,
+                )?;
+                let config = AsyncConnectionConfig::new()
+                    .set_connection_timeout(Some(CONNECT_TIMEOUT))
+                    .set_response_timeout(Some(RESPONSE_TIMEOUT));
+                Ok(Self::Sentinel(
+                    client.get_async_connection_with_config(&config).await?,
+                ))
+            }
         }
     }
 }
@@ -95,6 +134,7 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(conn) => conn.req_packed_command(cmd),
             Self::Cluster(conn) => conn.req_packed_command(cmd),
+            Self::Sentinel(conn) => conn.req_packed_command(cmd),
         }
     }
 
@@ -107,6 +147,7 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(conn) => conn.req_packed_commands(pipeline, offset, count),
             Self::Cluster(conn) => conn.req_packed_commands(pipeline, offset, count),
+            Self::Sentinel(conn) => conn.req_packed_commands(pipeline, offset, count),
         }
     }
 
@@ -114,6 +155,7 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(conn) => conn.get_db(),
             Self::Cluster(conn) => conn.get_db(),
+            Self::Sentinel(conn) => conn.get_db(),
         }
     }
 }
@@ -123,6 +165,7 @@ impl fmt::Debug for Connection {
         match self {
             Self::Standalone(_) => f.write_str("Connection::Standalone"),
             Self::Cluster(_) => f.write_str("Connection::Cluster"),
+            Self::Sentinel(_) => f.write_str("Connection::Sentinel"),
         }
     }
 }
