@@ -1628,10 +1628,37 @@
           "format": "uint",
           "minimum": 0
         },
+        "redis_connect_retries": {
+          "description": "How many times connecting to Redis is retried before it counts as down.\n\n_Default:_ `1`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "redis_connect_timeout_ms": {
+          "description": "How long connecting to Redis may take before it counts as down\n(milliseconds). See \"Redis timeouts\" in docs/RESULT_CACHE.md before\nchanging it.\n\n_Default:_ `500`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "redis_mode": {
           "description": "How PgDog connects to Redis.\n\n_Default:_ `standalone`",
           "$ref": "#/$defs/RedisMode",
           "default": "standalone"
+        },
+        "redis_response_timeout_ms": {
+          "description": "How long a Redis command may take before Redis counts as down\n(milliseconds). Every cacheable query waits on Redis at least once, so\nthis is also the most a slow Redis adds to a query.\n\n_Default:_ `500`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "redis_sentinel_master": {
           "description": "Name of the primary Sentinel monitors, for `redis_mode = \"sentinel\"`.",
@@ -1639,6 +1666,15 @@
             "string",
             "null"
           ]
+        },
+        "redis_unavailable_backoff_ms": {
+          "description": "Once Redis counts as down, how long the cache is skipped, queries\ngoing straight to Postgres, before connecting again (milliseconds).\n`0` tries again on the next query.\n\n_Default:_ `5000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "redis_url": {
           "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",

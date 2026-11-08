@@ -27,6 +27,32 @@ pub struct ResultCache {
     /// Name of the primary Sentinel monitors, for `redis_mode = "sentinel"`.
     pub redis_sentinel_master: Option<String>,
 
+    /// How long connecting to Redis may take before it counts as down
+    /// (milliseconds). See "Redis timeouts" in docs/RESULT_CACHE.md before
+    /// changing it.
+    ///
+    /// _Default:_ `500`
+    pub redis_connect_timeout_ms: Option<u64>,
+
+    /// How long a Redis command may take before Redis counts as down
+    /// (milliseconds). Every cacheable query waits on Redis at least once, so
+    /// this is also the most a slow Redis adds to a query.
+    ///
+    /// _Default:_ `500`
+    pub redis_response_timeout_ms: Option<u64>,
+
+    /// How many times connecting to Redis is retried before it counts as down.
+    ///
+    /// _Default:_ `1`
+    pub redis_connect_retries: Option<u32>,
+
+    /// Once Redis counts as down, how long the cache is skipped, queries
+    /// going straight to Postgres, before connecting again (milliseconds).
+    /// `0` tries again on the next query.
+    ///
+    /// _Default:_ `5000`
+    pub redis_unavailable_backoff_ms: Option<u64>,
+
     /// Optional expiration time for cached entries (seconds).
     pub expire_seconds: Option<u64>,
 

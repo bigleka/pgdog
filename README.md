@@ -84,6 +84,26 @@ max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
 ```
 
+#### Redis timeouts
+
+If Redis is slow or down, PgDog skips the cache and sends queries straight to Postgres. You control how fast that happens:
+
+```toml
+[result_cache]
+redis_connect_timeout_ms = 500       # opening a connection
+redis_response_timeout_ms = 500      # each Redis command: the most a slow Redis adds to a query
+redis_connect_retries = 1            # extra connection attempts before Redis counts as down
+redis_unavailable_backoff_ms = 5000  # how long the cache stays off before reconnecting
+```
+
+The defaults fit a Redis in the same datacenter. Keep them unless measurements say otherwise. Before changing one:
+
+- Measure Redis latency from the PgDog host (`redis-cli --latency-history`), through any proxy or TLS.
+- Keep the response timeout at 5 to 10 times the p99 you measured, and well below your applications' query timeouts.
+- Change one option at a time, then watch `result_cache_redis_errors` and the hit rate.
+
+Too short marks a healthy Redis as down and the cache keeps switching off. Too long makes queries wait on a sick Redis. With Sentinel, how fast a new primary takes over is set by Sentinel's `down-after-milliseconds`, not by PgDog. Full guide: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#redis-timeouts).
+
 Result Cache Encryption (result_cache)
 To increase security and protect sensitive data that may be cached, PgDog supports encryption of values ​​in the Redis result cache. This ensures that even in the event of unauthorized access or misconfiguration of the Redis instance, the cache data remains unreadable.
 

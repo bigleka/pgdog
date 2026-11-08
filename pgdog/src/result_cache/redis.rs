@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
 
 use super::{
-    connection::{Connection, Target},
+    connection::{Connection, Limits, Target},
     entry::Entry,
     singleflight::Singleflight,
     ttl, xfetch, CacheableRequest, ResultCacheKey,
@@ -27,6 +27,8 @@ use super::{
 pub struct ResultCacheConfig {
     pub enabled: bool,
     pub target: Target,
+    /// How long to skip the cache once Redis is unavailable.
+    pub unavailable_backoff: Duration,
     pub expire_seconds: Option<u64>,
     pub max_entry_bytes: usize,
     pub encryption_key: Option<String>,
@@ -51,12 +53,18 @@ impl ResultCacheConfig {
 
         Some(Self {
             enabled: rc.enabled,
-            target: Target::new(
-                rc.redis_mode,
-                &rc.redis_url,
-                &rc.redis_urls,
-                rc.redis_sentinel_master.as_deref(),
-            ),
+            target: Target {
+                limits: limits(&rc),
+                ..Target::new(
+                    rc.redis_mode,
+                    &rc.redis_url,
+                    &rc.redis_urls,
+                    rc.redis_sentinel_master.as_deref(),
+                )
+            },
+            unavailable_backoff: rc
+                .redis_unavailable_backoff_ms
+                .map_or(DEFAULT_UNAVAILABLE_BACKOFF, Duration::from_millis),
             // Apply a default TTL when not provided.
             expire_seconds: rc.expire_seconds.or(Some(30)),
             max_entry_bytes: rc.max_entry_bytes.unwrap_or(512 * 1024),
@@ -113,9 +121,23 @@ impl ResultCacheConfig {
     }
 }
 
-/// After failing to connect, how long to leave Redis alone. Queries skip the
-/// cache meanwhile instead of each one waiting on a connection attempt.
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+/// After Redis fails, how long to leave it alone by default. Queries skip the
+/// cache meanwhile instead of each one waiting on it.
+const DEFAULT_UNAVAILABLE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Configured Redis timeouts. A zero timeout would fail every command, so
+/// it's raised to 1ms.
+fn limits(rc: &pgdog_config::ResultCache) -> Limits {
+    let default = Limits::default();
+    let timeout = |ms: Option<u64>, default: Duration| {
+        ms.map_or(default, |ms| Duration::from_millis(ms.max(1)))
+    };
+    Limits {
+        connect_timeout: timeout(rc.redis_connect_timeout_ms, default.connect_timeout),
+        response_timeout: timeout(rc.redis_response_timeout_ms, default.response_timeout),
+        connect_retries: rc.redis_connect_retries.unwrap_or(default.connect_retries),
+    }
+}
 
 #[derive(Debug)]
 struct Shared {
@@ -183,7 +205,7 @@ impl RedisResultCache {
                 return Some(());
             }
             if let Some((at, target)) = &shared.failed {
-                if target == &cfg.target && at.elapsed() < RECONNECT_BACKOFF {
+                if target == &cfg.target && at.elapsed() < cfg.unavailable_backoff {
                     return None;
                 }
             }
@@ -207,8 +229,8 @@ impl RedisResultCache {
     }
 
     /// After a timeout, a connection error, or a write refused by a former
-    /// primary, stop using Redis for
-    /// `RECONNECT_BACKOFF`, so queries don't each wait on it.
+    /// primary, stop using Redis for `unavailable_backoff`, so queries don't
+    /// each wait on it.
     pub(super) fn unavailable(&self, err: &redis::RedisError) {
         if !makes_unavailable(err) {
             return;
@@ -216,7 +238,7 @@ impl RedisResultCache {
 
         let mut shared = self.shared.write();
         if let Some(target) = shared.target.take() {
-            warn!("result_cache: Redis unavailable, skipping the cache for {RECONNECT_BACKOFF:?}");
+            warn!("result_cache: Redis unavailable, skipping the cache for a while");
             shared.failed = Some((Instant::now(), target));
         }
         shared.connection = None;
@@ -588,11 +610,33 @@ fn matches_any(patterns: &[Regex], value: &str) -> bool {
 
 #[cfg(test)]
 mod test {
-    use std::io;
+    use std::{io, time::Duration};
 
     use redis::{ErrorKind, RedisError, ServerErrorKind};
 
-    use super::makes_unavailable;
+    use super::{makes_unavailable, ResultCacheConfig};
+    use crate::config::{set, ConfigAndUsers};
+
+    #[test]
+    fn test_redis_limits_come_from_config() {
+        let mut config = ConfigAndUsers::default();
+        config.config.result_cache = Some(pgdog_config::ResultCache {
+            enabled: true,
+            redis_connect_timeout_ms: Some(250),
+            redis_response_timeout_ms: Some(0),
+            redis_connect_retries: Some(3),
+            redis_unavailable_backoff_ms: Some(0),
+            ..Default::default()
+        });
+        set(config).unwrap();
+
+        let cfg = ResultCacheConfig::from_global_config().unwrap();
+        let limits = cfg.target.limits;
+        assert_eq!(limits.connect_timeout, Duration::from_millis(250));
+        assert_eq!(limits.response_timeout, Duration::from_millis(1));
+        assert_eq!(limits.connect_retries, 3);
+        assert_eq!(cfg.unavailable_backoff, Duration::ZERO);
+    }
 
     #[test]
     fn test_read_only_makes_redis_unavailable() {
