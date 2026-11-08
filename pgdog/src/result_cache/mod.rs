@@ -16,6 +16,20 @@ pub struct ResultCacheKey {
     pub redis_key: String,
     pub ttl: Option<Duration>,
     pub max_entry_bytes: usize,
+    /// A table the query reads was written within the read-after-write
+    /// window: run it on the primary.
+    pub read_primary: bool,
+}
+
+/// How long after a write reads of the table go to the primary, if enabled.
+pub fn read_after_write_window() -> Option<Duration> {
+    let window = crate::config::config()
+        .config
+        .result_cache
+        .as_ref()
+        .filter(|result_cache| result_cache.enabled)
+        .map(|result_cache| result_cache.read_after_write_window_ms.unwrap_or(1000))?;
+    Some(Duration::from_millis(window)).filter(|window| !window.is_zero())
 }
 
 #[derive(Debug, Clone)]

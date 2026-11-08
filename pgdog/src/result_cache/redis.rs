@@ -270,20 +270,31 @@ impl RedisResultCache {
         format!("{prefix}:tbl:{db}:{schema}.{}", table.name)
     }
 
-    /// Counter bumped on every invalidation of the table. Never expires: if it
-    /// did, the counter would restart and old entries would match again.
+    /// Generation of the table, bumped on every invalidation: the time of the
+    /// last write in ms (Redis clock), or one more than before if that's
+    /// higher. Never expires: if it did, it could restart lower and old
+    /// entries would match again.
+    ///
+    /// Being a time, it also tells readers whether the table was written
+    /// within the read-after-write window.
     fn generation_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
         let schema = table.schema.as_deref().unwrap_or("_");
         format!("{prefix}:gen:{db}:{schema}.{}", table.name)
     }
 
-    /// Current generation of each table, joined into a single string.
+    /// Current generation of each table, joined into a single string, and
+    /// whether one of them was written within the read-after-write window.
     ///
     /// It's part of the cache key, so a result computed before a table was
     /// invalidated is stored under a key no reader will look up again.
-    async fn generations(&self, prefix: &str, db: &str, tables: &[OwnedTable]) -> Option<String> {
+    async fn generations(
+        &self,
+        prefix: &str,
+        db: &str,
+        tables: &[OwnedTable],
+    ) -> Option<(String, bool)> {
         if tables.is_empty() {
-            return Some(String::new());
+            return Some((String::new(), false));
         }
 
         let keys: Vec<_> = tables
@@ -302,13 +313,25 @@ impl RedisResultCache {
                 }
             };
 
-        Some(
+        let recent_write = super::read_after_write_window().is_some_and(|window| {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            generations
+                .iter()
+                .flatten()
+                .any(|&written_at| now.saturating_sub(u128::from(written_at)) < window.as_millis())
+        });
+
+        Some((
             generations
                 .iter()
                 .map(|generation| generation.unwrap_or(0).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-        )
+            recent_write,
+        ))
     }
 
     pub async fn build_key(
@@ -335,7 +358,8 @@ impl RedisResultCache {
         let session_sig = format!("{:x}", md5::compute(format!("search_path={}", search_path)));
 
         // Query fingerprint, tied to the current generation of every table it reads.
-        let generations = self.generations(&cfg.key_prefix, db, &req.tables).await?;
+        let (generations, recent_write) =
+            self.generations(&cfg.key_prefix, db, &req.tables).await?;
         let fingerprint = format!(
             "{:x}",
             md5::compute(format!("{}\0{}", req.query, generations))
@@ -350,6 +374,7 @@ impl RedisResultCache {
             redis_key: key,
             ttl: cfg.ttl(),
             max_entry_bytes: cfg.max_entry_bytes,
+            read_primary: recent_write,
         })
     }
 
@@ -529,7 +554,12 @@ impl RedisResultCache {
             // before this write from being served. Deleting tagged keys
             // below only frees memory sooner.
             let generation_key = Self::generation_key(&cfg.key_prefix, db, table);
-            let bumped: redis::RedisResult<u64> = conn.incr(&generation_key, 1).await;
+            let bumped: redis::RedisResult<u64> = redis::cmd("EVAL")
+                .arg(BUMP_GENERATION)
+                .arg(1)
+                .arg(&generation_key)
+                .query_async(&mut conn)
+                .await;
             if let Err(err) = bumped {
                 crate::stats::ResultCache::redis_error();
                 self.unavailable(&err);
@@ -554,6 +584,14 @@ impl RedisResultCache {
         }
     }
 }
+
+/// Set the generation to the current time in ms, or one more than before if
+/// that's higher. Single key, sent with EVAL: works on every topology.
+const BUMP_GENERATION: &str = r#"local time = redis.call("TIME")
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+local generation = math.max(tonumber(redis.call("GET", KEYS[1]) or "0") + 1, now)
+redis.call("SET", KEYS[1], string.format("%d", generation))
+return generation"#;
 
 /// Errors meaning Redis can't be used right now: it's unreachable, too slow,
 /// or the connection points at a former primary (READONLY, e.g. after a

@@ -134,7 +134,7 @@ impl Connection {
     /// Try to get a connection for the given route.
     async fn try_conn(&mut self, request: &Request, route: &Route) -> Result<(), Error> {
         if let Shard::Direct(shard) = route.shard() {
-            let mut server = if route.is_read() {
+            let mut server = if route.use_replica() {
                 self.cluster()?.replica(*shard, request).await?
             } else {
                 self.cluster()?.primary(*shard, request).await?
@@ -166,7 +166,7 @@ impl Connection {
                         continue;
                     }
                 };
-                let mut server = if route.is_read() {
+                let mut server = if route.use_replica() {
                     shard.replica(request).await?
                 } else {
                     shard.primary(request).await?
