@@ -42,17 +42,25 @@ wait_for bash -c "redis-cli -p 7000 cluster info | grep -q cluster_state:ok"
 plain 6380
 plain 6384
 plain 6385 --replicaof 127.0.0.1 6384
+# A Sentinel may already run on 26379 (the Ubuntu redis-sentinel package
+# starts one), so register our primaries at runtime instead of in its config.
 cat > "$DIR/sentinel.conf" <<CONF
 port 26379
 bind 127.0.0.1
-sentinel monitor pgdog-cache 127.0.0.1 6380 1
-sentinel down-after-milliseconds pgdog-cache 1000
-sentinel failover-timeout pgdog-cache 5000
-sentinel monitor pgdog-failover 127.0.0.1 6384 1
-sentinel down-after-milliseconds pgdog-failover 1000
-sentinel failover-timeout pgdog-failover 5000
 CONF
 redis-cli -p 26379 ping >/dev/null 2>&1 || redis-server "$DIR/sentinel.conf" --sentinel --daemonize yes >/dev/null
+wait_for redis-cli -p 26379 ping
+monitor() {
+    local name=$1 port=$2
+    if ! redis-cli -p 26379 sentinel master "$name" >/dev/null 2>&1 \
+        || redis-cli -p 26379 sentinel master "$name" | grep -q "No such master"; then
+        redis-cli -p 26379 sentinel monitor "$name" 127.0.0.1 "$port" 1 >/dev/null
+    fi
+    redis-cli -p 26379 sentinel set "$name" down-after-milliseconds 1000 >/dev/null
+    redis-cli -p 26379 sentinel set "$name" failover-timeout 5000 >/dev/null
+}
+monitor pgdog-cache 6380
+monitor pgdog-failover 6384
 
 plain 6381
 plain 6382
@@ -70,7 +78,9 @@ CONF
 redis-cli -p 22121 ping >/dev/null 2>&1 \
     || nutcracker -c "$DIR/nutcracker.yml" -d -o "$DIR/nutcracker.log" -p "$DIR/nutcracker.pid"
 
-wait_for redis-cli -p 26379 sentinel get-master-addr-by-name pgdog-cache
+# Exits 0 even for an unknown master: check it returns an address.
+wait_for bash -c "redis-cli -p 26379 sentinel get-master-addr-by-name pgdog-cache | grep -q 6380"
 # Failover needs Sentinel to know the replica (it discovers them via INFO).
-wait_for bash -c "redis-cli -p 26379 sentinel replicas pgdog-failover | grep -q 6385"
+# After an earlier failover the roles may be swapped: either port will do.
+wait_for bash -c "redis-cli -p 26379 sentinel replicas pgdog-failover | grep -qE '638[45]'"
 wait_for redis-cli -p 22121 set pgdog:probe 1
