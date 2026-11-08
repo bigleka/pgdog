@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install CI deps
@@ -50,7 +50,7 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
 
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build]
     timeout-minutes: 30
     continue-on-error: ${{ matrix.continue_on_error == true }}
