@@ -9,7 +9,11 @@ use crate::{
         BufferedQuery, Client, ClientComms, Command, Error, Router, RouterContext, Stats,
     },
     net::{ErrorResponse, Message, Parameters},
-    result_cache::{redis::RedisResultCache, CacheableRequest},
+    result_cache::{
+        redis::RedisResultCache,
+        singleflight::{Flight, Leader},
+        CacheableRequest,
+    },
     state::State,
 };
 
@@ -66,13 +70,16 @@ pub struct QueryEngine {
     pending_invalidations: Vec<crate::frontend::router::parser::OwnedTable>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct ResultCacheCapture {
     key: crate::result_cache::ResultCacheKey,
     db: String,
     tables: Vec<crate::frontend::router::parser::OwnedTable>,
     bytes: Vec<u8>,
     errored: bool,
+    /// Set when this client runs the query for others waiting on the same key.
+    /// Dropping it without a result releases them.
+    leader: Option<Leader>,
 }
 
 impl QueryEngine {
@@ -196,12 +203,32 @@ impl QueryEngine {
                         }
 
                         crate::stats::ResultCache::miss();
+
+                        // Coalesce concurrent misses: one client runs the query,
+                        // the others wait for its result.
+                        let leader = match cache.singleflight().join(&key.redis_key) {
+                            Flight::Leader(leader) => Some(leader),
+                            Flight::Follower(follower) => {
+                                if let Some(payload) = follower.wait().await {
+                                    crate::stats::ResultCache::hit(payload.len());
+                                    let bytes_sent =
+                                        context.stream.send_raw_flush(&payload).await?;
+                                    self.stats.sent(bytes_sent);
+                                    self.set_state(State::Idle);
+                                    return Ok(());
+                                }
+                                // Leader got no result to share: run the query ourselves.
+                                None
+                            }
+                        };
+
                         self.result_cache_capture = Some(ResultCacheCapture {
                             key,
                             db: cluster.name().to_string(),
                             tables: req.tables.clone(),
                             bytes: Vec::new(),
                             errored: false,
+                            leader,
                         });
                     }
                 }

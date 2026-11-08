@@ -283,6 +283,11 @@ impl QueryEngine {
                             .await;
                         crate::stats::ResultCache::store(capture.bytes.len());
                     }
+
+                    // Stored first, so clients arriving after the flight ends hit the cache.
+                    if let Some(leader) = capture.leader {
+                        leader.finish(capture.bytes);
+                    }
                 }
             }
         }

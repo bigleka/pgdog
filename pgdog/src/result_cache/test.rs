@@ -22,7 +22,7 @@ mod redis {
         config::{set, ConfigAndUsers},
         frontend::router::parser::OwnedTable,
         net::Parameters,
-        result_cache::{redis::RedisResultCache, CacheableRequest},
+        result_cache::{redis::RedisResultCache, singleflight::Flight, CacheableRequest},
     };
 
     async fn cache() -> RedisResultCache {
@@ -44,6 +44,25 @@ mod redis {
             route_sig: "direct",
             tables: vec![table.clone()],
         }
+    }
+
+    /// Every client's QueryEngine gets its cache from `RedisResultCache::global()`.
+    /// Singleflight only prevents a stampede if they share the in-flight queries.
+    #[tokio::test]
+    async fn test_singleflight_is_shared_between_clients() {
+        cache().await;
+        let client_a = RedisResultCache::global().await.expect("redis reachable");
+        let client_b = RedisResultCache::global().await.expect("redis reachable");
+
+        let _leader = client_a.singleflight().join("same-key");
+
+        assert!(
+            matches!(
+                client_b.singleflight().join("same-key"),
+                Flight::Follower(_)
+            ),
+            "a second client missing on the same key should wait for the first one"
+        );
     }
 
     /// A read that started before a write and stores its result after the
