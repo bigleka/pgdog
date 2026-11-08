@@ -360,13 +360,15 @@ impl RedisResultCache {
         // Query fingerprint, tied to the current generation of every table it reads.
         let (generations, recent_write) =
             self.generations(&cfg.key_prefix, db, &req.tables).await?;
-        let fingerprint = format!(
-            "{:x}",
-            md5::compute(format!("{}\0{}", req.query, generations))
-        );
+        let mut fingerprint = md5::Context::new();
+        for part in [req.query.as_bytes(), &req.variant, generations.as_bytes()] {
+            fingerprint.consume(part);
+            fingerprint.consume(b"\0");
+        }
+        let fingerprint = format!("{:x}", fingerprint.compute());
 
         let key = format!(
-            "{}:v2:{}:{}:{}:{}:{}",
+            "{}:v3:{}:{}:{}:{}:{}",
             cfg.key_prefix, db, user, session_sig, req.route_sig, fingerprint
         );
 

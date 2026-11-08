@@ -25,6 +25,7 @@ mod replicas;
 mod result_cache;
 mod result_cache_adaptive_ttl;
 mod result_cache_distributed;
+mod result_cache_extended;
 mod result_cache_read_after_write;
 mod result_cache_topologies;
 mod result_cache_xfetch;
