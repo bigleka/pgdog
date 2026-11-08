@@ -12,6 +12,7 @@ static COALESCED: AtomicU64 = AtomicU64::new(0);
 static EARLY_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static TTL_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
 static REMOTE_WAITS: AtomicU64 = AtomicU64::new(0);
+static READ_PRIMARY: AtomicU64 = AtomicU64::new(0);
 static REMOTE_COALESCED: AtomicU64 = AtomicU64::new(0);
 
 pub struct ResultCacheMetric {
@@ -67,6 +68,11 @@ impl ResultCache {
     pub fn remote_coalesced(bytes: usize) {
         REMOTE_COALESCED.fetch_add(1, Ordering::Relaxed);
         BYTES_SERVED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// A read sent to the primary because a table it reads was just written.
+    pub fn read_primary() {
+        READ_PRIMARY.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn metrics() -> Vec<Metric> {
@@ -130,6 +136,12 @@ impl ResultCache {
                 name: "result_cache_ttl_extensions".into(),
                 help: "Result cache entries kept alive longer by a hit (adaptive TTL)".into(),
                 value: TTL_EXTENSIONS.load(Ordering::Relaxed),
+                gauge: false,
+            }),
+            Metric::new(ResultCacheMetric {
+                name: "result_cache_read_after_write_primary_reads".into(),
+                help: "Reads sent to the primary because a table they read was just written".into(),
+                value: READ_PRIMARY.load(Ordering::Relaxed),
                 gauge: false,
             }),
             Metric::new(ResultCacheMetric {

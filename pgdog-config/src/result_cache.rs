@@ -101,6 +101,17 @@ pub struct ResultCache {
     /// _Default:_ `1000`
     pub singleflight_lock_ms: Option<u64>,
 
+    /// With replicas: for this many milliseconds after a write to a table,
+    /// reads of that table go to the primary instead of a replica that may
+    /// not have the write yet. Covers the client that wrote, other clients,
+    /// and other PgDogs sharing Redis, and keeps stale replica results out of
+    /// the cache. Set it above your replicas' usual lag.
+    ///
+    /// `0` disables it. No effect without replicas.
+    ///
+    /// _Default:_ `1000`
+    pub read_after_write_window_ms: Option<u64>,
+
     /// Optional allow-list of schemas whose tables can be cached.
     ///
     /// Each entry is treated as a regular expression.

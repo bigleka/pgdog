@@ -1628,6 +1628,15 @@
           "format": "uint",
           "minimum": 0
         },
+        "read_after_write_window_ms": {
+          "description": "With replicas: for this many milliseconds after a write to a table,\nreads of that table go to the primary instead of a replica that may\nnot have the write yet. Covers the client that wrote, other clients,\nand other PgDogs sharing Redis, and keeps stale replica results out of\nthe cache. Set it above your replicas' usual lag.\n\n`0` disables it. No effect without replicas.\n\n_Default:_ `1000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "redis_connect_retries": {
           "description": "How many times connecting to Redis is retried before it counts as down.\n\n_Default:_ `1`",
           "type": [

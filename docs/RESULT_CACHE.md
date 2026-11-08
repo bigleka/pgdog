@@ -67,6 +67,27 @@ Before changing them:
 5. **Sentinel:** the time to move to a new primary is set in Sentinel, not here: `down-after-milliseconds` (Redis default 30000) plus the failover itself. Until then PgDog skips the cache and serves from Postgres. Lower `down-after-milliseconds` in `sentinel.conf` if that's too long, keeping it above your network's normal hiccups.
 6. **Check after each change**, one option at a time: `result_cache_redis_errors` and "Redis unavailable" warnings in the logs should stay at zero while Redis is healthy, and the hit rate (`result_cache_hits` vs `result_cache_misses`) shouldn't drop. Changing these settings reconnects to Redis on the next query.
 
+## Read-after-write (replicas)
+
+With replicas, a read right after a write can land on a replica that hasn't replayed the write yet. Worse, without protection, the cache would then store that stale result under the table's new generation and serve it to every client until it expires.
+
+For `read_after_write_window_ms` (default `1000`) after a write to a table, reads of that table go to the primary:
+
+- **Every client and every PgDog sharing Redis.** The table's generation in Redis is the time of its last write (Redis clock, in ms), so building the cache key tells whether it was just written, with no extra round trip. Results stored meanwhile come from the primary.
+- **The session that wrote, for any read.** Reads PgDog doesn't cache (tables in the unsafe lists, the extended protocol) still go to the primary for that session's own writes.
+- Explicit transactions (other than `BEGIN READ ONLY`) already run on the primary.
+- It applies with `read_write_split = "exclude_primary"` too: these reads go to the primary anyway.
+- After the window, reads go back to the replicas. The cache keeps serving what the primary returned.
+
+Choosing the window: set it above your replicas' usual replication lag, which PgDog reports per replica. If it's too short, a lagging replica can still answer, and its result gets cached. If it's too long, more reads land on the primary after every write. `0` turns it off. Without replicas it changes nothing.
+
+Limits:
+
+- Tables are matched by name as written in the query: `public.users` and `users` are different tables here, as they are for invalidation.
+- PgDog hosts and Redis need synchronized clocks (NTP): the window is measured against the time Redis recorded the write.
+- In session pooling mode, a client keeps the server it got first. Use transaction mode with replicas.
+- While Redis is unreachable, only the session's own writes are tracked.
+
 ## Stampede protection (singleflight)
 
 When several clients of the same PgDog process miss on the same cache key at once (e.g. a hot entry just expired), only the first one runs the query. The others wait for its result and get it as a cache hit, so the database sees one query instead of one per client.
@@ -122,6 +143,7 @@ Exposed in OpenMetrics format on the PgDog metrics endpoint:
 | `result_cache_ttl_extensions` | Entries kept alive longer by a hit (adaptive TTL) |
 | `result_cache_stores` | Entries written |
 | `result_cache_bytes_served` / `result_cache_bytes_stored` | Bytes served from / written to the cache |
+| `result_cache_read_after_write_primary_reads` | Reads sent to the primary because a table they read was just written |
 | `result_cache_redis_errors` | Failed Redis calls |
 
 ## Configuration
@@ -143,6 +165,7 @@ key_prefix = "pgdog:result_cache"
 xfetch_beta = 1.0
 # adaptive_ttl_max_seconds = 300  # off by default
 singleflight_lock_ms = 1000       # 0 = don't coalesce between PgDogs
+read_after_write_window_ms = 1000 # with replicas; 0 = off
 
 # Redis timeouts: read "Redis timeouts" above before changing them.
 # redis_connect_timeout_ms = 500

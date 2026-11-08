@@ -127,6 +127,7 @@ mod redis {
         waiter_leads_when_holder_gives_up,
         waiter_leads_when_lock_expires,
         lock_is_kept_while_holder_runs,
+        invalidation_marks_recent_write,
     );
 
     fn entry(payload: &[u8]) -> Entry {
@@ -420,5 +421,40 @@ mod redis {
             matches!(other, Lock::Held),
             "lock expired while its holder was still running, got {other:?}"
         );
+    }
+
+    /// Reads right after a write to a table they read must go to the primary;
+    /// later ones, and reads of other tables, needn't.
+    async fn invalidation_marks_recent_write(topology: Topology) {
+        let cache = cache(topology).await;
+        let users = request(&[table("users")]);
+        let orders = request(&[table("orders")]);
+        let params = Parameters::default();
+
+        let key = cache
+            .build_key("db", "user", &params, &users)
+            .await
+            .unwrap();
+        assert!(!key.read_primary, "never written, yet marked");
+
+        cache.invalidate_tables("db", &users.tables).await;
+        let key = cache
+            .build_key("db", "user", &params, &users)
+            .await
+            .unwrap();
+        assert!(key.read_primary, "just written, not marked");
+        let other = cache
+            .build_key("db", "user", &params, &orders)
+            .await
+            .unwrap();
+        assert!(!other.read_primary, "other table marked");
+
+        // Default window: 1s.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let key = cache
+            .build_key("db", "user", &params, &users)
+            .await
+            .unwrap();
+        assert!(!key.read_primary, "still marked after the window");
     }
 }

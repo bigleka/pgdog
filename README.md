@@ -84,6 +84,10 @@ max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
 ```
 
+#### Read-after-write with replicas
+
+For `read_after_write_window_ms` (default `1000`) after a write, reads of the written tables go to the primary: for the client that wrote, other clients, and other PgDogs sharing Redis. This keeps a lagging replica from returning stale rows, and keeps those rows out of the cache. Set it above your replicas' usual lag, or `0` to turn it off. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#read-after-write-replicas).
+
 #### Redis timeouts
 
 If Redis is slow or down, PgDog skips the cache and sends queries straight to Postgres. You control how fast that happens:

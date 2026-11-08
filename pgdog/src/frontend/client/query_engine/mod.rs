@@ -11,6 +11,7 @@ use crate::{
     net::{ErrorResponse, Message, Parameters},
     result_cache::{
         lock::{Lock, Remote, RemoteLock},
+        read_after_write_window,
         redis::RedisResultCache,
         singleflight::{Flight, Leader},
         CacheableRequest,
@@ -69,6 +70,9 @@ pub struct QueryEngine {
     result_cache: Option<RedisResultCache>,
     result_cache_capture: Option<ResultCacheCapture>,
     pending_invalidations: Vec<crate::frontend::router::parser::OwnedTable>,
+    /// Tables this session wrote, and when: its reads of them go to the
+    /// primary for the read-after-write window.
+    recent_writes: Vec<(crate::frontend::router::parser::OwnedTable, Instant)>,
 }
 
 #[derive(Debug)]
@@ -111,6 +115,7 @@ impl QueryEngine {
             result_cache: None,
             result_cache_capture: None,
             pending_invalidations: Vec::new(),
+            recent_writes: Vec::new(),
         })
     }
 
@@ -191,6 +196,8 @@ impl QueryEngine {
             }
         }
 
+        self.read_after_own_write(context);
+
         // Cache lookup (MVP: simple SELECT only, outside transactions).
         if let (Some(ref cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
             if !context.in_transaction() && context.client_request.is_executable() {
@@ -200,6 +207,12 @@ impl QueryEngine {
                         .build_key(cluster.name(), user, context.params, &req)
                         .await
                     {
+                        // Read-after-write: a table it reads was just written,
+                        // here or through another PgDog.
+                        if key.read_primary {
+                            read_primary(context);
+                        }
+
                         let (leader, remote_lock) = match cache.get(&key).await {
                             Some(cached) => {
                                 // XFetch: lead an early refresh unless someone,
@@ -416,8 +429,41 @@ impl QueryEngine {
         }
 
         let tables = mem::take(&mut self.pending_invalidations);
+        if read_after_write_window().is_some() {
+            let now = Instant::now();
+            for table in &tables {
+                self.recent_writes
+                    .retain(|(written, _)| !same_table(written, table));
+                self.recent_writes.push((table.clone(), now));
+            }
+        }
         if let (Some(cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
             cache.invalidate_tables(cluster.name(), &tables).await;
+        }
+    }
+
+    /// Send reads of tables this session wrote within the read-after-write
+    /// window to the primary, cached or not.
+    fn read_after_own_write(&mut self, context: &mut QueryEngineContext<'_>) {
+        if self.recent_writes.is_empty() || !context.client_request.route().use_replica() {
+            return;
+        }
+        let Some(window) = read_after_write_window() else {
+            self.recent_writes.clear();
+            return;
+        };
+        self.recent_writes
+            .retain(|(_, written_at)| written_at.elapsed() < window);
+
+        let reads_recent_write = context.client_request.ast.as_ref().is_some_and(|ast| {
+            ast.tables().iter().any(|table| {
+                self.recent_writes.iter().any(|(written, _)| {
+                    written.name == table.name && written.schema.as_deref() == table.schema
+                })
+            })
+        });
+        if reads_recent_write {
+            read_primary(context);
         }
     }
 
@@ -452,5 +498,23 @@ impl QueryEngine {
     /// Check if the backend protocol is out of sync due to an error in extended protocol.
     pub fn out_of_sync(&self) -> bool {
         self.backend.out_of_sync()
+    }
+}
+
+/// Cache tags ignore aliases: compare schema and name only.
+fn same_table(
+    a: &crate::frontend::router::parser::OwnedTable,
+    b: &crate::frontend::router::parser::OwnedTable,
+) -> bool {
+    a.name == b.name && a.schema == b.schema
+}
+
+/// Run this read on the primary.
+fn read_primary(context: &mut QueryEngineContext<'_>) {
+    if let Some(route) = context.client_request.route.as_mut() {
+        if route.use_replica() {
+            route.set_read_primary();
+            crate::stats::ResultCache::read_primary();
+        }
     }
 }
