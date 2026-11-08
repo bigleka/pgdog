@@ -2,7 +2,8 @@
 # Start every Redis topology the result cache supports, for tests:
 #   standalone  127.0.0.1:6379
 #   cluster     127.0.0.1:7000-7002 (3 primaries, no replicas)
-#   sentinel    127.0.0.1:26379, master "pgdog-cache" at 127.0.0.1:6380
+#   sentinel    127.0.0.1:26379, masters "pgdog-cache" (127.0.0.1:6380) and
+#               "pgdog-failover" (127.0.0.1:6384 + replica :6385, failed over by tests)
 #   twemproxy   127.0.0.1:22121, sharding over 127.0.0.1:6381 and :6382
 set -euo pipefail
 DIR=${REDIS_TOPOLOGIES_DIR:-/tmp/redis-topologies}
@@ -39,12 +40,17 @@ fi
 wait_for bash -c "redis-cli -p 7000 cluster info | grep -q cluster_state:ok"
 
 plain 6380
+plain 6384
+plain 6385 --replicaof 127.0.0.1 6384
 cat > "$DIR/sentinel.conf" <<CONF
 port 26379
 bind 127.0.0.1
 sentinel monitor pgdog-cache 127.0.0.1 6380 1
 sentinel down-after-milliseconds pgdog-cache 1000
 sentinel failover-timeout pgdog-cache 5000
+sentinel monitor pgdog-failover 127.0.0.1 6384 1
+sentinel down-after-milliseconds pgdog-failover 1000
+sentinel failover-timeout pgdog-failover 5000
 CONF
 redis-cli -p 26379 ping >/dev/null 2>&1 || redis-server "$DIR/sentinel.conf" --sentinel --daemonize yes >/dev/null
 
@@ -65,4 +71,6 @@ redis-cli -p 22121 ping >/dev/null 2>&1 \
     || nutcracker -c "$DIR/nutcracker.yml" -d -o "$DIR/nutcracker.log" -p "$DIR/nutcracker.pid"
 
 wait_for redis-cli -p 26379 sentinel get-master-addr-by-name pgdog-cache
+# Failover needs Sentinel to know the replica (it discovers them via INFO).
+wait_for bash -c "redis-cli -p 26379 sentinel replicas pgdog-failover | grep -q 6385"
 wait_for redis-cli -p 22121 set pgdog:probe 1

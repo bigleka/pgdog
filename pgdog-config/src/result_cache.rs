@@ -18,10 +18,14 @@ pub struct ResultCache {
     #[serde(default)]
     pub redis_mode: RedisMode,
 
-    /// Redis nodes for `redis_mode = "cluster"`: one or more cluster nodes to
-    /// discover the cluster from. Falls back to `redis_url` when empty.
+    /// Redis nodes for `redis_mode = "cluster"` (one or more cluster nodes to
+    /// discover the cluster from) or `"sentinel"` (the Sentinels). Falls back
+    /// to `redis_url` when empty.
     #[serde(default)]
     pub redis_urls: Vec<String>,
+
+    /// Name of the primary Sentinel monitors, for `redis_mode = "sentinel"`.
+    pub redis_sentinel_master: Option<String>,
 
     /// Optional expiration time for cached entries (seconds).
     pub expire_seconds: Option<u64>,
@@ -95,4 +99,6 @@ pub enum RedisMode {
     Standalone,
     /// Redis Cluster, discovered from `redis_urls`.
     Cluster,
+    /// Primary `redis_sentinel_master`, found through the Sentinels in `redis_urls`.
+    Sentinel,
 }

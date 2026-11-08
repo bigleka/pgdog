@@ -1510,6 +1510,11 @@
           "description": "Redis Cluster, discovered from `redis_urls`.",
           "type": "string",
           "const": "cluster"
+        },
+        {
+          "description": "Primary `redis_sentinel_master`, found through the Sentinels in `redis_urls`.",
+          "type": "string",
+          "const": "sentinel"
         }
       ]
     },
@@ -1628,13 +1633,20 @@
           "$ref": "#/$defs/RedisMode",
           "default": "standalone"
         },
+        "redis_sentinel_master": {
+          "description": "Name of the primary Sentinel monitors, for `redis_mode = \"sentinel\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "redis_url": {
           "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
           "type": "string",
           "default": ""
         },
         "redis_urls": {
-          "description": "Redis nodes for `redis_mode = \"cluster\"`: one or more cluster nodes to\ndiscover the cluster from. Falls back to `redis_url` when empty.",
+          "description": "Redis nodes for `redis_mode = \"cluster\"` (one or more cluster nodes to\ndiscover the cluster from) or `\"sentinel\"` (the Sentinels). Falls back\nto `redis_url` when empty.",
           "type": "array",
           "default": [],
           "items": {
