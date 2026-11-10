@@ -53,7 +53,6 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build]
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.continue_on_error == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -76,7 +75,7 @@ jobs:
           # plugins/run.sh builds 4 plugin crates with cargo, so it needs
           # the workspace target/ cache; the other entries just run the
           # cached pgdog binary.
-          - { name: plugins,       script: integration/plugins/run.sh, needs_rust_cache: true, continue_on_error: true }
+          - { name: plugins,       script: integration/plugins/run.sh, needs_rust_cache: true }
     env:
       PGDOG_BIN: ${{ github.workspace }}/target/release/pgdog
     steps:
