@@ -14,7 +14,7 @@ USERS_CONFIG="${SCRIPT_DIR}/users.toml"
 PGDOG_PORT=${PGDOG_PORT:-6440}
 export PGPASSWORD=pgdog
 
-# Worst case: remaining retry backoff (≤16s) + copy of ~60k rows (~5s) + replication startup (~1s).
+# Worst case: remaining retry backoff (≤16s) + copy of ~360k rows (~10s) + replication startup (~1s).
 REPLICATION_TIMEOUT=60
 
 PGDOG_PID=""

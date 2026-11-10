@@ -64,7 +64,10 @@ async fn test_reload_connection_count_stable() {
             .unwrap()
             .get(0);
         eprintln!("connections after RELOAD: {after}");
-        if after == before {
+        // Healthchecks and idle timeouts open and close connections in the
+        // background, so the count is never exact. What RELOAD must not do
+        // is duplicate the pools.
+        if after as f64 / before as f64 <= 1.1 {
             settled = true;
             break;
         }
@@ -72,7 +75,7 @@ async fn test_reload_connection_count_stable() {
 
     assert!(
         settled,
-        "connection count changed after RELOAD: before={before}, after={after}"
+        "connection count grew by more than 10% after RELOAD: before={before}, after={after}"
     );
 
     direct.close().await;
