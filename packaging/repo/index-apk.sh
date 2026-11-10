@@ -8,6 +8,7 @@ apk add -q abuild openssl >/dev/null
 
 key=/keys/pgdog-bigleka.rsa
 openssl rsa -in "$key" -pubout -out /out/pgdog-bigleka.rsa.pub 2>/dev/null
+echo "signing with RSA key sha256:$(openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)"
 
 for arch in x86_64 aarch64; do
     dir="/out/apk/$arch"

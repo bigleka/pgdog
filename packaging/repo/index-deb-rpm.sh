@@ -12,6 +12,7 @@ export GNUPGHOME
 gpg --batch --quiet --import /keys/gpg.asc
 fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
 sign() { gpg --batch --yes --local-user "$fingerprint" "$@"; }
+echo "signing with GPG key $fingerprint"
 gpg --batch --armor --export "$fingerprint" > /out/pgdog.asc
 
 # APT: one suite, "stable", with every version in a flat pool.
