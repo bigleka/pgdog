@@ -105,7 +105,7 @@ kill -INT "$pid"
 i=0
 while kill -0 "$pid" 2>/dev/null; do
     i=$((i + 1))
-    [ "$i" -lt 50 ] || fail "pgdog didn't stop on SIGINT"
+    [ "$i" -lt 50 ] || { cat /tmp/pgdog.log; fail "pgdog didn't stop on SIGINT"; }
     sleep 0.2
 done
 
