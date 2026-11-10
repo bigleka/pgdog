@@ -3,6 +3,10 @@
 #   VERSION  package version, from pgdog/Cargo.toml
 #   ARCH     amd64 or arm64
 # and copies the binary to .build/pgdog: glibc for deb/rpm, musl for apk.
+# Packages are signed when these are set (see packaging/repo/README.md):
+#   NFPM_RPM_KEY_FILE  armored GPG private key, for the .rpm
+#   NFPM_APK_KEY_FILE  RSA private key (PEM), for the .apk
+# Unset, they expand to nothing and nfpm leaves the packages unsigned.
 name: pgdog
 version: ${VERSION}
 release: 1
@@ -139,3 +143,10 @@ deb:
 rpm:
   group: Applications/Databases
   summary: PostgreSQL connection pooler, load balancer and sharder
+  signature:
+    key_file: ${NFPM_RPM_KEY_FILE}
+apk:
+  signature:
+    key_file: ${NFPM_APK_KEY_FILE}
+    # Users install the public key as /etc/apk/keys/pgdog-bigleka.rsa.pub.
+    key_name: pgdog-bigleka
