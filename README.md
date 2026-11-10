@@ -16,6 +16,24 @@ PgDog is a proxy for scaling PostgreSQL. It supports connection pooling, load ba
 
 ## Quick start
 
+### Linux packages
+
+`.deb` (Debian 12+, Ubuntu 22.04+), `.rpm` (RHEL/Rocky/Alma 9+) and `.apk`
+(Alpine) for amd64 and arm64 are on the
+[releases page](https://github.com/bigleka/pgdog/releases). They install a
+`pgdog` systemd service (OpenRC on Alpine) running as its own user, with the
+configuration in `/etc/pgdog`:
+
+```bash
+sudo apt install ./pgdog_1.0.0-1_amd64.deb      # or: dnf install ./pgdog-1.0.0-1.x86_64.rpm
+sudoedit /etc/pgdog/pgdog.toml /etc/pgdog/users.toml
+sudo systemctl enable --now pgdog
+sudo systemctl reload pgdog                     # after config changes
+```
+
+See [packaging/README.md](packaging/README.md) for what gets installed,
+several instances per host and building the packages.
+
 ### Kubernetes
 
 Helm chart is **[here](https://github.com/pgdogdev/helm)**. To install it, run:

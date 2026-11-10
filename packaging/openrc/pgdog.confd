@@ -1,0 +1,5 @@
+# Settings for /etc/init.d/pgdog.
+
+#PGDOG_CONFIG=/etc/pgdog/pgdog.toml
+#PGDOG_USERS=/etc/pgdog/users.toml
+#RUST_LOG=info
