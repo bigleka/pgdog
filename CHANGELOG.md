@@ -30,3 +30,6 @@ See [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md).
   services, a `pgdog` system user and configuration in `/etc/pgdog`.
   See [packaging/README.md](packaging/README.md).
 - `pgdog --version` and `SHOW VERSION` show the package version.
+- Signed APT, YUM and APK repository with every released version, on
+  GitHub Pages; `.rpm` and `.apk` packages are signed too. See
+  [packaging/repo/README.md](packaging/repo/README.md).
