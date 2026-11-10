@@ -2,7 +2,6 @@
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use crate::backend::databases::{databases, reload, shutdown};
 use crate::config::config;
@@ -13,9 +12,9 @@ use crate::net::{tweak, Stream};
 use crate::sighup::Sighup;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::ctrl_c;
-use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio::{select, spawn};
+use tokio_util::sync::CancellationToken;
 
 use tracing::{error, info, warn};
 
@@ -25,7 +24,9 @@ use super::{comms::comms, Client, Error};
 #[derive(Debug, Clone)]
 pub struct Listener {
     addr: String,
-    shutdown: Arc<Notify>,
+    /// Cancelled once shutdown is done; stays cancelled, so the accept
+    /// loop sees it even if it wasn't waiting at that moment.
+    shutdown: CancellationToken,
 }
 
 impl Listener {
@@ -33,7 +34,7 @@ impl Listener {
     pub fn new(addr: impl ToString) -> Self {
         Self {
             addr: addr.to_string(),
-            shutdown: Arc::new(Notify::new()),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -81,7 +82,7 @@ impl Listener {
                     }
                 }
 
-                _ = self.shutdown.notified() => {
+                _ = self.shutdown.cancelled() => {
                     break;
                 }
             }
@@ -92,7 +93,7 @@ impl Listener {
 
     /// Shutdown this listener.
     pub fn shutdown(&self) {
-        self.shutdown.notify_one();
+        self.shutdown.cancel();
     }
 
     fn start_shutdown(&self) {
@@ -149,7 +150,7 @@ impl Listener {
             }
         }
 
-        self.shutdown.notify_waiters();
+        self.shutdown.cancel();
     }
 
     async fn handle_client(stream: TcpStream, addr: SocketAddr) -> Result<(), Error> {
@@ -236,5 +237,30 @@ impl Listener {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::{comms, Listener};
+
+    /// On SIGINT the shutdown task can finish before the accept loop is
+    /// back in `select!`, e.g. on a busy single-CPU host: the loop must
+    /// still stop.
+    #[tokio::test]
+    async fn test_shutdown_finished_before_listen_stops_loop() {
+        let mut listener = Listener::new("127.0.0.1:0");
+        comms().shutdown();
+        listener.execute_shutdown().await;
+
+        let stopped = timeout(Duration::from_secs(2), listener.listen())
+            .await
+            .expect("listener missed the shutdown");
+
+        assert!(stopped.is_ok(), "listen failed: {stopped:?}");
     }
 }
