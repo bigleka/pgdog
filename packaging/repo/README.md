@@ -30,7 +30,12 @@ every package's SHA256.
 
 ## Keys
 
-Fingerprint of the GPG key: _(fill in when the key is created)_.
+Fingerprints of the keys in use:
+
+- GPG: `BA94 E774 4353 F54F 2B11  F3ED 3FC5 3DDB A353 2F87`
+- RSA (APK), SHA256 of the DER public key:
+  `6a2c5ab7619ccbf116e752a2ca68c11b4e27f0171cf58a879043866a020beee9`
+  (`openssl rsa -pubin -in pgdog-bigleka.rsa.pub -outform DER | sha256sum`)
 
 Created once, kept by the maintainer and stored as two repository secrets.
 Neither has a passphrase: CI signs unattended, and the secrets are what
