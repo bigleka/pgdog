@@ -9,5 +9,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-pgdog-plugin = { git = "https://github.com/pgdogdev/pgdog", branch = "main" }
+pgdog-plugin = { git = "https://github.com/bigleka/pgdog", branch = "main" }
 assertions = { path = "../assertions" }
