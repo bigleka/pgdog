@@ -38,10 +38,37 @@ jobs:
       - name: Render tests
         run: charts/pgdog/test/test.sh
 
+      # Check the configurations with PgDog from this commit: settings added
+      # to PgDog and the chart together aren't in the published image yet.
+      # The ci workflow caches the binary under the same key.
+      - name: Compute pgdog binary cache key
+        id: cache-key
+        run: echo "key=pgdog-bin-${{ runner.os }}-$(bash integration/ci/cache-key.sh)" >> "$GITHUB_OUTPUT"
+      - name: Restore pgdog binaries
+        id: pgdog-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/debug/pgdog
+            target/release/pgdog
+          key: ${{ steps.cache-key.outputs.key }}
+      - name: Install build deps
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold
+      - uses: Swatinem/rust-cache@v2
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        with:
+          prefix-key: build-v2
+          save-if: false
+      - name: Build pgdog
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        run: cargo build --bin pgdog
+
       - name: PgDog accepts every rendered configuration
-        env:
-          ENGINE: docker
-        run: charts/pgdog/test/configcheck.sh ghcr.io/bigleka/pgdog:main
+        run: |
+          bin=target/release/pgdog
+          [ -x "$bin" ] || bin=target/debug/pgdog
+          PGDOG_BIN="$bin" charts/pgdog/test/configcheck.sh
 
   e2e:
     runs-on: ubuntu-24.04
