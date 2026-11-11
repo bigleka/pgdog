@@ -3,6 +3,15 @@
 This fork has its own version numbers. It forked from upstream
 [pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) at 0.1.38.
 
+## Unreleased
+
+### Result cache (Redis)
+
+- The encryption key can come from a file (`encryption_key_file`) or the
+  `PGDOG_RESULT_CACHE_ENCRYPTION_KEY` environment variable instead of
+  `pgdog.toml`. An empty key, or both `encryption_key` and
+  `encryption_key_file`, is now a configuration error.
+
 ## 1.0.0
 
 First release of the fork, with Linux packages.

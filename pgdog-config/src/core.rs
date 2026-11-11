@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -59,6 +60,14 @@ impl ConfigAndUsers {
 
         if config.multi_tenant.is_some() {
             info!("multi-tenant protection enabled");
+        }
+
+        if let Some(result_cache) = config.result_cache.as_mut() {
+            let env_key = env::var(ResultCache::ENCRYPTION_KEY_ENV).ok();
+            if let Err(err) = result_cache.resolve_encryption_key(env_key) {
+                error!("failed to load {}: {}", config_path.display(), err);
+                return Err(err);
+            }
         }
 
         let mut users: Users = if let Ok(users) = read_to_string(users_path) {
@@ -1363,5 +1372,49 @@ shard = 0
         let err = config.check().unwrap_err().to_string();
         assert!(err.contains("tls_verify"));
         assert!(err.contains("azure_workload_identity"));
+    }
+
+    fn load_with_result_cache(result_cache: &str) -> Result<ConfigAndUsers, Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("pgdog.toml");
+        std::fs::write(
+            &config,
+            format!("[result_cache]\nenabled = true\n{result_cache}\n"),
+        )
+        .unwrap();
+        ConfigAndUsers::load(&config, &dir.path().join("users.toml"))
+    }
+
+    fn encryption_key(config: &ConfigAndUsers) -> Option<&str> {
+        config
+            .config
+            .result_cache
+            .as_ref()
+            .and_then(|result_cache| result_cache.encryption_key.as_deref())
+    }
+
+    #[test]
+    fn test_load_reads_result_cache_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("cache.key");
+        std::fs::write(&key, "secret from file\n").unwrap();
+
+        let config =
+            load_with_result_cache(&format!("encryption_key_file = {:?}", key.display())).unwrap();
+        assert_eq!(encryption_key(&config), Some("secret from file"));
+    }
+
+    #[test]
+    fn test_load_takes_result_cache_key_from_env() {
+        std::env::set_var(crate::ResultCache::ENCRYPTION_KEY_ENV, "from env");
+        let config = load_with_result_cache(r#"encryption_key = "inline""#);
+        std::env::remove_var(crate::ResultCache::ENCRYPTION_KEY_ENV);
+        assert_eq!(encryption_key(&config.unwrap()), Some("from env"));
+    }
+
+    #[test]
+    fn test_load_fails_on_unreadable_result_cache_key_file() {
+        let config = load_with_result_cache(r#"encryption_key_file = "/nonexistent/pgdog.key""#);
+        assert!(config.is_err());
     }
 }
