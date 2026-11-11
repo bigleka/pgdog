@@ -1,0 +1,18 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- if and (hasKey .Values.service "exposeMetrics") (not .Values.service.exposeMetrics) (not .Values.statefulSet.enabled) }}
+{{- fail "serviceMonitor scrapes the Service's openmetrics port; it needs service.exposeMetrics: true" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "pgdog.fullname" . }}
+  labels:
+    {{- include "pgdog.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - path: /
+      port: openmetrics
+  selector:
+    matchLabels:
+      {{- include "pgdog.selectorLabels" . | nindent 6 }}
+{{- end }}

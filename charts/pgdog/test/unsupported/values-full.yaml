@@ -1,0 +1,169 @@
+# Full configuration test with databases and users
+replicas: 3
+
+env:
+  - name: RUST_LOG
+    value: trace
+workers: 4
+defaultPoolSize: 20
+minPoolSize: 2
+poolerMode: transaction
+healthcheckInterval: 30_000
+requireHealthcheckOnDiscovery: true
+idleHealthcheckInterval: 30_000
+idleHealthcheckDelay: 5_000
+loadBalancingStrategy: round_robin
+readWriteStrategy: conservative
+readWriteSplit: include_primary
+preparedStatements: extended
+preparedStatementsLimit: 1000
+queryCacheLimit: 500
+passthroughAuth: disabled
+connectAttempts: 2
+connectAttemptDelay: 100
+dryRun: false
+loadSchema: auto
+mirrorQueue: 256
+mirrorExposure: 1.0
+authType: scram
+authTokenCacheSize: 2000
+crossShardDisabled: false
+dnsTtl: 30_000
+pubSubChannelSize: 1024
+openMetricsPort: 9090
+openMetricsNamespace: pgdog_
+logConnections: true
+logDisconnections: true
+logDedupThreshold: 100
+logDedupWindow: 1_000
+expandedExplain: false
+queryParserEngine: "pg_query_raw"
+regexParserLimit: 1000
+logMinDurationParse: 100
+logQuerySampleLength: 1000
+
+# Sharding settings
+twoPhaseCommit: true
+twoPhaseCommitAuto: false
+systemCatalogs: omnisharded_sticky
+omnishardedSticky: true
+reshardingCopyFormat: binary
+reshardingParallelCopies: 1
+reloadSchemaOnDdl: true
+
+memoryNetBuffer: 8192
+memoryMessageBuffer: 8192
+memoryStackSize: 2097152
+port: 6432
+healthcheckPort: 8080
+logFormat: json
+logLevel: debug
+tlsClientRequired: false
+tlsVerify: prefer
+adminPassword: admin-secret
+
+tcpKeepalive: true
+tcpTime: 7200
+tcpInterval: 75
+tcpRetries: 9
+
+
+databases:
+  - name: primary
+    host: postgres-primary.example.com
+    port: 5432
+    shard: 0
+    databaseName: app
+    user: app_user
+    password: secret123
+    poolSize: 20
+    minPoolSize: 2
+    poolerMode: transaction
+    statementTimeout: 30_000
+    idleTimeout: 120_000
+    readOnly: false
+    serverLifetime: 86_400_000
+  - name: replica
+    host: postgres-replica.example.com
+    port: 5432
+    role: replica
+  - name: primary
+    host: postgres-shard1.example.com
+    port: 5432
+    shard: 1
+
+users:
+  - name: app_user
+    database: primary
+    password: secret123
+    poolerMode: transaction
+    readWriteSplit: exclude_primary
+  - name: admin_user
+    database: primary
+    password: admin123
+
+shardedTables:
+  - database: primary
+    name: users
+    column: id
+    dataType: bigint
+    mapping:
+      - values: ["1", "2", "3"]
+        shard: 0
+      - start: 4
+        end: 100
+        shard: 1
+
+shardedSchemas:
+  - database: primary
+    name: tenant_a
+    shard: 0
+
+mirrors:
+  - sourceDb: primary
+    destinationDb: replica
+    queueDepth: 128
+
+qos:
+  enabled: true
+  maxEntries: 10_000
+
+omnishardedTables:
+  - database: primary
+    sticky: true
+    tables:
+      - pg_class
+      - pg_attribute
+      - pg_attrdef
+      - pg_index
+      - pg_constraint
+      - pg_namespace
+
+plugins:
+  - name: pgdog_routing
+    config: |
+      [routing]
+      key = "value"
+  - name: pgdog_auth
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+
+nodeSelector:
+  node-type: database
+
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: database
+    effect: NoSchedule
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: pgdog
+          topologyKey: kubernetes.io/hostname

@@ -1,0 +1,86 @@
+{{- with .Values.resultCache }}
+{{- if and .enabled .valkey.enabled }}
+{{- $name := printf "%s-valkey" (include "pgdog.fullname" $) }}
+# A single Valkey for the result cache, with no persistence: losing it only
+# empties the cache. See resultCache.valkey in values.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: valkey
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: result-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: valkey
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: valkey
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: result-cache
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: "{{ .valkey.image.repository }}:{{ .valkey.image.tag }}"
+          imagePullPolicy: {{ .valkey.image.pullPolicy }}
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - {{ .valkey.maxmemory | quote }}
+            - --maxmemory-policy
+            - {{ .valkey.maxmemoryPolicy | quote }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["valkey-cli", "ping"]
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .valkey.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: valkey
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: result-cache
+spec:
+  selector:
+    app.kubernetes.io/name: valkey
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+{{- end }}
+{{- end }}

@@ -1,0 +1,17 @@
+# End-to-end test: two PgDogs sharing the bundled Valkey, results encrypted.
+replicas: 2
+databases:
+  - name: app
+    host: postgres
+    port: 5432
+users:
+  - name: app
+    database: app
+    password: secret
+resultCache:
+  enabled: true
+  xfetchBeta: 0
+  encryptionKeySecret:
+    name: pgdog-cache-key
+  valkey:
+    enabled: true

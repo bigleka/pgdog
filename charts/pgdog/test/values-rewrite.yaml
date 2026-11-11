@@ -1,0 +1,17 @@
+# Test rewrite configuration
+rewrite:
+  enabled: true
+  shardKey: "rewrite"
+  splitInserts: "ignore"
+  primaryKey: "rewrite"
+
+# Basic database config for testing rewrite
+databases:
+  - name: primary
+    host: postgres.example.com
+    port: 5432
+
+users:
+  - name: app_user
+    database: primary
+    password: secret123
