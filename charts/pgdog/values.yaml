@@ -230,8 +230,11 @@ prometheusResources:
 openMetricsPort: 9090
 # prometheusPort configures the port on which Prometheus will export its metrics
 # prometheusPort: 9091
-# openMetricsNamespace configures the metrics namespace
-openMetricsNamespace: pgdog_
+# openMetricsNamespace is a prefix for every metric name. This fork's
+# Grafana dashboard and Prometheus alerts (examples/grafana) use the names
+# without a prefix, as PgDog serves them by default; upstream's chart sets
+# "pgdog_".
+openMetricsNamespace: ""
 
 
 # logOutput defines the output format of the logs.

@@ -245,6 +245,7 @@ expect "disabled: no Valkey" "$(kinds -f "$TEST_DIR/values-result-cache-valkey.y
 expect "default image is this fork's" \
   "$(helm template test-release "$CHART_DIR" | yq -r 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image')" \
   "ghcr.io/bigleka/pgdog:$(yq -r .appVersion "$CHART_DIR/Chart.yaml")"
+contains "metrics keep the names the dashboard and alerts use" "$(pgdog_toml)" 'openmetrics_namespace = ""'
 echo "  [result_cache], the encryption key Secret and the bundled Valkey render as set, and only when enabled"
 
 echo ""

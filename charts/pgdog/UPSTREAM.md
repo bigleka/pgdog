@@ -5,8 +5,9 @@ commit `2fa5e87` (chart v0.97, for PgDog 0.1.63), MIT licensed
 ([LICENSE](LICENSE)). Changes for the fork:
 
 - `Chart.yaml`: name kept, version follows the fork's releases.
-- `values.yaml`: `image.repository` is `ghcr.io/bigleka/pgdog`; new
-  `resultCache` section.
+- `values.yaml`: `image.repository` is `ghcr.io/bigleka/pgdog`;
+  `openMetricsNamespace` is empty (upstream: `pgdog_`), so metric names
+  match the fork's dashboard and alerts; new `resultCache` section.
 - `templates/_fork.tpl` (new) and its call at the top of
   `templates/deployment.yaml`: refuse settings the fork's PgDog lacks.
 - `templates/config.yaml`: `[result_cache]`.
