@@ -31,7 +31,7 @@ fn set_lock_ms(ms: u64) {
     set(config).unwrap();
 }
 
-async fn redis() -> redis::aio::MultiplexedConnection {
+pub(super) async fn redis() -> redis::aio::MultiplexedConnection {
     redis::Client::open("redis://127.0.0.1:6379")
         .unwrap()
         .get_multiplexed_async_connection()
@@ -39,7 +39,7 @@ async fn redis() -> redis::aio::MultiplexedConnection {
         .unwrap()
 }
 
-fn key_prefix() -> String {
+pub(super) fn key_prefix() -> String {
     config()
         .config
         .result_cache
