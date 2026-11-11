@@ -6,7 +6,7 @@ pub mod singleflight;
 pub mod ttl;
 pub mod xfetch;
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use crate::frontend::router::parser::OwnedTable;
 use crate::frontend::ClientRequest;
@@ -83,6 +83,25 @@ impl CacheableRequest {
             route_sig,
             tables,
         })
+    }
+}
+
+/// Cached reply as sent to a client in or out of a transaction.
+///
+/// A reply ends with the ReadyForQuery it was captured with, whose status
+/// says whether that client was in a transaction. Only read-only
+/// transactions use the cache, so it's `I` or `T`.
+pub fn reply_for(payload: &[u8], in_transaction: bool) -> Cow<'_, [u8]> {
+    let status = if in_transaction { b'T' } else { b'I' };
+    match payload {
+        [.., b'Z', 0, 0, 0, 5, current] if *current != status => {
+            let mut reply = payload.to_vec();
+            if let Some(last) = reply.last_mut() {
+                *last = status;
+            }
+            Cow::Owned(reply)
+        }
+        _ => Cow::Borrowed(payload),
     }
 }
 

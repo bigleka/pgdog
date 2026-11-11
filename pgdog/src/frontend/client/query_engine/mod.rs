@@ -5,6 +5,7 @@ use crate::{
     config::config,
     frontend::{
         client::query_engine::{hooks::QueryEngineHooks, route_query::ClusterCheck},
+        client::TransactionType,
         router::{parser::Shard, Route},
         BufferedQuery, Client, ClientComms, Command, Error, Router, RouterContext, Stats,
     },
@@ -13,6 +14,7 @@ use crate::{
         lock::{Lock, Remote, RemoteLock},
         read_after_write_window,
         redis::RedisResultCache,
+        reply_for,
         singleflight::{Flight, Leader},
         CacheableRequest,
     },
@@ -44,6 +46,7 @@ pub mod start_transaction;
 mod test;
 #[cfg(test)]
 mod testing;
+mod transaction_cache;
 pub mod two_pc;
 pub mod unknown_command;
 
@@ -51,6 +54,7 @@ use self::query::ExplainResponseState;
 pub(crate) use advisory_lock::AdvisoryLocks;
 pub use context::QueryEngineContext;
 use notify_buffer::NotifyBuffer;
+use transaction_cache::TransactionCache;
 pub use two_pc::phase::TwoPcPhase;
 use two_pc::TwoPc;
 
@@ -73,6 +77,9 @@ pub struct QueryEngine {
     /// Tables this session wrote, and when: its reads of them go to the
     /// primary for the read-after-write window.
     recent_writes: Vec<(crate::frontend::router::parser::OwnedTable, Instant)>,
+    /// What the client's statements tell about its transaction, to know when
+    /// the result cache can serve it.
+    transaction_cache: TransactionCache,
 }
 
 #[derive(Debug)]
@@ -116,6 +123,7 @@ impl QueryEngine {
             result_cache_capture: None,
             pending_invalidations: Vec::new(),
             recent_writes: Vec::new(),
+            transaction_cache: TransactionCache::default(),
         })
     }
 
@@ -176,6 +184,13 @@ impl QueryEngine {
             self.result_cache = RedisResultCache::global().await;
         }
 
+        // What this statement does to the transaction, for the result cache.
+        match context.client_request.ast.as_ref() {
+            Some(ast) => self.transaction_cache.observe(ast.parse_result()),
+            None if context.client_request.is_executable() => self.transaction_cache.unknown(),
+            None => (),
+        }
+
         // Table-based invalidation: remember tables touched by writes. Their cache
         // entries are dropped once the writes are visible to other sessions, i.e.
         // when the transaction (explicit or implicit) ends.
@@ -198,14 +213,22 @@ impl QueryEngine {
 
         self.read_after_own_write(context);
 
-        // Cache lookup (MVP: simple SELECT only, outside transactions).
+        // Cache lookup: outside transactions, or in read-only READ COMMITTED ones.
         if let (Some(ref cache), Ok(cluster)) = (&self.result_cache, self.backend.cluster()) {
-            if !context.in_transaction() && context.client_request.is_executable() {
+            let in_transaction = context.in_transaction();
+            if (!in_transaction || self.cache_in_transaction(context))
+                && context.client_request.is_executable()
+            {
                 if let Some(req) = CacheableRequest::from_client_request(context.client_request) {
                     let user = context.params.get_required("user").unwrap_or("unknown");
                     if let Some(key) = cache
                         .build_key(cluster.name(), user, context.params, &req)
                         .await
+                        // A transaction may already run on a replica, which
+                        // can miss the write: don't cache what it reads.
+                        .filter(|key| {
+                            !(in_transaction && key.read_primary && has_replicas(cluster))
+                        })
                     {
                         // Read-after-write: a table it reads was just written,
                         // here or through another PgDog.
@@ -237,10 +260,12 @@ impl QueryEngine {
                                     None => {
                                         let payload = &cached.entry.payload;
                                         crate::stats::ResultCache::hit(payload.len());
-                                        let bytes_sent =
-                                            context.stream.send_raw_flush(payload).await?;
+                                        let bytes_sent = context
+                                            .stream
+                                            .send_raw_flush(&reply_for(payload, in_transaction))
+                                            .await?;
                                         self.stats.sent(bytes_sent);
-                                        self.set_state(State::Idle);
+                                        self.set_state(idle(in_transaction));
                                         return Ok(());
                                     }
                                 }
@@ -261,10 +286,13 @@ impl QueryEngine {
                                                 );
                                                 let bytes_sent = context
                                                     .stream
-                                                    .send_raw_flush(&entry.payload)
+                                                    .send_raw_flush(&reply_for(
+                                                        &entry.payload,
+                                                        in_transaction,
+                                                    ))
                                                     .await?;
                                                 self.stats.sent(bytes_sent);
-                                                self.set_state(State::Idle);
+                                                self.set_state(idle(in_transaction));
                                                 leader.finish(entry.payload);
                                                 return Ok(());
                                             }
@@ -273,10 +301,15 @@ impl QueryEngine {
                                     Flight::Follower(follower) => {
                                         if let Some(payload) = follower.wait().await {
                                             crate::stats::ResultCache::coalesced(payload.len());
-                                            let bytes_sent =
-                                                context.stream.send_raw_flush(&payload).await?;
+                                            let bytes_sent = context
+                                                .stream
+                                                .send_raw_flush(&reply_for(
+                                                    &payload,
+                                                    in_transaction,
+                                                ))
+                                                .await?;
                                             self.stats.sent(bytes_sent);
-                                            self.set_state(State::Idle);
+                                            self.set_state(idle(in_transaction));
                                             return Ok(());
                                         }
                                         // Leader got no result to share: run the query ourselves.
@@ -499,6 +532,32 @@ impl QueryEngine {
     /// Check if the backend protocol is out of sync due to an error in extended protocol.
     pub fn out_of_sync(&self) -> bool {
         self.backend.out_of_sync()
+    }
+}
+
+impl QueryEngine {
+    /// The result cache can serve this transaction: read-only, only plain
+    /// reads in it so far, and `READ COMMITTED`, so each statement sees the
+    /// latest data anyway, as an autocommit read would.
+    fn cache_in_transaction(&self, context: &QueryEngineContext<'_>) -> bool {
+        let assume_read_committed = config()
+            .config
+            .result_cache
+            .as_ref()
+            .is_some_and(|result_cache| result_cache.cache_read_only_transactions);
+        context.transaction() == Some(TransactionType::ReadOnly)
+            && self
+                .transaction_cache
+                .cacheable(context.params, assume_read_committed)
+    }
+}
+
+/// State after a reply served from the cache.
+fn idle(in_transaction: bool) -> State {
+    if in_transaction {
+        State::IdleInTransaction
+    } else {
+        State::Idle
     }
 }
 

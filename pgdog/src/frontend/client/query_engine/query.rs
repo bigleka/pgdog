@@ -274,7 +274,9 @@ impl QueryEngine {
 
             // Store cached payload at the end of a successful exchange.
             if let Some(capture) = self.result_cache_capture.take() {
-                if !capture.errored && !context.in_transaction() {
+                if !capture.errored
+                    && (!context.in_transaction() || self.cache_in_transaction(context))
+                {
                     let delta = capture.started.elapsed();
                     let entry = Entry {
                         delta,

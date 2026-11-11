@@ -310,7 +310,7 @@ impl TestTable {
 }
 
 /// Fill the cache for `table.select()` and prove later reads are cache hits.
-async fn prime_cache(client: &mut TestClient, table: &mut TestTable) {
+pub(super) async fn prime_cache(client: &mut TestClient, table: &mut TestTable) {
     assert_eq!(
         select_value(client, &table.select()).await.as_deref(),
         Some("1")

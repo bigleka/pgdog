@@ -1559,6 +1559,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "cache_read_only_transactions": {
+          "description": "Use the cache in read-only transactions that don't name an isolation\nlevel (`BEGIN READ ONLY`), as if they were `READ COMMITTED`.\n\nRead-only transactions that say `ISOLATION LEVEL READ COMMITTED` use\nthe cache regardless, and `REPEATABLE READ` or `SERIALIZABLE` ones\nnever do: each of their statements must see the same snapshot.\n\n**Note:** PgDog can't see `default_transaction_isolation` set with\n`ALTER ROLE` or `ALTER DATABASE`. Don't enable this if a role or\ndatabase defaults to `repeatable read` or `serializable`.\n\n_Default:_ `false`",
+          "type": "boolean",
+          "default": false
+        },
         "cache_safe_schema_list": {
           "description": "Optional allow-list of schemas whose tables can be cached.\n\nEach entry is treated as a regular expression.",
           "type": "array",

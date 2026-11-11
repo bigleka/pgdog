@@ -692,6 +692,9 @@ data:
         {{- if hasKey . "xfetchBeta" }}
         xfetch_beta = {{ .xfetchBeta | float64 }}
         {{- end }}
+        {{- if hasKey . "cacheReadOnlyTransactions" }}
+        cache_read_only_transactions = {{ .cacheReadOnlyTransactions }}
+        {{- end }}
         {{- range $field, $toml := dict "cacheSafeSchemaList" "cache_safe_schema_list" "cacheUnsafeSchemaList" "cache_unsafe_schema_list" "cacheSafeTableList" "cache_safe_table_list" "cacheUnsafeTableList" "cache_unsafe_table_list" }}
         {{- if hasKey $.Values.resultCache $field }}
         {{ $toml }} = {{ index $.Values.resultCache $field | toToml }}

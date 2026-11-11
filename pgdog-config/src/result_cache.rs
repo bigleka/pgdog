@@ -129,6 +129,21 @@ pub struct ResultCache {
     /// _Default:_ `1000`
     pub read_after_write_window_ms: Option<u64>,
 
+    /// Use the cache in read-only transactions that don't name an isolation
+    /// level (`BEGIN READ ONLY`), as if they were `READ COMMITTED`.
+    ///
+    /// Read-only transactions that say `ISOLATION LEVEL READ COMMITTED` use
+    /// the cache regardless, and `REPEATABLE READ` or `SERIALIZABLE` ones
+    /// never do: each of their statements must see the same snapshot.
+    ///
+    /// **Note:** PgDog can't see `default_transaction_isolation` set with
+    /// `ALTER ROLE` or `ALTER DATABASE`. Don't enable this if a role or
+    /// database defaults to `repeatable read` or `serializable`.
+    ///
+    /// _Default:_ `false`
+    #[serde(default)]
+    pub cache_read_only_transactions: bool,
+
     /// Optional allow-list of schemas whose tables can be cached.
     ///
     /// Each entry is treated as a regular expression.

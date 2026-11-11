@@ -214,6 +214,7 @@ for line in \
   'adaptive_ttl_max_seconds = 300' \
   'singleflight_lock_ms = 2000' \
   'read_after_write_window_ms = 1500' \
+  'cache_read_only_transactions = true' \
   'redis_connect_timeout_ms = 250' \
   'redis_response_timeout_ms = 300' \
   'redis_connect_retries = 2' \

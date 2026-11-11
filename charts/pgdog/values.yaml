@@ -422,6 +422,7 @@ resultCache:
   # adaptiveTtlMaxSeconds: 300
   # singleflightLockMs: 1000
   # readAfterWriteWindowMs: 1000
+  # cacheReadOnlyTransactions: false
   # redisConnectTimeoutMs: 500
   # redisResponseTimeoutMs: 500
   # redisConnectRetries: 1

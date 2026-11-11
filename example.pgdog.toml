@@ -283,6 +283,10 @@ max_entry_bytes = 524288
 # encryption_key = "long random string"
 # Redis key prefix.
 key_prefix = "pgdog:result_cache"
+# Also cache reads in `BEGIN READ ONLY` transactions that don't name an
+# isolation level, as if they were READ COMMITTED. Leave it off if a role or
+# database defaults to repeatable read or serializable.
+# cache_read_only_transactions = false
 # Optional allow/deny lists (regex) to control what gets cached.
 # Unsafe lists take precedence over safe lists.
 cache_safe_schema_list = []

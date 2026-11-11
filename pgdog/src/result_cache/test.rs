@@ -12,6 +12,24 @@ fn cacheable_request_only_simple_select_read_route() {
     assert!(CacheableRequest::from_client_request(&req).is_none());
 }
 
+#[test]
+fn reply_for_sets_transaction_status() {
+    use super::reply_for;
+    let idle = [b'D', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];
+    let in_transaction = [b'D', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'T'];
+
+    assert_eq!(&*reply_for(&idle, true), &in_transaction[..]);
+    assert_eq!(&*reply_for(&in_transaction, false), &idle[..]);
+    assert!(matches!(
+        reply_for(&idle, false),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert!(matches!(
+        reply_for(&in_transaction, true),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
 /// Redis-level behaviour, run against every supported Redis topology.
 /// Require the topologies from the dev container (see `redis-topologies.sh`).
 mod redis {
