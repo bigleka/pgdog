@@ -64,12 +64,17 @@ e.g. `docker stop -t 90`.
 
 ### Kubernetes
 
-Helm chart is **[here](https://github.com/pgdogdev/helm)**. To install it, run:
+This fork's chart is in [charts/pgdog](charts/pgdog): upstream's
+[chart](https://github.com/pgdogdev/helm) with this fork's image, the
+result cache settings, the encryption key from a Secret and an optional
+Valkey. It's published with every release:
 
 ```bash
-helm repo add pgdogdev https://helm.pgdog.dev
-helm install pgdog pgdogdev/pgdog
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.0.0 -f values.yaml
 ```
+
+Upstream's chart (`helm repo add pgdogdev https://helm.pgdog.dev`) deploys
+upstream PgDog, without the result cache.
 
 ### AWS
 

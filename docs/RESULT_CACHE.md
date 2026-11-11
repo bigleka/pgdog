@@ -40,6 +40,14 @@ With Sentinel, after a failover the former primary drops its connections or refu
 
 PgDog only sends commands that work on all of them: no `MULTI`, no `CLIENT` commands (twemproxy closes the connection on them), and multi-key commands only where the client splits them per cluster node.
 
+### Memory and eviction
+
+Give Redis a `maxmemory` and a `maxmemory-policy` of `volatile-lru` (or another
+`volatile-*` policy, or `noeviction`), never `allkeys-*`. Cached results have a
+TTL and can be evicted at any time: that's only a miss. Each table's generation
+counter (`<prefix>:gen:...`) has no TTL on purpose, and evicting it could make
+entries written before an invalidation match again.
+
 ## When Redis is down or slow
 
 The cache never holds a query up for long:

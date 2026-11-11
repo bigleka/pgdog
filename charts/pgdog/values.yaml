@@ -1,0 +1,906 @@
+# chart instance name overrides
+nameOverride: ""
+fullnameOverride: ""
+
+# labels configuration
+# Allows overriding the labels and selectors used by resources
+# If not set, defaults to new standard Kubernetes labels (app.kubernetes.io/*)
+# For backwards compatibility with existing deployments, set to legacy format:
+#   labels: { app: pgdog }
+#   selectorLabels: { app: pgdog }
+# NOTE: Changing selectors on existing deployments requires deleting and
+# recreating the Deployment due to Kubernetes selector immutability
+labels: {}
+selectorLabels: {}
+
+# allows adding custom annotations to the deployment
+annotations: {}
+
+# allows adding custom labels to the pods
+podLabels: {}
+# allows adding custom annotations to the pods
+podAnnotations: {}
+
+# restartOnConfigChange triggers a rolling restart when pgdog config changes.
+# Disabled by default; enable if you don't have a hot-reload mechanism (e.g. SIGHUP sidecar).
+# See: https://github.com/pgdogdev/helm/issues/15
+# restartOnConfigChange: false
+
+# clusterName identifies the Kubernetes cluster (optional)
+# When set, this will be added as a label to all Prometheus metrics
+# clusterName: ""
+
+## Optionally specify an array of imagePullSecrets.
+## Secrets must be manually created in the namespace.
+## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+## e.g:
+## imagePullSecrets:
+##   - name: regcred
+##
+imagePullSecrets: []
+
+# image contains the Docker image properties.
+image:
+  # repository is the Docker image repository
+  repository: ghcr.io/bigleka/pgdog
+  # tag is the Docker image tag (defaults to Chart appVersion if not specified)
+  tag: ""
+  # digest is the image digest (overrides tag when specified)
+  # Example: digest: sha256:abc123def456...
+  digest: ""
+  # pullPolicy specifies when to use cached version of the image.
+  pullPolicy: IfNotPresent
+  # name is the full image name (DEPRECATED: use repository and tag)
+  # If set, this takes precedence over repository and tag for backward
+  # compatibility
+  # name: ghcr.io/bigleka/pgdog:main
+# host specifies the network interface IP address to bind to.
+# Default: "0.0.0.0" (IPv4 only)
+# For IPv6 dual-stack support, use "::"
+# Not set by default to maintain backward compatibility.
+# host: "::"
+# port on which PgDog will run.
+port: 6432
+# listenBacklog is the maximum number of pending client connections queued by
+# the listening socket. The kernel caps the effective value at
+# net.core.somaxconn, so raise both settings when increasing this value.
+# Defaults to 1024. This setting cannot be changed at runtime.
+# listenBacklog: 1024
+# healthcheckPort on which PgDog will expose healthcheck endpoint
+# (if not specified, no separate healthcheck port is configured)
+# healthcheckPort: 8080
+# Optional [general] setting; omitted unless explicitly set to true or false.
+# requireHealthcheckOnDiscovery: true
+# authTokenCacheSize sets auth_token_cache_size in the [general] section.
+# Omitted unless explicitly set.
+# authTokenCacheSize: 2000
+# replicas indicates how many instances of PgDog will run (HA).
+replicas: 2
+
+# priorityClassName assigns a PriorityClass to pgdog pods for scheduling priority.
+# Not set by default; omitted from the pod spec unless explicitly specified.
+# Example: priorityClassName: production-critical
+
+# terminationGracePeriodSeconds is automatically set to shutdownTimeout + 5 seconds.
+# Default is 65 seconds (60s shutdownTimeout + 5s buffer).
+# Uncomment to override with an explicit value:
+# terminationGracePeriodSeconds: 90
+
+# Optional: Delay stopping the container to allow the Kubernetes service to update its endpoints and
+# allow clients to switch to other instances before PgDog shuts down.
+# This is useful in combination with short client connection lifetimes to avoid errors during pod shutdown.
+# preStopSleepSeconds: 25
+
+# Optional: lifecycle hooks for the pgdog container, instead of preStopSleepSeconds
+# (set one, not both). A preStop requires terminationGracePeriodSeconds covering
+# it plus shutdownTimeout. The image's stop signal is SIGINT, PgDog's graceful
+# shutdown, so a preStop only needs to wait, e.g. until clients have left:
+# lifecycle:
+#   preStop:
+#     exec:
+#       command:
+#         - /bin/sh
+#         - -c
+#         - |
+#           sleep 30
+#           until curl -fsS localhost:9090 | awk '$1 == "pgdog_clients" && $2 == 0 {f = 1} END {exit !f}'; do sleep 5; done
+# terminationGracePeriodSeconds: 3600
+
+# Optional: Deployment rollout strategy (Deployment only)
+# strategy: {}
+
+# Optional: container health probes (disabled by default)
+# livenessProbe: {}
+# readinessProbe: {}
+# startupProbe: {}
+
+# statefulSet controls whether to deploy as StatefulSet instead of Deployment
+# StatefulSet provides stable DNS hostnames for each pod (e.g., pgdog-0, pgdog-1)
+statefulSet:
+  # enabled switches from Deployment to StatefulSet
+  enabled: false
+  # walPvc creates one persistent volume claim per StatefulSet pod.
+  # The volume is mounted at /var/lib/pgdog. An init container creates the
+  # /var/lib/pgdog/wal directory, which is used by twoPhaseCommitWalDir.
+  walPvc:
+    enabled: false
+    size: 1Gi
+    # Set to a StorageClass compatible with the nodes running PgDog.
+    # Omit to use the cluster default; set to "" to disable dynamic provisioning.
+    # storageClassName: balanced-storage
+
+# env allows setting custom environment variables on the pgdog container
+# Note: NODE_ID is automatically generated and cannot be overridden
+# Example:
+# env:
+#   - name: MY_VAR
+#     value: "my-value"
+#   - name: SECRET_VAR
+#     valueFrom:
+#       secretKeyRef:
+#         name: my-secret
+#         key: password
+env: []
+
+# Extra customization for advanced use cases
+# extraInitContainers allows adding custom init containers that run before the main pgdog container
+# Init containers are useful for setup tasks like downloading certificates, waiting for dependencies, etc.
+# Example:
+# extraInitContainers:
+#   - name: init-ca
+#     image: busybox
+#     command: ['sh', '-c', 'wget -O /pki/ca-bundle.pem https://truststore.example.com/ca-bundle.pem']
+#     volumeMounts:
+#       - name: pki
+#         mountPath: /pki
+extraInitContainers: []
+
+# extraContainers adds sidecar containers next to pgdog (and the prometheus
+# sidecar, if enabled), e.g. one that sends SIGHUP to reload a renewed TLS
+# certificate. Combine with shareProcessNamespace to signal the pgdog process.
+# Sidecars get the pod's service account token unless automountServiceAccountToken
+# is false, and inherit nothing from securityContext: set their own. Run only
+# trusted images pinned by digest.
+# Example:
+# extraContainers:
+#   - name: sidecar
+#     image: busybox:1.37@sha256:<digest>
+#     command: ['sh', '-c', 'sleep infinity']
+#     securityContext:
+#       allowPrivilegeEscalation: false
+#       capabilities:
+#         drop: [ALL]
+extraContainers: []
+
+# shareProcessNamespace lets containers in the pod see and signal each other's
+# processes. PID 1 is then the pause container, not pgdog: signal pgdog by name
+# (pidof -s pgdog). A container running as pgdog's user can read its environment
+# and files through /proc, users.toml passwords included.
+# shareProcessNamespace: false
+
+# automountServiceAccountToken controls whether the pod gets a Kubernetes API
+# token. PgDog does not call the Kubernetes API; set to false when nothing else
+# in the pod does. Omitted from the pod spec unless set.
+# automountServiceAccountToken: false
+
+# extraVolumes allows adding custom volumes to the pod
+# These volumes can be referenced by extraVolumeMounts or extraInitContainers
+# Example:
+# extraVolumes:
+#   - name: pki
+#     emptyDir: {}
+extraVolumes: []
+
+# extraVolumeMounts allows adding custom volume mounts to the main pgdog container
+# The volumes must be defined in extraVolumes
+# Example:
+# extraVolumeMounts:
+#   - name: pki
+#     mountPath: /pki
+extraVolumeMounts: []
+
+# noCpuLimits removes CPU limits from containers so they can use idle CPU on the host.
+# Memory limits are still applied. CPU requests are preserved for scheduling.
+noCpuLimits: false
+
+# resources define resource requests and limits for the pgdog container
+# Note: requests and limits are set to the same values for Guaranteed QoS
+# Ratio: 1GB memory per 1 CPU (1000m CPU = 1Gi memory)
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# prometheusResources define resource requests and limits for the
+# prometheus sidecar (if enabled)
+# Note: requests and limits are set to the same values for Guaranteed QoS
+# Ratio: 1GB memory per 1 CPU (e.g., 100m CPU = 100Mi memory)
+prometheusResources:
+  requests:
+    cpu: 100m
+    memory: 100Mi
+  limits:
+    cpu: 100m
+    memory: 100Mi
+# openMetricsPort configures the port on which OpenMetrics
+# (Prometheus) are exported
+openMetricsPort: 9090
+# prometheusPort configures the port on which Prometheus will export its metrics
+# prometheusPort: 9091
+# openMetricsNamespace configures the metrics namespace
+openMetricsNamespace: pgdog_
+
+
+# logOutput defines the output format of the logs.
+#
+# Available options:
+# - text
+# - json
+#
+# Defaults to `text`.
+logFormat: text
+
+# logLevel defines the log level using the same syntax as RUST_LOG.
+#
+# Available options:
+# - error
+# - warn
+# - info
+# - debug
+# - trace
+# - off
+#
+# Defaults to `info`.
+logLevel: "info"
+
+# queryLogStdout controls query logging to stdout (optional).
+# queryLogStdout: false
+
+# loadBalancingStrategy controls how read queries are distributed across
+# replicas.
+#
+# PgDog defaults to `random`; the chart keeps its historical default of
+# `round_robin` by setting this explicitly.
+loadBalancingStrategy: round_robin
+
+# serverLifetime is the maximum amount of time (in milliseconds) a server
+# connection is allowed to exist. Connections exceeding this limit are closed
+# once they are checked back into the pool.
+# Defaults to 86400000 (24h).
+# serverLifetime: 86400000
+
+# serverLifetimeJitter is the maximum random adjustment (in milliseconds)
+# applied to serverLifetime per backend connection. Each connection's effective
+# lifetime is sampled uniformly from
+# [serverLifetime - jitter, serverLifetime + jitter] once at creation. This
+# breaks up synchronized retirement of connection cohorts that opened together
+# (e.g. during a traffic ramp).
+# Defaults to 0 (no jitter).
+# serverLifetimeJitter: 0
+
+# Admin password
+# adminPassword: change-me
+
+# databases contains the list of database entries in pgdog.toml
+# Supports all arguments from pgdog.toml. Arguments are named in
+# camelCase format.
+# Set tlsServerCertificate and tlsServerPrivateKey on a database to use
+# a different certificate and key for its PostgreSQL connections.
+databases: []
+
+# users contains the list of user entries in users.toml
+# Supports all arguments from users.toml. Arguments are named in
+# camelCase format.
+# Set identity on a user to match the identity in its client TLS certificate.
+# Set authType on a user to override the general authType setting.
+# Set readWriteSplit on a user to render read_write_split in users.toml (optional).
+# Set serverIamRegion to the AWS region for RDS IAM authentication
+# when serverAuth is rds_iam.
+# Set serverIamAssumeRole to an IAM role ARN to assume for RDS IAM authentication
+# when serverAuth is rds_iam.
+# Set serverVaultPath to the Vault credentials path when serverAuth is
+# vault_dynamic or vault_static, and vaultRefreshPercent (1-80) to control
+# when dynamic credentials are renewed. Set vaultPath to a static role path
+# to authenticate clients against its Vault-managed password. These require
+# the vault section below.
+users: []
+
+# mirrors contains a list of databases to replicate traffic from/to.
+mirrors: []
+
+# queryParsers contains per-database query parser settings in pgdog.toml.
+# Each entry requires: database and level; engine is optional.
+# Example:
+# queryParsers:
+#   - database: "prod"
+#     level: "off"
+#     engine: "pg_query_raw"
+queryParsers: []
+
+# shardedSchemas contains the list of sharded schema entries in pgdog.toml
+# Each entry requires: database and shard; name is optional
+# Example:
+# shardedSchemas:
+#   - database: "prod"
+#     name: "customer_a"
+#     shard: 0
+shardedSchemas: []
+
+# shardedTables contains the list of sharded table entries in pgdog.toml
+# Each entry requires: database and column; name and dataType are optional.
+# When dataType is omitted, PgDog defaults to bigint.
+# An entry may also carry a list/range/default mapping via the optional `mapping` field.
+# Each mapping rule has a target `shard`; the rule type is inferred from the fields set:
+#   - `values` -> list rule
+#   - `start` and/or `end` -> range rule
+#   - `shard` only -> default (catch-all) rule
+# Example:
+# shardedTables:
+#   - database: "prod"
+#     name: "users"
+#     column: "id"
+#     dataType: "bigint"
+#   - database: "prod"
+#     column: "tenant_id"
+#     dataType: "bigint"
+#     mapping:
+#       - values: [1, 5, 1_000]
+#         shard: 0
+#       - start: 100
+#         end: 200
+#         shard: 1
+#       - shard: 2
+shardedTables: []
+
+# shardedMappings contains the list of sharded mapping entries in pgdog.toml
+# DEPRECATED: prefer the `mapping` field on shardedTables entries above. This
+# legacy top-level form is still supported for backward compatibility.
+# Each entry requires: database, column, kind, shard; values, start and end are optional
+# Example:
+# shardedMappings:
+#     - database: "prod"
+#       column: "tenant_id"
+#       kind: "list"
+#       values: [1, 5, 1_000]
+#       shard: 0
+#     - database: "prod"
+#       column: "tenant_id"
+#       kind: "range"
+#       start: 1
+#       end: 100
+#       shard: 1
+shardedMappings: []
+
+# omnishardedTables contains the list of omnisharded table entries in pgdog.toml
+# Each entry requires: database and tables; sticky is optional
+# Example:
+# omnishardedTables:
+#   - database: "prod"
+#     sticky: true
+#     tables:
+#       - "pg_class"
+#       - "pg_attribute"
+#       - "pg_attrdef"
+#       - "pg_index"
+omnishardedTables: []
+
+# plugins contains the list of plugin entries in pgdog.toml
+# Each entry requires: name; config is optional (inline TOML content)
+# When config is provided, a <name>.toml file is added to the ConfigMap
+# and the plugin config path is set to /etc/pgdog/<name>.toml
+# Example:
+# plugins:
+#   - name: "pgdog_routing"
+#     config: |
+#       [routing]
+#       key = "value"
+#   - name: "pgdog_auth"
+plugins: []
+
+# resultCache configures the Redis result cache of this fork
+# (https://github.com/bigleka/pgdog/blob/main/docs/RESULT_CACHE.md).
+# Point it at your Redis, Valkey or Dragonfly with redisUrl (or redisMode
+# and redisUrls for Cluster and Sentinel), or set valkey.enabled to run a
+# single Valkey pod with the chart, for trying it out.
+# Settings left out use PgDog's defaults.
+resultCache:
+  enabled: false
+  # redisUrl: "redis://redis.cache.svc:6379"
+  # redisMode: standalone   # standalone, cluster or sentinel
+  # redisUrls: []           # cluster nodes, or sentinels
+  # redisSentinelMaster: mymaster
+  # expireSeconds: 30
+  # maxEntryBytes: 524288
+  # keyPrefix: "pgdog:result_cache"
+  # xfetchBeta: 1.0
+  # adaptiveTtlMaxSeconds: 300
+  # singleflightLockMs: 1000
+  # readAfterWriteWindowMs: 1000
+  # redisConnectTimeoutMs: 500
+  # redisResponseTimeoutMs: 500
+  # redisConnectRetries: 1
+  # redisUnavailableBackoffMs: 5000
+  # cacheSafeSchemaList: []
+  # cacheUnsafeSchemaList: []
+  # cacheSafeTableList: []
+  # cacheUnsafeTableList: []
+
+  # encryptionKeySecret names an existing Secret holding the key that
+  # encrypts cached results in Redis. It reaches PgDog as the
+  # PGDOG_RESULT_CACHE_ENCRYPTION_KEY environment variable, so changing it
+  # takes a rollout. Create one with:
+  #   kubectl create secret generic pgdog-cache-key \
+  #     --from-literal=encryption-key="$(openssl rand -base64 32)"
+  encryptionKeySecret:
+    name: ""
+    key: encryption-key
+
+  # valkey runs one Valkey pod with no persistence, as <release>-valkey,
+  # and points redisUrl at it when redisUrl isn't set. Good for trying the
+  # cache out; for production, use a Redis you operate (Sentinel or Cluster).
+  valkey:
+    enabled: false
+    image:
+      repository: docker.io/valkey/valkey
+      tag: "8.1"
+      pullPolicy: IfNotPresent
+    # maxmemory caps Valkey's memory; set it below the container limit.
+    maxmemory: 200mb
+    # Only evict keys with a TTL: PgDog's per-table generation counters
+    # have none and must never be evicted.
+    maxmemoryPolicy: volatile-lru
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 256Mi
+
+# service contains the Kubernetes service configuration
+service:
+  # type specifies the type of Kubernetes service
+  # (ClusterIP, NodePort, LoadBalancer, etc)
+  type: ClusterIP
+  # annotations allows adding custom annotations to the service
+  annotations: {}
+  # traffic distribution mode for Kubernetes service
+  # (PreferClose, PreferSameZone, PreferSameNode)
+  # see https://kubernetes.io/docs/reference/networking/virtual-ips/#traffic-distribution for more details.
+  trafficDistribution: ""
+  # externalTrafficPolicy controls how NodePort and LoadBalancer services
+  # route external traffic (Cluster or Local). Local restricts load-balancer
+  # backends to nodes running pgdog pods (avoiding an extra hop through
+  # non-backend nodes) and preserves client source IPs.
+  # see https://kubernetes.io/docs/reference/networking/virtual-ips/#external-traffic-policy for more details.
+  externalTrafficPolicy: ""
+  # internalTrafficPolicy controls how in-cluster traffic to the service is
+  # routed (Cluster or Local).
+  # see https://kubernetes.io/docs/reference/networking/virtual-ips/#internal-traffic-policy for more details.
+  internalTrafficPolicy: ""
+  # loadBalancerIP pins a LoadBalancer service to a pre-reserved IP.
+  # Support depends on the cloud provider.
+  # see https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer for more details.
+  loadBalancerIP: ""
+  # ipFamilyPolicy controls IP family behavior for the service.
+  # Valid values: SingleStack, PreferDualStack, RequireDualStack
+  # Leave empty to use cluster defaults.
+  # Ref: https://kubernetes.io/docs/concepts/services-networking/dual-stack/
+  ipFamilyPolicy: ""
+  # ipFamilies specifies which IP families to use for the service.
+  # Example for dual-stack: ["IPv4", "IPv6"]
+  # Leave empty to use cluster defaults.
+  # Note: Order matters - first family is primary.
+  ipFamilies: []
+  # exposeMetrics adds the openMetricsPort to the Service. Set to false for any
+  # internet-facing LoadBalancer and scrape the pods directly (e.g. a PodMonitor);
+  # serviceMonitor needs it true, except with statefulSet (headless Service).
+  exposeMetrics: true
+  # aws configures AWS Load Balancer Controller annotations
+  # When enabled, service type is automatically set to LoadBalancer
+  aws:
+    # enabled controls whether to add AWS LB annotations
+    enabled: false
+    # scheme controls whether the load balancer is internet-facing or internal
+    # Valid values: "internet-facing" or "internal"
+    scheme: "internet-facing"
+
+# nodeSelector allows scheduling pods on nodes with specific labels
+nodeSelector: {}
+
+# tolerations allows pods to be scheduled on nodes with matching taints
+tolerations: []
+
+# affinity and anti-affinity rules for pod scheduling
+affinity: {}
+  # Example: spread pods across different nodes for HA
+  # podAntiAffinity:
+  #   preferredDuringSchedulingIgnoredDuringExecution:
+  #   - weight: 100
+  #     podAffinityTerm:
+  #       labelSelector:
+  #         matchExpressions:
+  #         - key: app
+  #           operator: In
+  #           values:
+  #           - pgdog
+  #       topologyKey: kubernetes.io/hostname
+
+# topologySpreadConstraints controls how pods are spread across topology domains
+# https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+topologySpreadConstraints: []
+  # - maxSkew: 1
+  #   topologyKey: topology.kubernetes.io/zone
+  #   whenUnsatisfiable: DoNotSchedule
+  #   labelSelector:
+  #     matchLabels:
+  #       app: pgdog
+
+# multiAz spreads pods evenly across availability zones with a maximum skew of 1.
+multiAz:
+  enabled: true
+  # Valid values: DoNotSchedule, ScheduleAnyway
+  whenUnsatisfiable: ScheduleAnyway
+
+# podAntiAffinity enables default anti-affinity rules to spread pods
+# across nodes
+# Set to true for automatic pod anti-affinity configuration
+podAntiAffinity:
+  enabled: true
+  # type can be "soft" (preferred) or "hard" (required)
+  type: soft
+
+# podDisruptionBudget helps maintain availability during voluntary disruptions
+podDisruptionBudget:
+  enabled: true
+  # minAvailable specifies the minimum number of pods that must be available
+  # Can be an absolute number or a percentage (e.g., "50%")
+  minAvailable: 1
+  # maxUnavailable specifies the maximum number of pods that can be unavailable
+  # Only one of minAvailable or maxUnavailable can be specified
+  # maxUnavailable: 1
+
+# serviceAccount configuration for RBAC
+serviceAccount:
+  # create specifies whether a ServiceAccount should be created
+  create: true
+  # annotations to add to the service account
+  annotations: {}
+  # name of the service account to use
+  # (if not set and create is true, a name is generated)
+  name: ""
+
+# rbac configuration
+rbac:
+  # create specifies whether RBAC resources should be created
+  create: true
+
+# externalSecrets integration for secrets management
+externalSecrets:
+  # enabled controls whether to use ExternalSecrets instead of plain
+  # Kubernetes secrets
+  enabled: false
+  # create controls whether to create an ExternalSecret resource or
+  # use an existing one
+  # Set to false if you want to reference an externally managed ExternalSecret
+  create: true
+  # name of the ExternalSecret to create or reference
+  # (if empty, uses the chart fullname)
+  name: ""
+  # secretName is the name of the Kubernetes Secret that the
+  # ExternalSecret creates/targets (if empty, uses the chart fullname)
+  # Only needed when using an existing ExternalSecret with a custom
+  # target secret name
+  secretName: ""
+  # refreshInterval defines how often to sync secrets from external
+  # source (only used when create: true)
+  refreshInterval: 1h
+  # secretStoreRef references the SecretStore to use
+  # (only used when create: true)
+  secretStoreRef:
+    name: ""
+    kind: SecretStore
+  # remoteRefs defines the external secret references
+  # (only used when create: true)
+  remoteRefs: []
+    # Example structure:
+    # - secretKey: users.toml
+    #   remoteRef:
+    #     key: pgdog/users
+    #     property: users.toml
+
+# usersSecret references an existing Secret (that you created yourself in
+# this namespace) holding the users.toml file. When name is set, the chart
+# does not render its own users Secret and mounts this one instead.
+usersSecret:
+  # name of the existing Secret containing users.toml
+  name: ""
+  # key within that Secret whose value is the users.toml content;
+  # it is mounted at /etc/secrets/pgdog/users.toml regardless of the key name
+  key: users.toml
+
+# configSecret references an existing Secret (that you created yourself in
+# this namespace) holding the pgdog.toml file. When name is set, the chart
+# does not render its own pgdog.toml ConfigMap and mounts this Secret as the
+# /etc/pgdog directory instead. Use this when your pgdog.toml contains values
+# that must not live in a ConfigMap (e.g. database hosts or the admin
+# password sourced from a secrets manager).
+# Note: overlaying a Secret-provided pgdog.toml on top of the chart's
+# ConfigMap with a subPath volume mount does not work — the mount target is
+# a symlink inside the ConfigMap volume and the container runtime rejects it
+# (kubernetes/kubernetes#61545) — which is why this swaps the volume source.
+# Note: plugins[].config entries render into the chart's ConfigMap and are
+# not mounted when configSecret.name is set; a Secret-provided pgdog.toml
+# controls its own plugin config paths, so mount plugin files elsewhere via
+# extraVolumes/extraVolumeMounts.
+configSecret:
+  # name of the existing Secret containing pgdog.toml
+  name: ""
+  # key within that Secret whose value is the pgdog.toml content;
+  # it is mounted at /etc/pgdog/pgdog.toml regardless of the key name
+  key: pgdog.toml
+
+# otel configures OpenTelemetry metrics export. Left unset by default so the
+# [otel] section is omitted from pgdog.toml. Uncomment and fill in to enable.
+# otel:
+#   endpoint: https://otlp.example.com/v1/metrics
+#   namespace: pgdog
+#   # Datadog API key options (mutually exclusive):
+#   #   datadogApiKey: inline value, written into pgdog.toml (plaintext in the
+#   #     ConfigMap) — avoid for real secrets.
+#   datadogApiKey: ""
+#   #   datadogApiKeySecret: inject the key from an existing Secret you created
+#   #     as the DD_API_KEY env var, which pgdog reads. Nothing is written into
+#   #     pgdog.toml. Preferred for real secrets.
+#   datadogApiKeySecret:
+#     name: ""          # existing Secret name
+#     key: dd-api-key   # key within that Secret holding the API key
+
+# vault configures HashiCorp Vault, used by users with serverAuth set to
+# vault_dynamic or vault_static, or with vaultPath set. Left unset by default
+# so the [vault] section is omitted from pgdog.toml.
+# vault:
+#   url: https://vault.internal:8200
+#   authMethod: kubernetes   # kubernetes or approle
+#   authMount: ""            # default: kubernetes or approle
+#   namespace: ""            # Vault Enterprise namespace
+#   # Kubernetes auth
+#   kubernetesRole: pgdog
+#   kubernetesJwtPath: ""    # default: the pod's service account token
+#   # AppRole auth
+#   approleRoleId: ""
+#   approleSecretIdFile: ""  # file holding the secret ID, e.g. via extraVolumes
+#   # Alternatively, inject the secret ID from an existing Secret you created
+#   # as the VAULT_SECRET_ID env var, which pgdog reads when
+#   # approleSecretIdFile is not set.
+#   approleSecretIdSecret:
+#     name: ""          # existing Secret name
+#     key: secret-id    # key within that Secret holding the secret ID
+#   clientTokenTtl: 60       # seconds before token expiry to log in again
+
+# ServiceMonitor for Prometheus metrics
+serviceMonitor:
+  enabled: false
+
+# Grafana remote write configuration for Prometheus
+grafanaRemoteWrite:
+  # url is the Grafana remote write endpoint
+  # When set, remote_write will be enabled automatically
+  # Example: https://prometheus-prod-XX-XXX.grafana.net/api/prom/push
+  url: ""
+  # basicAuth credentials for Grafana Cloud
+  basicAuth:
+    # username is typically a numeric user ID for Grafana Cloud
+    username: ""
+    # password is the Grafana Cloud API key/token
+    password: ""
+  # queueConfig allows fine-tuning the remote write queue behavior
+  queueConfig:
+    # capacity is the number of samples to buffer per shard before blocking
+    capacity: 10000
+    # maxShards is the maximum number of shards (parallelism)
+    maxShards: 50
+    # minShards is the minimum number of shards
+    minShards: 1
+    # maxSamplesPerSend is the maximum number of samples per send
+    maxSamplesPerSend: 5000
+    # batchSendDeadline is the maximum time samples will wait in buffer
+    batchSendDeadline: 5s
+    # minBackoff is the initial retry delay
+    minBackoff: 30ms
+    # maxBackoff is the maximum retry delay
+    maxBackoff: 5s
+
+# Query stats (PgDog EE)
+queryStats:
+  # enabled enables pgdog query stats (EE version only)
+  enabled: false
+  queryPlansThreshold: 1000
+  queryPlansMaxAge: 15000
+  queryPlansCache: 100
+  queryPlansSampleRate: 1.0
+  maxErrors: 100
+  maxErrorAge: 300000
+# Control configuration (PgDog EE)
+# Enables communication with PgDog Cloud control plane
+control:
+  # enabled controls whether to include [control] section in pgdog.toml
+  enabled: false
+  # Require a control plane connection before allowing application traffic.
+  required: false
+  # endpoint is the control plane URL. Leave empty to use PGDOG_CONTROL_ENDPOINT.
+  endpoint: ""
+  # token is the authentication token. Leave empty to use PGDOG_CONTROL_TOKEN.
+  token: ""
+  # Inject the endpoint/token from existing Secrets in the same namespace.
+  # Inline endpoint/token values take precedence. Requires a PgDog EE version
+  # that supports PGDOG_CONTROL_ENDPOINT and PGDOG_CONTROL_TOKEN.
+  endpointSecret:
+    name: ""
+    key: endpoint
+  tokenSecret:
+    name: ""
+    key: token
+  # metricsInterval defines how often to push metrics (in milliseconds)
+  metricsInterval: 1000
+  # statsInterval defines how often to push stats (in milliseconds)
+  statsInterval: 5000
+  # activeQueriesInterval defines how often to push active queries (in milliseconds)
+  activeQueriesInterval: 5000
+  # errorsInterval defines how often to push errors (in milliseconds)
+  errorsInterval: 5000
+  # requestTimeout defines the timeout for control plane requests (in milliseconds)
+  requestTimeout: 1000
+  # queryTimingsChunkSize defines the chunk size for query timings
+  queryTimingsChunkSize: 25
+  # queryTimingsNewQueryQueueSize defines the queue size for new query timings
+  queryTimingsNewQueryQueueSize: 1000
+
+# LSN check configuration for replication failover auto mode (in milliseconds)
+# See: https://docs.pgdog.dev/features/load-balancer/replication-failover/
+# lsnCheckDelay: 0        # Set to 0 to start LSN monitoring immediately
+# lsnCheckInterval: 1000  # How frequently to re-fetch replication status
+
+# tlsGenerateSelfSignedCert generates a self-signed TLS certificate and private
+# key on chart installation and stores them as a Kubernetes Secret.
+# When enabled, tls_certificate and tls_private_key are automatically configured
+# in pgdog.toml, so you don't need to set tlsCertificate/tlsPrivateKey manually.
+# Note: certificates are regenerated on every helm upgrade.
+# tlsGenerateSelfSignedCert: false
+
+# tlsClientCaCertificate is the path to the CA certificate used to verify
+# client TLS certificates. Mount it with extraVolumes/extraVolumeMounts.
+# tlsClientCaCertificate: /etc/pgdog-client-ca/ca.crt
+
+# tlsServerCertificate and tlsServerPrivateKey are paths to the certificate
+# and private key PgDog presents when authenticating to PostgreSQL with mTLS.
+# Mount these files with extraVolumes/extraVolumeMounts.
+# tlsServerCertificate: /etc/pgdog-server-tls/tls.crt
+# tlsServerPrivateKey: /etc/pgdog-server-tls/tls.key
+
+# rdsCertificateBundle includes the AWS RDS CA certificate bundle so pgdog can
+# verify TLS connections to RDS/Aurora instances. When enabled,
+# tls_server_ca_certificate is automatically configured in pgdog.toml.
+# See: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html
+rdsCertificateBundle:
+  # enabled controls whether to mount the RDS CA bundle
+  enabled: false
+  # type selects which bundle to use: "global" (all commercial regions) or "govcloud"
+  type: global
+
+# TCP keep-alive configuration (optional)
+# These settings control socket-level keep-alive behavior.
+# All time values are in milliseconds.
+# tcpKeepalive: true
+# tcpTime: 7200000     # 2 hours (Linux default: 7200s)
+# tcpInterval: 75000   # 75 seconds (Linux default: 75s)
+# tcpRetries: 9
+
+# Memory configuration (optional)
+# These settings control buffer and stack sizes
+# memoryNetBuffer: 8192
+# memoryMessageBuffer: 8192
+# memoryStackSize: 2097152
+
+# Query parser configuration
+# queryParser controls whether the query parser and which features are enabled
+# Valid values: "auto", "on", "off", "session_control", "session_control_and_locks"
+# queryParser: "auto"
+
+# queryParserEngine specifies which query parser engine to use
+# queryParserEngine: ""
+
+# queryParserEnabled is DEPRECATED - use queryParser instead
+# queryParserEnabled: true
+
+# regexParserLimit specifies the maximum number of characters in a query that the regex parser
+# will inspect. Only applies when queryParser is "session_control" or "session_control_and_locks"
+# regexParserLimit: 1000
+
+# Prometheus Collector configuration
+# Deploys a standalone Prometheus instance that collects metrics from all pgdog pods
+prometheusCollector:
+  # enabled controls whether to deploy the Prometheus collector
+  enabled: false
+  # labels allows overriding prometheus-collector resource labels
+  labels: {}
+  # selectorLabels allows overriding prometheus-collector selector labels
+  selectorLabels: {}
+  # podAnnotations allows adding custom annotations to the prometheus-collector pods
+  podAnnotations: {}
+  # image contains the Docker image properties for Prometheus
+  image:
+    repository: prom/prometheus
+    tag: latest
+    pullPolicy: IfNotPresent
+  # port on which Prometheus will expose metrics
+  port: 9090
+  # scrapeInterval defines how often to scrape targets
+  scrapeInterval: 15s
+  # evaluationInterval defines how often to evaluate rules
+  evaluationInterval: 15s
+  # resources define resource requests and limits for the Prometheus container
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # storage configuration for Prometheus TSDB
+  storage:
+    # size is the maximum size of the emptyDir volume
+    size: 10Gi
+  # retention configuration for Prometheus TSDB
+  retention:
+    # time is the maximum duration to keep data (e.g., 15d, 6h)
+    time: 15d
+    # size is the maximum size of data to retain (e.g., 5GB, 500MB)
+    # Prometheus will delete oldest data first when this limit is exceeded
+    size: 5GB
+  # tls configuration for enabling HTTPS on the Prometheus endpoint
+  tls:
+    # enabled controls whether TLS is enabled for Prometheus
+    # When enabled, a self-signed certificate is automatically generated
+    enabled: false
+  # basicAuth configuration for protecting the Prometheus endpoint
+  basicAuth:
+    # enabled controls whether basic auth is required to access Prometheus
+    enabled: false
+    # username for basic auth
+    username: ""
+    # password is the plaintext password (used for health checks)
+    password: ""
+    # passwordHash is the bcrypt hash of the password
+    # Generate with: htpasswd -nBC 10 "" | tr -d ':\n'
+    # Or use Python: python -c "import bcrypt; print(bcrypt.hashpw(b'password', bcrypt.gensalt()).decode())"
+    passwordHash: ""
+  # service contains the Kubernetes service configuration
+  service:
+    # type specifies the type of Kubernetes service (ignored when aws.enabled is true)
+    type: ClusterIP
+    # annotations allows adding custom annotations to the service
+    annotations: {}
+    # aws configures AWS Load Balancer Controller annotations
+    # When enabled, service type is automatically set to LoadBalancer
+    aws:
+      # enabled controls whether to add AWS LB annotations
+      enabled: false
+      # scheme controls whether the load balancer is internet-facing or internal
+      # Valid values: "internet-facing" or "internal"
+      scheme: "internet-facing"
+  # nodeSelector allows scheduling pods on nodes with specific labels
+  nodeSelector: {}
+  # tolerations allows pods to be scheduled on nodes with matching taints
+  tolerations: []
+  # affinity rules for pod scheduling
+  affinity: {}
+
+securityContext: {}
+podSecurityContext: {}
+
+secret:
+  # annotations allows adding custom annotations to the generated Secret
+  annotations: {}

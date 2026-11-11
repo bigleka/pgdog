@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgdog.fullname" . }}-prom
+data:
+  prom.yml: |
+    global:
+      scrape_interval: 15s
+      external_labels:
+        {{- if .Values.clusterName }}
+        cluster: ${CLUSTER_NAME}
+        {{- end }}
+        deployment: ${DEPLOYMENT_NAME}
+        pod_name: ${POD_NAME}
+        pod_namespace: ${POD_NAMESPACE}
+        pod_ip: ${POD_IP}
+    scrape_configs:
+      - job_name: pgdog
+        scrape_interval: 15s
+        static_configs:
+          - targets: ['127.0.0.1:{{ .Values.openMetricsPort }}']
+    {{- if .Values.grafanaRemoteWrite.url }}
+    remote_write:
+      - url: {{ .Values.grafanaRemoteWrite.url }}
+        {{- if and .Values.grafanaRemoteWrite.basicAuth.username .Values.grafanaRemoteWrite.basicAuth.password }}
+        basic_auth:
+          username: {{ .Values.grafanaRemoteWrite.basicAuth.username }}
+          password: {{ .Values.grafanaRemoteWrite.basicAuth.password }}
+        {{- end }}
+        queue_config:
+          capacity: {{ .Values.grafanaRemoteWrite.queueConfig.capacity }}
+          max_shards: {{ .Values.grafanaRemoteWrite.queueConfig.maxShards }}
+          min_shards: {{ .Values.grafanaRemoteWrite.queueConfig.minShards }}
+          max_samples_per_send: {{ .Values.grafanaRemoteWrite.queueConfig.maxSamplesPerSend }}
+          batch_send_deadline: {{ .Values.grafanaRemoteWrite.queueConfig.batchSendDeadline }}
+          min_backoff: {{ .Values.grafanaRemoteWrite.queueConfig.minBackoff }}
+          max_backoff: {{ .Values.grafanaRemoteWrite.queueConfig.maxBackoff }}
+    {{- end }}

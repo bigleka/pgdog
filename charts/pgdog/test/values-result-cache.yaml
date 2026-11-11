@@ -1,0 +1,35 @@
+# Result cache against an external Redis Sentinel, with every setting and
+# the encryption key from a Secret.
+databases:
+  - name: app
+    host: postgres.db.svc
+    port: 5432
+users:
+  - name: app
+    database: app
+    password: secret
+
+resultCache:
+  enabled: true
+  redisMode: sentinel
+  redisUrls:
+    - redis://sentinel-0.cache.svc:26379
+    - redis://sentinel-1.cache.svc:26379
+  redisSentinelMaster: mymaster
+  expireSeconds: 60
+  maxEntryBytes: 1_048_576
+  keyPrefix: "app:cache"
+  xfetchBeta: 1.5
+  adaptiveTtlMaxSeconds: 300
+  singleflightLockMs: 2000
+  readAfterWriteWindowMs: 1500
+  redisConnectTimeoutMs: 250
+  redisResponseTimeoutMs: 300
+  redisConnectRetries: 2
+  redisUnavailableBackoffMs: 10_000
+  cacheSafeSchemaList: ["public"]
+  cacheUnsafeSchemaList: []
+  cacheSafeTableList: []
+  cacheUnsafeTableList: ["audit_.*"]
+  encryptionKeySecret:
+    name: pgdog-cache-key

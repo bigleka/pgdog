@@ -1,0 +1,3 @@
+Thanks for using PgDog, a pooler for sharding PostgreSQL!
+
+You've installed/upgraded the following resource: {{ .Release.Name }}

@@ -5,6 +5,18 @@ This fork has its own version numbers. It forked from upstream
 
 ## Unreleased
 
+### Helm chart
+
+- `charts/pgdog`: upstream's chart (pgdogdev/helm v0.97) with this fork's
+  image, `resultCache` settings, the encryption key from a Secret and an
+  optional Valkey. Settings this fork's PgDog doesn't support make the
+  install fail by name. Published as `oci://ghcr.io/bigleka/charts/pgdog`
+  on releases. See [charts/pgdog/README.md](charts/pgdog/README.md).
+
+### Docs
+
+- The result cache guide says which Redis eviction policies are safe.
+
 ### Container image
 
 - `ghcr.io/bigleka/pgdog` is tagged `X.Y.Z`, `X.Y` and `latest` on
