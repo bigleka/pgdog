@@ -657,7 +657,7 @@ mod test {
 
     use redis::{ErrorKind, RedisError, ServerErrorKind};
 
-    use super::{makes_unavailable, ResultCacheConfig};
+    use super::{decrypt, encrypt, makes_unavailable, ResultCacheConfig};
     use crate::config::{set, ConfigAndUsers};
 
     #[test]
@@ -708,5 +708,51 @@ mod test {
             "WRONGTYPE",
         ));
         assert!(!makes_unavailable(&err));
+    }
+
+    const PLAINTEXT: &[u8] = b"DataRow: 123.456.789-00";
+
+    #[test]
+    fn test_encrypted_value_decrypts_with_the_same_key() {
+        let encrypted = encrypt("key", PLAINTEXT).unwrap();
+        assert_eq!(decrypt("key", &encrypted).as_deref(), Some(PLAINTEXT));
+    }
+
+    #[test]
+    fn test_encrypted_value_hides_the_plaintext() {
+        let encrypted = encrypt("key", PLAINTEXT).unwrap();
+        assert!(!encrypted
+            .windows(PLAINTEXT.len())
+            .any(|window| window == PLAINTEXT));
+    }
+
+    /// A fresh nonce each time: the same value never encrypts the same way twice.
+    #[test]
+    fn test_same_value_encrypts_differently_each_time() {
+        assert_ne!(
+            encrypt("key", PLAINTEXT).unwrap(),
+            encrypt("key", PLAINTEXT).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_other_key_cannot_decrypt() {
+        let encrypted = encrypt("key", PLAINTEXT).unwrap();
+        assert_eq!(decrypt("other key", &encrypted), None);
+    }
+
+    /// AES-GCM authenticates the value: a changed byte is rejected, not decrypted to garbage.
+    #[test]
+    fn test_tampered_value_is_rejected() {
+        let mut encrypted = encrypt("key", PLAINTEXT).unwrap();
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 1;
+        assert_eq!(decrypt("key", &encrypted), None);
+    }
+
+    /// Values shorter than a nonce, e.g. a plaintext entry, aren't decrypted.
+    #[test]
+    fn test_value_shorter_than_nonce_is_rejected() {
+        assert_eq!(decrypt("key", b"short"), None);
     }
 }
