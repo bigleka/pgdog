@@ -259,6 +259,53 @@ cache_safe_table_list = []
 cache_unsafe_table_list = []
 ```
 
+## Benchmark
+
+`bench/result_cache/run.sh` runs pgbench against Postgres directly, PgDog
+without the cache, PgDog with it, and with it encrypted, and prints a table.
+Three workloads:
+
+- **lookup**: one row by primary key, keys skewed (zipfian), so most repeat.
+- **report**: an aggregate over one branch's 100k accounts (a scan), with 10
+  distinct keys.
+- **mixed**: report, plus 1 tpcb-like write transaction in 10. The writes go
+  to the table the reports scan, so each one invalidates all of them.
+
+On a laptop (Intel i7-2820QM, 4 cores/8 threads, with Postgres 17, Redis 8,
+PgDog and pgbench all on it), scale 10, 16 clients, `-M prepared`, 30s per run
+after 10s of warm-up:
+
+| Workload | Target | TPS | Avg latency (ms) | Cache hits |
+|---|---|---:|---:|---:|
+| lookup | Postgres | 65,711 | 0.243 | |
+| lookup | PgDog | 30,310 | 0.528 | |
+| lookup | PgDog + cache | 29,716 | 0.538 | 94% |
+| lookup | PgDog + cache, encrypted | 26,696 | 0.599 | 94% |
+| report | Postgres | 27 | 603 | |
+| report | PgDog | 26 | 605 | |
+| report | PgDog + cache | 31,174 | 0.513 | 100% |
+| report | PgDog + cache, encrypted | 29,873 | 0.536 | 100% |
+| mixed | Postgres | 29 | 558 | |
+| mixed | PgDog | 28 | 572 | |
+| mixed | PgDog + cache | 58 | 274 | 15% |
+| mixed | PgDog + cache, encrypted | 54 | 295 | 11% |
+
+What it shows:
+
+- **The cache pays off by what a miss costs.** A 600ms aggregate answered in
+  0.5ms: over a thousand times the throughput. A primary-key lookup costs
+  Postgres about as much as a hit costs PgDog (two Redis round trips: the
+  tables' generations, then the entry), so caching it gains nothing even at
+  94% hits. Keep such tables out with `cache_unsafe_table_list`, or leave the
+  cache to the queries that are slow.
+- **Writes to a table drop every cached read of it.** In the mixed run, the
+  reports hit the cache 15% of the time and still doubled the throughput,
+  because each hit saves a whole scan.
+- **Encryption** costs 4-10% here.
+- PgDog itself halves the lookup throughput on this machine, where it shares 8
+  threads with Postgres, Redis and pgbench. Measure on your own hardware, with
+  PgDog on its own cores.
+
 ## Current limitations
 
 - Over the extended protocol, only one statement per `Sync` (see [Extended protocol](#extended-protocol)).

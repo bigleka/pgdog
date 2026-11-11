@@ -16,6 +16,8 @@ This fork has its own version numbers. It forked from upstream
 ### Docs
 
 - The result cache guide says which Redis eviction policies are safe.
+- Result cache benchmark with pgbench (`bench/result_cache/run.sh`), with
+  results in the guide.
 
 ### Container image
 
