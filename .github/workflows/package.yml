@@ -1,10 +1,18 @@
 name: package
+# Images on ghcr.io/bigleka/pgdog: `main` and the short commit SHA on every
+# push to main; `X.Y.Z`, `X.Y`, `vX.Y.Z` and `latest` on release tags.
+# Releases are created by the release workflow with GITHUB_TOKEN, which
+# doesn't trigger other workflows, so this listens to the tag push itself.
 on:
   push:
     branches: ['main']
-  release:
-    types: [published]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build again, e.g. v1.0.0 (empty builds the selected branch)
+        required: false
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -33,6 +41,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-tags: true
           fetch-depth: 0
 
@@ -105,6 +114,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-tags: true
           fetch-depth: 0
 
@@ -135,7 +145,7 @@ jobs:
       - name: Check for git tag
         id: tag
         run: |
-          TAG=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
+          TAG=$(git describe --exact-match --tags --match 'v[0-9]*' HEAD 2>/dev/null || echo "")
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           if [ -n "$TAG" ]; then
             echo "Git tag found: $TAG"
@@ -148,11 +158,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` only with a release tag, never for main.
+          flavor: |
+            latest=${{ steps.tag.outputs.tag != '' }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=main,enable=${{ steps.tag.outputs.tag == '' && github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
             type=raw,value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
             type=raw,value=${{ steps.commit.outputs.sha }}
 

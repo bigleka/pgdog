@@ -38,6 +38,30 @@ sudo systemctl reload pgdog                     # after config changes
 See [packaging/README.md](packaging/README.md) for RHEL and Alpine, what
 gets installed, several instances per host and building the packages.
 
+### Container image
+
+`ghcr.io/bigleka/pgdog`, for amd64 and arm64:
+
+| Tag | |
+|-----|-|
+| `1.0.0`, `1.0`, `latest` | Releases. |
+| `main` | The latest commit on `main`. |
+| `<short SHA>` | One commit. |
+
+PgDog reads `pgdog.toml` and `users.toml` from its working directory,
+`/pgdog`:
+
+```bash
+docker run -p 6432:6432 \
+    -v ./pgdog.toml:/pgdog/pgdog.toml:ro -v ./users.toml:/pgdog/users.toml:ro \
+    -e PGDOG_RESULT_CACHE_ENCRYPTION_KEY \
+    ghcr.io/bigleka/pgdog:1.0
+```
+
+It stops gracefully on `SIGINT`, the image's stop signal: give it up to
+`general.shutdown_timeout` (60 s by default) to finish running transactions,
+e.g. `docker stop -t 90`.
+
 ### Kubernetes
 
 Helm chart is **[here](https://github.com/pgdogdev/helm)**. To install it, run:
