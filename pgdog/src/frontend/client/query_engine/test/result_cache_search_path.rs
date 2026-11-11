@@ -118,3 +118,25 @@ async fn test_qualified_write_invalidates_unqualified_read() {
         "stale value served after UPDATE <schema>.t"
     );
 }
+
+/// The same unqualified query from sessions whose search_path finds
+/// different tables doesn't share a cached result.
+#[tokio::test]
+async fn test_search_path_separates_cached_results() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let one = TestSchema::new().await;
+    let mut two = TestSchema::new().await;
+    two.update_directly(2).await;
+    let select = "SELECT v FROM t WHERE id = 1";
+
+    // Dropping a test client shuts the pools down: keep both.
+    let mut first_client = one.client().await;
+    let mut second_client = two.client().await;
+    let first = select_value(&mut first_client, select).await;
+    let second = select_value(&mut second_client, select).await;
+    one.drop().await;
+    two.drop().await;
+
+    assert_eq!(first.as_deref(), Some("1"));
+    assert_eq!(second.as_deref(), Some("2"), "other search_path's result");
+}

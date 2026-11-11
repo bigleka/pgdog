@@ -337,11 +337,18 @@ async fn test_hit_inside_transaction_reports_transaction_status() {
     let mut client = TestClient::new(Parameters::default()).await;
     prime_cache(&mut client, &mut table).await;
 
-    simple(&mut client, "BEGIN").await;
+    table.update_directly(1000).await;
+    simple(&mut client, "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await;
     let reply = simple(&mut client, &table.select()).await;
     simple(&mut client, "ROLLBACK").await;
     table.drop().await;
 
+    let value = reply
+        .iter()
+        .find(|message| message.code() == 'D')
+        .and_then(|message| DataRow::try_from(message.clone()).ok())
+        .and_then(|row| row.get_text(0));
+    assert_eq!(value.as_deref(), Some("1"), "precondition: a cache hit");
     let rfq = ReadyForQuery::try_from(reply.last().unwrap().clone()).unwrap();
     assert_eq!(
         rfq.status, 'T',
@@ -534,7 +541,8 @@ async fn test_write_after_read_in_one_query_invalidates() {
     assert_eq!(after.as_deref(), Some("2"), "stale read after the write");
 }
 
-/// ... and isn't a read the cache can replay: the write must run each time.
+/// ... and isn't a read the cache can replay: the write must run each time,
+/// even when nothing in the query names a table to invalidate.
 #[tokio::test]
 async fn test_query_with_write_after_read_not_cached() {
     enable_result_cache(QueryParserLevel::Auto);
@@ -542,8 +550,8 @@ async fn test_query_with_write_after_read_not_cached() {
     let mut client = TestClient::new(Parameters::default()).await;
 
     let query = format!(
-        "SELECT v FROM {name} WHERE id = 1; UPDATE {name} SET v = v + 1 WHERE id = 1",
-        name = table.name
+        "SELECT 1; DO $$ BEGIN UPDATE {} SET v = v + 1 WHERE id = 1; END $$",
+        table.name
     );
     simple(&mut client, &query).await;
     simple(&mut client, &query).await;
