@@ -28,6 +28,7 @@ mod result_cache_distributed;
 mod result_cache_encryption;
 mod result_cache_extended;
 mod result_cache_read_after_write;
+mod result_cache_search_path;
 mod result_cache_topologies;
 mod result_cache_xfetch;
 mod rewrite_extended;

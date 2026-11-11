@@ -458,7 +458,8 @@ impl QueryEngine {
         let reads_recent_write = context.client_request.ast.as_ref().is_some_and(|ast| {
             ast.tables().iter().any(|table| {
                 self.recent_writes.iter().any(|(written, _)| {
-                    written.name == table.name && written.schema.as_deref() == table.schema
+                    written.name == table.name
+                        && may_be_same_schema(written.schema.as_deref(), table.schema)
                 })
             })
         });
@@ -507,6 +508,15 @@ fn same_table(
     b: &crate::frontend::router::parser::OwnedTable,
 ) -> bool {
     a.name == b.name && a.schema == b.schema
+}
+
+/// A table named without a schema is whichever one the session's search_path
+/// finds, so it can be the table of that name in any schema.
+fn may_be_same_schema(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 /// Without replicas every read already runs on the primary.

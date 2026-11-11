@@ -309,3 +309,66 @@ async fn test_transaction_reads_session_write() {
         "read went to the stale replica"
     );
 }
+
+/// Schema the table was created in, through the search_path.
+async fn schema_of(table: &mut Table) -> String {
+    table
+        .primary
+        .fetch_all::<String>(format!(
+            "SELECT schemaname::text FROM pg_tables WHERE tablename = '{}'",
+            table.name
+        ))
+        .await
+        .unwrap()
+        .pop()
+        .expect("table exists")
+}
+
+/// `UPDATE t` then `SELECT ... FROM <schema>.t`, or the other way around:
+/// the session's search_path can make them the same table, so the read must
+/// see the write. Not cached, so only the session's own list sends it to
+/// the primary.
+async fn session_reads_its_write_by_other_name(qualified_write: bool) -> Option<String> {
+    let mut table = Table::new().await;
+    let name = table.name.clone();
+    configure(|result_cache| result_cache.cache_unsafe_table_list = vec![name]);
+    let schema = schema_of(&mut table).await;
+    let qualified = format!("{schema}.{}", table.name);
+    let (update, select) = if qualified_write {
+        (
+            format!("UPDATE {qualified} SET v = 2 WHERE id = 1"),
+            table.select(),
+        )
+    } else {
+        (
+            table.update(2),
+            format!("SELECT v FROM {qualified} WHERE id = 1"),
+        )
+    };
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    simple(&mut client, &update).await;
+    let value = select_value(&mut client, &select).await;
+    table.drop().await;
+    value
+}
+
+#[tokio::test]
+async fn test_session_reads_unqualified_write_by_schema() {
+    assert_eq!(
+        session_reads_its_write_by_other_name(false)
+            .await
+            .as_deref(),
+        Some("2"),
+        "SELECT FROM <schema>.t after UPDATE t went to the stale replica"
+    );
+}
+
+#[tokio::test]
+async fn test_session_reads_qualified_write_unqualified() {
+    assert_eq!(
+        session_reads_its_write_by_other_name(true).await.as_deref(),
+        Some("2"),
+        "SELECT FROM t after UPDATE <schema>.t went to the stale replica"
+    );
+}

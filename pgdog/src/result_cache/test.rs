@@ -128,6 +128,9 @@ mod redis {
         waiter_leads_when_lock_expires,
         lock_is_kept_while_holder_runs,
         invalidation_marks_recent_write,
+        unqualified_write_invalidates_qualified_read,
+        qualified_write_invalidates_unqualified_read,
+        qualified_write_keeps_other_schema,
     );
 
     fn entry(payload: &[u8]) -> Entry {
@@ -146,6 +149,14 @@ mod redis {
     fn table(name: &str) -> OwnedTable {
         OwnedTable {
             name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn qualified(schema: &str, name: &str) -> OwnedTable {
+        OwnedTable {
+            name: name.into(),
+            schema: Some(schema.into()),
             ..Default::default()
         }
     }
@@ -457,5 +468,54 @@ mod redis {
             .await
             .unwrap();
         assert!(!key.read_primary, "still marked after the window");
+    }
+
+    /// Whether a write to `written` drops a cached read of `read`.
+    async fn write_invalidates(topology: Topology, read: OwnedTable, written: OwnedTable) -> bool {
+        let cache = cache(topology).await;
+        let req = request(&[read]);
+        let params = Parameters::default();
+
+        let key = cache.build_key("db", "user", &params, &req).await.unwrap();
+        cache
+            .set_with_table_tags("db", &key, &entry(b"rows"), &req.tables)
+            .await;
+        assert!(cache.get(&key).await.is_some(), "entry wasn't stored");
+
+        cache.invalidate_tables("db", &[written]).await;
+
+        let key = cache.build_key("db", "user", &params, &req).await.unwrap();
+        cache.get(&key).await.is_none()
+    }
+
+    /// `pedidos` can be `public.pedidos`: PgDog doesn't know which schema the
+    /// session's search_path resolves it to (it can come from ALTER ROLE or
+    /// ALTER DATABASE), so a write to it must drop reads of any `*.pedidos`.
+    async fn unqualified_write_invalidates_qualified_read(topology: Topology) {
+        assert!(
+            write_invalidates(topology, qualified("public", "pedidos"), table("pedidos")).await,
+            "UPDATE pedidos left SELECT FROM public.pedidos cached"
+        );
+    }
+
+    /// And a write to `public.pedidos` must drop reads of `pedidos`.
+    async fn qualified_write_invalidates_unqualified_read(topology: Topology) {
+        assert!(
+            write_invalidates(topology, table("pedidos"), qualified("public", "pedidos")).await,
+            "UPDATE public.pedidos left SELECT FROM pedidos cached"
+        );
+    }
+
+    /// Fully qualified names are known to be different tables.
+    async fn qualified_write_keeps_other_schema(topology: Topology) {
+        assert!(
+            !write_invalidates(
+                topology,
+                qualified("public", "pedidos"),
+                qualified("vendas", "pedidos")
+            )
+            .await,
+            "UPDATE vendas.pedidos dropped SELECT FROM public.pedidos"
+        );
     }
 }

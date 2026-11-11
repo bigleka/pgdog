@@ -1,4 +1,5 @@
 use std::{
+    fmt, iter,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -268,21 +269,20 @@ impl RedisResultCache {
         });
     }
 
-    fn tag_set_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
-        let schema = table.schema.as_deref().unwrap_or("_");
-        format!("{prefix}:tbl:{db}:{schema}.{}", table.name)
+    /// Set of the cache keys stored under a counter (see [`Counter`]).
+    fn tag_set_key(prefix: &str, db: &str, counter: &Counter) -> String {
+        format!("{prefix}:tbl:{db}:{counter}")
     }
 
-    /// Generation of the table, bumped on every invalidation: the time of the
-    /// last write in ms (Redis clock), or one more than before if that's
-    /// higher. Never expires: if it did, it could restart lower and old
-    /// entries would match again.
+    /// Generation of a counter (see [`Counter`]), bumped on every
+    /// invalidation: the time of the last write in ms (Redis clock), or one
+    /// more than before if that's higher. Never expires: if it did, it could
+    /// restart lower and old entries would match again.
     ///
     /// Being a time, it also tells readers whether the table was written
     /// within the read-after-write window.
-    fn generation_key(prefix: &str, db: &str, table: &OwnedTable) -> String {
-        let schema = table.schema.as_deref().unwrap_or("_");
-        format!("{prefix}:gen:{db}:{schema}.{}", table.name)
+    fn generation_key(prefix: &str, db: &str, counter: &Counter) -> String {
+        format!("{prefix}:gen:{db}:{counter}")
     }
 
     /// Current generation of each table, joined into a single string, and
@@ -300,9 +300,9 @@ impl RedisResultCache {
             return Some((String::new(), false));
         }
 
-        let keys: Vec<_> = tables
+        let keys: Vec<_> = Counter::read(tables)
             .iter()
-            .map(|table| Self::generation_key(prefix, db, table))
+            .map(|counter| Self::generation_key(prefix, db, counter))
             .collect();
         let mut conn = self.connection()?;
         let generations: Vec<Option<u64>> =
@@ -535,8 +535,8 @@ impl RedisResultCache {
             return;
         };
 
-        for table in tables {
-            let set_key = Self::tag_set_key(&cfg.key_prefix, db, table);
+        for counter in Counter::read(tables) {
+            let set_key = Self::tag_set_key(&cfg.key_prefix, db, &counter);
             let _: redis::RedisResult<()> = conn.sadd(&set_key, &key.redis_key).await;
             let _: redis::RedisResult<()> = conn.expire(&set_key, set_ttl_secs as i64).await;
         }
@@ -554,11 +554,11 @@ impl RedisResultCache {
             return;
         };
 
-        for table in tables {
+        for counter in Counter::written(tables) {
             // Bump the generation first: it's what keeps results computed
             // before this write from being served. Deleting tagged keys
             // below only frees memory sooner.
-            let generation_key = Self::generation_key(&cfg.key_prefix, db, table);
+            let generation_key = Self::generation_key(&cfg.key_prefix, db, &counter);
             let bumped: redis::RedisResult<u64> = redis::cmd("EVAL")
                 .arg(BUMP_GENERATION)
                 .arg(1)
@@ -571,7 +571,7 @@ impl RedisResultCache {
                 warn!("result_cache generation bump failed: {}", err);
             }
 
-            let set_key = Self::tag_set_key(&cfg.key_prefix, db, table);
+            let set_key = Self::tag_set_key(&cfg.key_prefix, db, &counter);
             let keys: redis::RedisResult<Vec<String>> = conn.smembers(&set_key).await;
             match keys {
                 Ok(keys) => {
@@ -586,6 +586,79 @@ impl RedisResultCache {
                     warn!("result_cache invalidate failed: {}", err);
                 }
             }
+        }
+    }
+}
+
+/// Generation counter of a table name.
+///
+/// `pedidos` is whichever table the session's search_path finds first, and
+/// PgDog doesn't know which: the search_path can come from ALTER ROLE or
+/// ALTER DATABASE, or the table can be created in another schema of the path
+/// later. So `pedidos` may be `public.pedidos`, and `public.pedidos` may be
+/// `pedidos`, while `public.pedidos` and `vendas.pedidos` never are the same.
+///
+/// | Statement on      | Reads depend on                | Writes bump                    |
+/// |-------------------|--------------------------------|--------------------------------|
+/// | `public.pedidos`  | `Schema(public)`, `Unqualified`| `Schema(public)`, `AnySchema`  |
+/// | `pedidos`         | `AnySchema`                    | `Unqualified`, `AnySchema`     |
+///
+/// Every write to `pedidos` bumps a counter the reads of `pedidos` and
+/// `public.pedidos` depend on, and writes to `vendas.pedidos` don't touch
+/// reads of `public.pedidos`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Counter<'a> {
+    /// Table in this schema, named with it.
+    Schema(&'a str, &'a str),
+    /// Writes naming the table without a schema.
+    Unqualified(&'a str),
+    /// Writes to a table of this name in any schema.
+    AnySchema(&'a str),
+}
+
+impl<'a> Counter<'a> {
+    /// Counters reads of the tables depend on.
+    fn read(tables: &'a [OwnedTable]) -> Vec<Self> {
+        Self::dedup(tables.iter().flat_map(|table| {
+            let name = table.name.as_str();
+            let (counter, unqualified) = match table.schema.as_deref() {
+                Some(schema) => (Self::Schema(schema, name), Some(Self::Unqualified(name))),
+                None => (Self::AnySchema(name), None),
+            };
+            iter::once(counter).chain(unqualified)
+        }))
+    }
+
+    /// Counters writes to the tables bump.
+    fn written(tables: &'a [OwnedTable]) -> Vec<Self> {
+        Self::dedup(tables.iter().flat_map(|table| {
+            let name = table.name.as_str();
+            match table.schema.as_deref() {
+                Some(schema) => [Self::Schema(schema, name), Self::AnySchema(name)],
+                None => [Self::Unqualified(name), Self::AnySchema(name)],
+            }
+        }))
+    }
+
+    fn dedup(counters: impl Iterator<Item = Self>) -> Vec<Self> {
+        let mut unique = Vec::new();
+        for counter in counters {
+            if !unique.contains(&counter) {
+                unique.push(counter);
+            }
+        }
+        unique
+    }
+}
+
+/// `_` and `*` can be schema names too, if quoted. The counters then share a
+/// key, which only invalidates more than needed.
+impl fmt::Display for Counter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schema(schema, name) => write!(f, "{schema}.{name}"),
+            Self::Unqualified(name) => write!(f, "_.{name}"),
+            Self::AnySchema(name) => write!(f, "*.{name}"),
         }
     }
 }
