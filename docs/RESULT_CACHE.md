@@ -94,6 +94,35 @@ A request is cached when it runs one statement and ends with `Sync`: `[Parse] Bi
 - Not cached: `Execute` with a row limit (partial results), pipelines of several statements before `Sync`, and requests ending in `Flush` instead of `Sync`.
 - Writes over the extended protocol invalidate like any other.
 
+## Transactions
+
+Outside transactions, every cacheable `SELECT` goes through the cache. Inside
+one, only plain `SELECT`s of a read-only `READ COMMITTED` transaction do: each of
+its statements takes a new snapshot anyway, so a cached result is as good as an
+autocommit read. A hit inside a transaction tells the client it's still in one.
+
+| Transaction | Cache |
+|---|---|
+| `BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED` (or `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` in it) | Yes |
+| `BEGIN READ ONLY`, no level named | Only with `cache_read_only_transactions = true` |
+| `REPEATABLE READ` or `SERIALIZABLE`, in `BEGIN` or `SET TRANSACTION` | No: every statement must see the transaction's snapshot |
+| Read-write transactions | No |
+| After anything but a plain `SELECT` in the transaction: a write (read-only transactions can write temporary tables, which can hide a table of the same name), `SELECT ... FOR UPDATE/SHARE`, a data-modifying `WITH`, a `SET` | No, until it ends |
+| After an error, until `ROLLBACK` | No |
+
+`BEGIN READ ONLY` without a level (what pgjdbc sends for read-only connections,
+and Spring for `@Transactional(readOnly = true)`) runs at the role's or
+database's `default_transaction_isolation`. PgDog can't see one set with `ALTER
+ROLE` or `ALTER DATABASE`, so it only assumes `READ COMMITTED` with
+`cache_read_only_transactions = true`. Don't enable it if a role or database
+defaults to `repeatable read` or `serializable`. A session that sets
+`default_transaction_isolation`, or `SET SESSION CHARACTERISTICS AS TRANSACTION
+ISOLATION LEVEL`, to either never uses the cache in such transactions.
+
+With replicas, a read-only transaction may already be running on a replica when
+it reads a table written within `read_after_write_window_ms`: that read skips
+the cache, so the replica's result isn't stored.
+
 ## Read-after-write (replicas)
 
 With replicas, a read right after a write can land on a replica that hasn't replayed the write yet. Worse, without protection, the cache would then store that stale result under the table's new generation and serve it to every client until it expires.
@@ -215,6 +244,7 @@ xfetch_beta = 1.0
 # adaptive_ttl_max_seconds = 300  # off by default
 singleflight_lock_ms = 1000       # 0 = don't coalesce between PgDogs
 read_after_write_window_ms = 1000 # with replicas; 0 = off
+cache_read_only_transactions = false # see "Transactions"
 
 # Redis timeouts: read "Redis timeouts" above before changing them.
 # redis_connect_timeout_ms = 500
@@ -232,6 +262,6 @@ cache_unsafe_table_list = []
 ## Current limitations
 
 - Over the extended protocol, only one statement per `Sync` (see [Extended protocol](#extended-protocol)).
-- Skips caching inside explicit transactions.
+- Inside transactions, only read-only `READ COMMITTED` ones (see [Transactions](#transactions)).
 - Session signature is conservative and may lead to fewer cache hits (by design).
 

@@ -372,3 +372,34 @@ async fn test_session_reads_qualified_write_unqualified() {
         "SELECT FROM t after UPDATE <schema>.t went to the stale replica"
     );
 }
+
+/// A read-only transaction already on the replica reads a table just
+/// written: its stale result must not be cached for the clients reading
+/// after it.
+#[tokio::test]
+async fn test_read_only_transaction_on_replica_doesnt_cache_stale_result() {
+    configure(|result_cache| result_cache.cache_read_only_transactions = true);
+    let table = Table::new().await;
+    let mut writer = TestClient::new(Parameters::default()).await;
+    let mut reader = TestClient::new(Parameters::default()).await;
+    let mut other = TestClient::new(Parameters::default()).await;
+
+    simple(
+        &mut reader,
+        "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED",
+    )
+    .await;
+    // Runs on the replica, which the transaction then stays on.
+    simple(&mut reader, "SELECT 1").await;
+    simple(&mut writer, &table.update(2)).await;
+    select_value(&mut reader, &table.select()).await;
+    simple(&mut reader, "COMMIT").await;
+    let after = select_value(&mut other, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(
+        after.as_deref(),
+        Some("2"),
+        "replica's stale result was cached in the transaction"
+    );
+}

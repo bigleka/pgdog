@@ -139,6 +139,10 @@ key_prefix = "pgdog:result_cache"
 
 For `read_after_write_window_ms` (default `1000`) after a write, reads of the written tables go to the primary: for the client that wrote, other clients, and other PgDogs sharing Redis. This keeps a lagging replica from returning stale rows, and keeps those rows out of the cache. Set it above your replicas' usual lag, or `0` to turn it off. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#read-after-write-replicas).
 
+#### Transactions
+
+Reads inside read-only `READ COMMITTED` transactions use the cache too (`BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED`). For `BEGIN READ ONLY` without a level, as pgjdbc and Spring send, set `cache_read_only_transactions = true`, unless a role or database defaults to `repeatable read` or `serializable`. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#transactions).
+
 #### Monitoring
 
 A Grafana dashboard, Prometheus alerts and Kubernetes `PodMonitor`/`PrometheusRule` for PgDog and the result cache are in [examples/grafana](examples/grafana).

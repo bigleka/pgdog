@@ -38,6 +38,10 @@ This fork has its own version numbers. It forked from upstream
   writes through one may not invalidate the other's entries.
 - Read-after-write: a session that wrote `pedidos` sends its reads of
   `public.pedidos` to the primary too, and the other way around.
+- Plain `SELECT`s in read-only `READ COMMITTED` transactions use the cache
+  (`BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED`). `BEGIN READ ONLY`
+  without a level does with `cache_read_only_transactions = true`.
+  `REPEATABLE READ` and `SERIALIZABLE` transactions never do.
 
 ## 1.0.0
 
