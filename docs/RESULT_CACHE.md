@@ -22,6 +22,14 @@ To avoid stale results while still being precise, PgDog uses **table-based inval
   that invalidation increments. Cache keys include the current generation of every
   table the query reads, so a slow read that started before a write and finishes after
   it stores its result under a key no one looks up again. These counters never expire.
+- A table named without a schema (`pedidos`) is whichever one the session's
+  `search_path` finds, and PgDog doesn't know which: the path can come from
+  `ALTER ROLE` or `ALTER DATABASE`. So writes to `pedidos` drop cached reads of
+  `pedidos` and of `<any schema>.pedidos`, and writes to `public.pedidos` drop reads
+  of `public.pedidos` and of `pedidos`. Only fully qualified names in different
+  schemas (`public.pedidos` and `vendas.pedidos`) are kept apart. With one schema
+  per tenant and unqualified names, a write in one tenant drops that table's
+  cached reads in every tenant.
 - Enabling the result cache turns on the query parser when `query_parser = "auto"`,
   since both caching and invalidation need the parsed query.
 - Writes that don't go through PgDog are not seen; their results stay cached until

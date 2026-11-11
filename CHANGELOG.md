@@ -30,6 +30,14 @@ This fork has its own version numbers. It forked from upstream
   `PGDOG_RESULT_CACHE_ENCRYPTION_KEY` environment variable instead of
   `pgdog.toml`. An empty key, or both `encryption_key` and
   `encryption_key_file`, is now a configuration error.
+- A write to a table named without a schema (`UPDATE pedidos`) now drops
+  cached reads of it under its schema (`SELECT ... FROM public.pedidos`),
+  and the other way around. Each was invalidated only under the name it was
+  written with, so the other could be served stale until it expired. The
+  generation counters change; while PgDogs of both versions share a Redis,
+  writes through one may not invalidate the other's entries.
+- Read-after-write: a session that wrote `pedidos` sends its reads of
+  `public.pedidos` to the primary too, and the other way around.
 
 ## 1.0.0
 
