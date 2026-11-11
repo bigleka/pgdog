@@ -139,6 +139,23 @@ Off by default. With `adaptive_ttl_max_seconds` set, every hit pushes its entry'
 - The TTL update is sent to Redis in the background; the client doesn't wait for it.
 - Near the cap the remaining TTL shrinks again, so XFetch refreshes hot entries before they expire.
 
+## Encryption
+
+Cached results are the rows your queries return. Without encryption, whoever can read Redis (a shared instance, a backup, an `RDB` file, `MONITOR`) reads them, with no access to Postgres at all. With a key, PgDog encrypts every entry with AES-256-GCM before storing it and decrypts it on a hit:
+
+- Each entry gets a fresh random nonce, and GCM authenticates it: a changed byte is rejected, not decrypted to garbage.
+- An entry PgDog can't decrypt (written with another key, stored before encryption was turned on, tampered with) is a miss: the query goes to Postgres, and a warning is logged.
+- Only values are encrypted. Key names still show the database, the user and, in the table tags, table names.
+- The AES key is the SHA-256 of the configured string, so use a long random one: `openssl rand -base64 32`.
+
+Where the key comes from, highest priority first:
+
+1. The `PGDOG_RESULT_CACHE_ENCRYPTION_KEY` environment variable (ignored when empty). With the packages, put it in `/etc/default/pgdog` or `/etc/sysconfig/pgdog`, mode `0600`.
+2. `encryption_key_file`: a file holding the key, e.g. a mounted Kubernetes Secret. Trailing whitespace is ignored.
+3. `encryption_key` in `pgdog.toml`. If you use it, make the file readable by PgDog only (`chown root:pgdog`, `chmod 640`).
+
+Setting both `encryption_key` and `encryption_key_file`, an empty key, or a file PgDog can't read is a configuration error. `encryption_key_file` and `encryption_key` are read again on every reload (`systemctl reload pgdog`); the environment variable only when PgDog starts. After a key change, entries written with the old key miss until they expire.
+
 ## Metrics
 
 A Grafana dashboard and Prometheus alerts for these metrics are in [examples/grafana](../examples/grafana).
@@ -177,6 +194,7 @@ redis_url = "redis://127.0.0.1:6379"
 expire_seconds = 30
 max_entry_bytes = 524288
 key_prefix = "pgdog:result_cache"
+# encryption_key_file = "/etc/pgdog/cache.key"  # see "Encryption"
 xfetch_beta = 1.0
 # adaptive_ttl_max_seconds = 300  # off by default
 singleflight_lock_ms = 1000       # 0 = don't coalesce between PgDogs

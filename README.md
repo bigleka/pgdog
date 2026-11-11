@@ -134,54 +134,18 @@ The defaults fit a Redis in the same datacenter. Keep them unless measurements s
 
 Too short marks a healthy Redis as down and the cache keeps switching off. Too long makes queries wait on a sick Redis. With Sentinel, how fast a new primary takes over is set by Sentinel's `down-after-milliseconds`, not by PgDog. Full guide: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#redis-timeouts).
 
-Result Cache Encryption (result_cache)
-To increase security and protect sensitive data that may be cached, PgDog supports encryption of values ​​in the Redis result cache. This ensures that even in the event of unauthorized access or misconfiguration of the Redis instance, the cache data remains unreadable.
+#### Encryption
 
-How it Works
-When an encryption key is provided in the configuration, PgDog uses the AES-256-GCM algorithm to:
+Cached results are the rows your queries return: whoever can read Redis can read them, without any access to Postgres. With an encryption key, PgDog encrypts each entry (AES-256-GCM) before storing it and decrypts it on a hit. An entry it can't decrypt, written with another key or before encryption was on, is a miss: the query goes to Postgres.
 
-Encrypt the query results before saving them to Redis.
-Decrypt the results when retrieving them from the cache, before sending them to the client.
-This process is completely transparent to the client application. The key provided in the configuration is internally processed with SHA-256 to derive a secure 256-bit encryption key.
-
-Configuration
-Encryption is enabled by adding the encryption_key option to the [result_cache] section of your pgdog.toml file.
-
-Example 1: Encryption Disabled (Default Behavior)
-By default, encryption is disabled. Data is stored in plain text in Redis. This occurs when the encryption_key is missing or commented out.
-
-# pgdog.toml
+Keep the key out of `pgdog.toml`:
 
 ```toml
 [result_cache]
-enabled = true
-redis_url = "redis://127.0.0.1:6379"
-expire_seconds = 30
-# A linha encryption_key está ausente ou comentada.
-# encryption_key = "..."
+encryption_key_file = "/etc/pgdog/cache.key"  # e.g. a mounted Kubernetes Secret
 ```
 
-Expected Result in Redis: The value associated with a cache key will be the result of the query in binary format, readable by anyone with access to Redis.
-
-Example 2: Encryption Enabled
-To enable encryption, uncomment and set a value for encryption_key. It is recommended to use a long, random, and secret string for maximum security.
-
-# pgdog.toml
-```toml
-[result_cache]
-enabled = true
-redis_url = "redis://127.0.0.1:6379"
-expire_seconds = 30
-# Ativa a criptografia com a chave secreta fornecida.
-encryption_key = "uma-chave-secreta-muito-longa-e-dificil-de-adivinhar-aqui-321"
-```
-
-Expected Result in Redis: The value associated with a cache key will be a block of encrypted binary data. Attempting to read this value directly in Redis (using GET in redis-cli, for example) will result in unreadable data, protecting against accidental leaks.
-
-Security and Performance Considerations
-Key Security: The encryption_key is a secret and should be treated as such. Avoid committing it to public repositories. For production environments, consider using a secret management system and loading the key via an environment variable (a planned future improvement).
-
-Performance: AES-256-GCM encryption is extremely fast on modern hardware, especially on CPUs that support AES-NI. The impact on latency for cache operations (get/set) is generally minimal (on the order of microseconds). For the vast majority of applications, the security gain far outweighs the small performance cost.
+or set the `PGDOG_RESULT_CACHE_ENCRYPTION_KEY` environment variable, which takes precedence over the file and over `encryption_key`. Generate one with `openssl rand -base64 32`. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#encryption).
 
 &#128216; **[Configuration](https://docs.pgdog.dev/configuration/)**
 

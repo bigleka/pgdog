@@ -1,5 +1,9 @@
+use std::{fs::read_to_string, path::PathBuf};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::Error;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -62,8 +66,21 @@ pub struct ResultCache {
     /// Key prefix in Redis.
     pub key_prefix: Option<String>,
 
-    /// Optional secret key for encryption.
+    /// Encrypts cached results in Redis (AES-256-GCM), so whoever can read
+    /// Redis can't read the data. Use a long random string, e.g.
+    /// `openssl rand -base64 32`.
+    ///
+    /// Prefer `encryption_key_file` or the `PGDOG_RESULT_CACHE_ENCRYPTION_KEY`
+    /// environment variable, which overrides both, to keep the key out of
+    /// this file.
+    ///
+    /// _Default:_ none, results are stored unencrypted
     pub encryption_key: Option<String>,
+
+    /// File holding `encryption_key`, e.g. a mounted Kubernetes Secret.
+    /// Trailing whitespace and newlines are ignored. Can't be set together with
+    /// `encryption_key`. Read when the configuration is loaded or reloaded.
+    pub encryption_key_file: Option<PathBuf>,
 
     /// How eagerly hits refresh entries before they expire (XFetch).
     ///
@@ -141,6 +158,50 @@ pub struct ResultCache {
     pub cache_unsafe_table_list: Vec<String>,
 }
 
+impl ResultCache {
+    /// Environment variable holding the encryption key. Overrides
+    /// `encryption_key` and `encryption_key_file`.
+    pub const ENCRYPTION_KEY_ENV: &'static str = "PGDOG_RESULT_CACHE_ENCRYPTION_KEY";
+
+    /// Settle `encryption_key` from `env_key` (the value of
+    /// [`Self::ENCRYPTION_KEY_ENV`]), `encryption_key_file` or the
+    /// configuration itself.
+    pub fn resolve_encryption_key(&mut self, env_key: Option<String>) -> Result<(), Error> {
+        if let Some(key) = env_key.filter(|key| !key.is_empty()) {
+            self.encryption_key = Some(key);
+            return Ok(());
+        }
+
+        if let Some(path) = &self.encryption_key_file {
+            if self.encryption_key.is_some() {
+                return Err(Error::ParseError(
+                    "result_cache: set \"encryption_key\" or \"encryption_key_file\", not both"
+                        .into(),
+                ));
+            }
+            let key = read_to_string(path).map_err(|err| {
+                Error::ParseError(format!(
+                    "result_cache: \"encryption_key_file\" {}: {err}",
+                    path.display()
+                ))
+            })?;
+            self.encryption_key = Some(key.trim_end().to_string());
+        }
+
+        if self
+            .encryption_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err(Error::ParseError(
+                "result_cache: the encryption key is empty".into(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// How the result cache connects to Redis.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -152,4 +213,111 @@ pub enum RedisMode {
     Cluster,
     /// Primary `redis_sentinel_master`, found through the Sentinels in `redis_urls`.
     Sentinel,
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    fn key_file(contents: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file
+    }
+
+    fn with_file(file: &NamedTempFile) -> ResultCache {
+        ResultCache {
+            encryption_key_file: Some(file.path().to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_key_is_read_from_file_without_trailing_newline() {
+        let file = key_file("secret from file\n");
+        let mut result_cache = with_file(&file);
+        result_cache.resolve_encryption_key(None).unwrap();
+        assert_eq!(
+            result_cache.encryption_key.as_deref(),
+            Some("secret from file")
+        );
+    }
+
+    #[test]
+    fn test_env_key_overrides_the_configuration() {
+        let file = key_file("from file");
+        let mut result_cache = with_file(&file);
+        result_cache
+            .resolve_encryption_key(Some("from env".into()))
+            .unwrap();
+        assert_eq!(result_cache.encryption_key.as_deref(), Some("from env"));
+
+        let mut result_cache = ResultCache {
+            encryption_key: Some("inline".into()),
+            ..Default::default()
+        };
+        result_cache
+            .resolve_encryption_key(Some("from env".into()))
+            .unwrap();
+        assert_eq!(result_cache.encryption_key.as_deref(), Some("from env"));
+    }
+
+    /// An empty variable, as container tooling often leaves them, doesn't count.
+    #[test]
+    fn test_empty_env_key_is_ignored() {
+        let mut result_cache = ResultCache {
+            encryption_key: Some("inline".into()),
+            ..Default::default()
+        };
+        result_cache
+            .resolve_encryption_key(Some("".into()))
+            .unwrap();
+        assert_eq!(result_cache.encryption_key.as_deref(), Some("inline"));
+    }
+
+    #[test]
+    fn test_key_and_key_file_together_are_rejected() {
+        let file = key_file("from file");
+        let mut result_cache = ResultCache {
+            encryption_key: Some("inline".into()),
+            ..with_file(&file)
+        };
+        let err = result_cache.resolve_encryption_key(None).unwrap_err();
+        assert!(err.to_string().contains("encryption_key_file"), "{err}");
+    }
+
+    #[test]
+    fn test_unreadable_key_file_is_rejected() {
+        let mut result_cache = ResultCache {
+            encryption_key_file: Some("/nonexistent/pgdog.key".into()),
+            ..Default::default()
+        };
+        let err = result_cache.resolve_encryption_key(None).unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/pgdog.key"), "{err}");
+    }
+
+    /// An empty key would encrypt with a key anyone can derive.
+    #[test]
+    fn test_empty_key_is_rejected() {
+        let file = key_file(" \n");
+        let mut from_file = with_file(&file);
+        assert!(from_file.resolve_encryption_key(None).is_err());
+
+        let mut inline = ResultCache {
+            encryption_key: Some("".into()),
+            ..Default::default()
+        };
+        assert!(inline.resolve_encryption_key(None).is_err());
+    }
+
+    #[test]
+    fn test_no_key_configured_means_no_encryption() {
+        let mut result_cache = ResultCache::default();
+        result_cache.resolve_encryption_key(None).unwrap();
+        assert_eq!(result_cache.encryption_key, None);
+    }
 }

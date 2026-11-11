@@ -1597,7 +1597,14 @@
           "default": false
         },
         "encryption_key": {
-          "description": "Optional secret key for encryption.",
+          "description": "Encrypts cached results in Redis (AES-256-GCM), so whoever can read\nRedis can't read the data. Use a long random string, e.g.\n`openssl rand -base64 32`.\n\nPrefer `encryption_key_file` or the `PGDOG_RESULT_CACHE_ENCRYPTION_KEY`\nenvironment variable, which overrides both, to keep the key out of\nthis file.\n\n_Default:_ none, results are stored unencrypted",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encryption_key_file": {
+          "description": "File holding `encryption_key`, e.g. a mounted Kubernetes Secret.\nTrailing whitespace and newlines are ignored. Can't be set together with\n`encryption_key`. Read when the configuration is loaded or reloaded.",
           "type": [
             "string",
             "null"
