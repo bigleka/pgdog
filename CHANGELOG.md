@@ -5,6 +5,13 @@ This fork has its own version numbers. It forked from upstream
 
 ## Unreleased
 
+### Container image
+
+- `ghcr.io/bigleka/pgdog` is tagged `X.Y.Z`, `X.Y` and `latest` on
+  releases, besides `main` and the commit SHA. Release images were never
+  built: the release event is created with `GITHUB_TOKEN`, which doesn't
+  trigger other workflows.
+
 ### Result cache (Redis)
 
 - The encryption key can come from a file (`encryption_key_file`) or the
