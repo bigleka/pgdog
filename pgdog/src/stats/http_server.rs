@@ -12,12 +12,13 @@ use tracing::{info, warn};
 
 use super::{
     Clients, ClientsLocked, Listeners, LookupMetrics, MirrorStatsMetrics, Pools, QueryCache,
-    TokenCache, TwoPc,
+    ResultCache, TokenCache, TwoPc,
 };
 use crate::tasks;
 use crate::util::server::accept;
 
-async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// Everything the OpenMetrics endpoint serves.
+pub(crate) fn render() -> String {
     let clients = Clients::load();
     let clients_locked = ClientsLocked::load();
     let pools = Pools::load();
@@ -49,7 +50,12 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         .collect();
     let token_cache = token_cache.join("\n");
     let two_pc = TwoPc::load();
-    let metrics_data = clients.to_string()
+    let result_cache: Vec<_> = ResultCache::metrics()
+        .into_iter()
+        .map(|m| m.to_string())
+        .collect();
+    let result_cache = result_cache.join("\n");
+    clients.to_string()
         + "\n"
         + &clients_locked.to_string()
         + "\n"
@@ -65,7 +71,13 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         + "\n"
         + &token_cache
         + "\n"
-        + &two_pc.to_string();
+        + &two_pc.to_string()
+        + "\n"
+        + &result_cache
+}
+
+async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let metrics_data = render();
     let response = Response::builder()
         .header(
             hyper::header::CONTENT_TYPE,

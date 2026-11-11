@@ -52,6 +52,19 @@ impl Parse {
         }
     }
 
+    /// Anonymous statement with parameter types (OIDs).
+    #[cfg(test)]
+    pub(crate) fn new_anonymous_typed(query: &str, types: &[i32]) -> Self {
+        let mut data_types = (types.len() as i16).to_be_bytes().to_vec();
+        for oid in types {
+            data_types.extend_from_slice(&oid.to_be_bytes());
+        }
+        Self {
+            data_types: Bytes::from(data_types),
+            ..Self::new_anonymous(query)
+        }
+    }
+
     /// New prepared statement.
     pub(crate) fn named(name: impl AsRef<str>, query: impl AsRef<str>) -> Self {
         Self {

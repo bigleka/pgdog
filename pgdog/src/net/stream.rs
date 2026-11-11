@@ -293,6 +293,28 @@ impl Stream {
         Ok(sent)
     }
 
+    /// Send pre-encoded Postgres protocol bytes and flush.
+    ///
+    /// `bytes` is expected to contain one or more complete protocol messages
+    /// (type byte + length + payload) concatenated.
+    pub(crate) async fn send_raw_flush(&mut self, bytes: &[u8]) -> Result<usize, crate::net::Error> {
+        self.io_in_progress = true;
+        let result = async {
+            match &mut self.inner {
+                StreamInner::Plain(stream) => eof(stream.write_all(bytes).await)?,
+                StreamInner::Tls(stream) => eof(stream.write_all(bytes).await)?,
+                StreamInner::DevNull => (),
+                #[cfg(test)]
+                StreamInner::Memory(stream) => eof(stream.write_all(bytes).await)?,
+            }
+            eof(self.flush().await)?;
+            Ok(bytes.len())
+        }
+        .await;
+        self.io_in_progress = false;
+        result
+    }
+
     /// Send multiple messages and flush the buffer.
     pub(crate) async fn send_many(
         &mut self,

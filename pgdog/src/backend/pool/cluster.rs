@@ -81,6 +81,8 @@ pub(crate) struct Cluster {
     resharding_replication_retry_min_delay: Duration,
     sharding_lookup_timeout: Duration,
     regex_parser: RegexParser,
+    /// Result cache enabled: needs the query parser.
+    result_cache: bool,
     identity: Option<String>,
     tls_client_certificate_required: bool,
     #[debug(skip)]
@@ -129,6 +131,7 @@ impl Default for Cluster {
             resharding_replication_retry_min_delay: Default::default(),
             sharding_lookup_timeout: Duration::from_millis(General::sharding_lookup_timeout()),
             regex_parser: Default::default(),
+            result_cache: false,
             identity: Default::default(),
             tls_client_certificate_required: Default::default(),
             schema_loader: Default::default(),
@@ -220,6 +223,7 @@ pub(crate) struct ClusterConfig<'a> {
     sharding_lookup_timeout: u64,
     regex_parser_limit: usize,
     pub_sub_enabled: bool,
+    result_cache: bool,
     identity: &'a Option<String>,
     tls_client_certificate_required: bool,
     schema_cache: SchemaCache,
@@ -291,6 +295,10 @@ impl<'a> ClusterConfig<'a> {
             resharding_replication_retry_min_delay: general.resharding_replication_retry_min_delay,
             regex_parser_limit: general.regex_parser_limit,
             pub_sub_enabled: general.pub_sub_enabled(),
+            result_cache: config
+                .result_cache
+                .as_ref()
+                .is_some_and(|result_cache| result_cache.enabled),
             identity: &user.identity,
             tls_client_certificate_required: user.tls_client_certificate_required.unwrap_or(true),
             schema_cache,
@@ -339,6 +347,7 @@ impl Cluster {
             sharding_lookup_timeout,
             regex_parser_limit,
             pub_sub_enabled,
+            result_cache,
             identity,
             tls_client_certificate_required,
             schema_cache,
@@ -416,6 +425,7 @@ impl Cluster {
             ),
             sharding_lookup_timeout: Duration::from_millis(sharding_lookup_timeout),
             regex_parser: RegexParser::new(regex_parser_limit, query_parser),
+            result_cache,
             identity: identity.clone(),
             tls_client_certificate_required,
             schema_loader: Box::new(schema_loader::FromServer),
@@ -630,6 +640,7 @@ impl Cluster {
                     || self.router_needed()
                     || self.dry_run()
                     || self.prepared_statements() == &PreparedStatementsLevel::Full
+                    || self.result_cache
                     || self.regex_parser.use_parser(request)
             }
         }

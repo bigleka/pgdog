@@ -70,6 +70,9 @@ moka = { version = "0.12", features = ["sync"] }
 derive_builder = "0.20.2"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-rds = { version = "1", default-features = false }
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager", "cluster-async", "sentinel"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
 pgdog-config = { path = "../pgdog-config" }
 pgdog-vector = { path = "../pgdog-vector" }
 pgdog-stats = { path = "../pgdog-stats" }

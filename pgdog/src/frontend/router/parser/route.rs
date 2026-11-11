@@ -150,6 +150,8 @@ pub(crate) struct Route {
     table_change: TableChange,
     /// Minimum replica LSN in its 64-bit representation.
     pub(crate) lsn: Option<u64>,
+    /// A read that must see recent writes replicas may not have yet.
+    read_primary: bool,
 }
 
 impl Display for Route {
@@ -206,6 +208,17 @@ impl Route {
     /// can be sent to a replica.
     pub(crate) fn is_read(&self) -> bool {
         self.read
+    }
+
+    /// Send this read to the primary: it must see writes replicas may not
+    /// have yet. It's still a read.
+    pub(crate) fn set_read_primary(&mut self) {
+        self.read_primary = true;
+    }
+
+    /// Whether a replica can serve this query.
+    pub(crate) fn use_replica(&self) -> bool {
+        self.read && !self.read_primary
     }
 
     /// Returns true if this query can only be sent

@@ -354,6 +354,9 @@ impl QueryEngine {
             || !self.backend.has_more_messages()
             || message.streaming();
 
+        // Boxed, like the lookup: Redis futures are large.
+        Box::pin(self.result_cache_message(context, &message)).await;
+
         self.stats.sent(message.len());
 
         // Do this before flushing, because flushing can take time.
@@ -374,6 +377,10 @@ impl QueryEngine {
             } else {
                 context.stream.send(&message).await?;
             }
+        }
+
+        if code == 'Z' {
+            Box::pin(self.result_cache_store(context)).await;
         }
 
         self.hooks.on_server_message(context, &message)?;

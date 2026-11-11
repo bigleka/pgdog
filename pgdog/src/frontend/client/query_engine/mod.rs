@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::{
     backend::pool::{Connection, Request},
     config::config,
@@ -9,12 +11,17 @@ use crate::{
         router::{Route, parser::Shard},
     },
     net::{ErrorResponse, Message, Parameters},
+    result_cache::{
+        ResultCacheKey, lock::RemoteLock, redis::RedisResultCache, singleflight::Leader,
+        tables::OwnedTable,
+    },
     state::State,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 pub(crate) mod advisory_lock;
+mod cache;
 pub(crate) mod connect;
 pub(crate) mod context;
 pub(crate) mod deallocate;
@@ -42,6 +49,7 @@ mod temp_table;
 mod test;
 #[cfg(test)]
 mod testing;
+mod transaction_cache;
 pub(crate) mod two_pc;
 
 use self::query::ExplainResponseState;
@@ -53,6 +61,7 @@ pub(crate) use result::QueryEngineResult;
 pub(crate) use split::Pipeline;
 pub(in crate::frontend) use temp_table::TempTableChange;
 use temp_table::TempTables;
+use transaction_cache::TransactionCache;
 use two_pc::TwoPc;
 pub(crate) use two_pc::phase::TwoPcPhase;
 pub(crate) use two_pc::*;
@@ -78,6 +87,32 @@ pub(crate) struct QueryEngine {
     temp_tables: TempTables,
     // Count how many rows we received from the query we are currently executing.
     result_row_counter: usize,
+    result_cache: Option<RedisResultCache>,
+    result_cache_capture: Option<ResultCacheCapture>,
+    pending_invalidations: Vec<OwnedTable>,
+    /// Tables this session wrote, and when: its reads of them go to the
+    /// primary for the read-after-write window.
+    recent_writes: Vec<(OwnedTable, Instant)>,
+    /// What the client's statements tell about its transaction, to know when
+    /// the result cache can serve it.
+    transaction_cache: TransactionCache,
+}
+
+#[derive(Debug)]
+struct ResultCacheCapture {
+    key: ResultCacheKey,
+    db: String,
+    tables: Vec<OwnedTable>,
+    bytes: Vec<u8>,
+    errored: bool,
+    /// Set when this client runs the query for others waiting on the same key.
+    /// Dropping it without a result releases them.
+    leader: Option<Leader>,
+    /// Lock making other PgDogs wait for this result. Dropping it without a
+    /// result lets them run the query.
+    remote_lock: Option<RemoteLock>,
+    /// When the query started, to record how long it takes to compute.
+    started: Instant,
 }
 
 impl QueryEngine {
@@ -106,6 +141,11 @@ impl QueryEngine {
             manual_lock: false,
             temp_tables: Default::default(),
             result_row_counter: 0,
+            result_cache: None,
+            result_cache_capture: None,
+            pending_invalidations: Vec::new(),
+            recent_writes: Vec::new(),
+            transaction_cache: TransactionCache::default(),
         })
     }
 
@@ -201,6 +241,12 @@ impl QueryEngine {
         }
 
         self.hooks.before_execution(context)?;
+
+        // Boxed: keeps this large future out of every request's.
+        if Box::pin(self.result_cache(context, client_request)).await? {
+            self.update_stats(context);
+            return Ok(QueryEngineResult::Done(context.transaction()));
+        }
 
         self.pending_explain = None;
 

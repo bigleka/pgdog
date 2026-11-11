@@ -76,6 +76,23 @@ impl Execute {
     pub(crate) fn len(&self) -> usize {
         self.payload.len()
     }
+
+    /// Most rows to return, 0 for all of them.
+    pub(crate) fn max_rows(&self) -> i32 {
+        // After the portal name and its terminating NUL.
+        let Some(start) = self.payload[5..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|nul| 5 + nul + 1)
+        else {
+            return 0;
+        };
+        self.payload
+            .get(start..start + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_be_bytes)
+            .unwrap_or(0)
+    }
 }
 
 impl FromBytes for Execute {
@@ -117,5 +134,12 @@ mod test {
 
         let exec = Execute::new_portal("test1");
         assert_eq!(exec.portal(), "test1");
+    }
+
+    #[test]
+    fn test_max_rows() {
+        assert_eq!(Execute::new_portal_limit("p", 25).max_rows(), 25);
+        assert_eq!(Execute::new_portal_limit("", 3).max_rows(), 3);
+        assert_eq!(Execute::new().max_rows(), 0);
     }
 }

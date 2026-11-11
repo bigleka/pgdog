@@ -22,6 +22,7 @@ impl QueryEngine {
             }
             self.backend.end_transaction();
             context.transaction = None; // Clear transaction state
+            Box::pin(self.invalidate_pending()).await;
         }
 
         self.fake_command_response(

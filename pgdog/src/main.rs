@@ -50,6 +50,7 @@ mod healthcheck;
 mod net;
 mod parameters;
 mod plugin;
+mod result_cache;
 mod state;
 mod stats;
 pub(crate) mod sync;

@@ -1,0 +1,22 @@
+# Prometheus Operator: scrape every PgDog pod. Match the labels of your
+# PgDog pods, and name their metrics port (openmetrics_port) "metrics".
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: pgdog
+  labels:
+    release: prometheus # the label your Prometheus selects monitors by
+spec:
+  # job="pgdog", from the pod's app.kubernetes.io/name label: the
+  # PgDogDown alert checks up{job="pgdog"}.
+  jobLabel: app.kubernetes.io/name
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgdog
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 15s
+      # The dashboard and alerts tell PgDogs apart by instance.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
