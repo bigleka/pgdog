@@ -5,7 +5,7 @@ the most optimal way to share those changes.
 
 ### v2026-11-02
 
-**OS version**: [v0.1.63](CHANGELOG.md#v0163)
+**OS version**: [v0.1.63](CHANGELOG-UPSTREAM.md#v0163)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |
@@ -25,7 +25,7 @@ the most optimal way to share those changes.
 
 ### v2026-10-16
 
-**OS version**: [v0.1.62](CHANGELOG.md#v0162)
+**OS version**: [v0.1.62](CHANGELOG-UPSTREAM.md#v0162)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |
@@ -42,7 +42,7 @@ the most optimal way to share those changes.
 
 ### v2026-10-09
 
-**OS version**: [v0.1.61](CHANGELOG.md#v0161)
+**OS version**: [v0.1.61](CHANGELOG-UPSTREAM.md#v0161)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |
@@ -64,7 +64,7 @@ the most optimal way to share those changes.
 
 ### v2026-09-17
 
-**OS version**: [v0.1.59](CHANGELOG.md#v0159)
+**OS version**: [v0.1.59](CHANGELOG-UPSTREAM.md#v0159)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |
@@ -89,7 +89,7 @@ the most optimal way to share those changes.
 
 ### v2026-09-10
 
-**OS version**: [v0.1.58](CHANGELOG.md#v0158)
+**OS version**: [v0.1.58](CHANGELOG-UPSTREAM.md#v0158)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |
@@ -103,11 +103,11 @@ the most optimal way to share those changes.
 
 #### Bug fixes
 
-- Autodiscovery would drop and re-create connections when a replica was added/removed. This was caused by a bad connection pool compatibility check and fixed in the open source edition ([v0.1.58](CHANGELOG.md#v0.1.58)).
+- Autodiscovery would drop and re-create connections when a replica was added/removed. This was caused by a bad connection pool compatibility check and fixed in the open source edition ([v0.1.58](CHANGELOG-UPSTREAM.md#v0.1.58)).
 
 ### v2026-09-03
 
-**OS version**: [v0.1.57](CHANGELOG.md#v0157)
+**OS version**: [v0.1.57](CHANGELOG-UPSTREAM.md#v0157)
 
 | Application   | Docker image                                            |
 | ------------- | ------------------------------------------------------- |

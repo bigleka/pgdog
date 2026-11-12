@@ -1,0 +1,374 @@
+{{- include "pgdog.forkUnsupported" . }}
+apiVersion: apps/v1
+{{- if .Values.statefulSet.enabled }}
+kind: StatefulSet
+{{- else }}
+kind: Deployment
+{{- end }}
+metadata:
+  name: {{ include "pgdog.fullname" . }}
+  labels:
+    {{- include "pgdog.labels" . | nindent 4 }}
+  {{- if .Values.annotations }}
+  annotations:
+    {{- toYaml .Values.annotations | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.statefulSet.enabled }}
+  serviceName: {{ include "pgdog.fullname" . }}-headless
+  {{- end }}
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pgdog.selectorLabels" . | nindent 6 }}
+  {{- if not .Values.statefulSet.enabled }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- include "pgdog.selectorLabels" . | nindent 8 }}
+      {{- if or .Values.restartOnConfigChange .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.restartOnConfigChange }}
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.podAnnotations }}
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pgdog.serviceAccountName" . }}
+      {{- if hasKey .Values "automountServiceAccountToken" }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      {{- end }}
+      {{- if .Values.shareProcessNamespace }}
+      shareProcessNamespace: true
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- else }}
+      terminationGracePeriodSeconds: {{ add (div (default 60000 .Values.shutdownTimeout | int64) 1000) 5 }}
+      {{- end }}
+      {{- if or (and .Values.statefulSet.enabled .Values.statefulSet.walPvc.enabled) .Values.extraInitContainers }}
+      initContainers:
+        {{- if and .Values.statefulSet.enabled .Values.statefulSet.walPvc.enabled }}
+        - name: create-wal-directory
+          {{- if .Values.image.name }}
+          image: {{ .Values.image.name }}
+          {{- else if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["mkdir", "-p", "/var/lib/pgdog/wal"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: wal
+              mountPath: /var/lib/pgdog
+        {{- end }}
+        {{- with .Values.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pgdog
+          {{- if .Values.image.name }}
+          image: {{ .Values.image.name }}
+          {{- else if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/pgdog"]
+          args:
+            - "--config"
+            - "/etc/pgdog/pgdog.toml"
+            - "--users"
+            - "/etc/secrets/pgdog/users.toml"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.control }}
+            {{- if .enabled }}
+            {{- with .endpointSecret }}
+            {{- if .name }}
+            - name: PGDOG_CONTROL_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name | quote }}
+                  key: {{ .key | default "endpoint" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .tokenSecret }}
+            {{- if .name }}
+            - name: PGDOG_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name | quote }}
+                  key: {{ .key | default "token" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.otel }}
+            {{- with .datadogApiKeySecret }}
+            {{- if .name }}
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key | default "dd-api-key" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.vault }}
+            {{- with .approleSecretIdSecret }}
+            {{- if .name }}
+            - name: VAULT_SECRET_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key | default "secret-id" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.resultCache }}
+            {{- if and .enabled .encryptionKeySecret.name }}
+            - name: PGDOG_RESULT_CACHE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .encryptionKeySecret.name | quote }}
+                  key: {{ .encryptionKeySecret.key | default "encryption-key" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- range .Values.env }}
+            {{- if ne .name "NODE_ID" }}
+            - {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: pgdog
+              containerPort: {{ .Values.port }}
+            - name: metrics
+              containerPort: {{ .Values.openMetricsPort }}
+          {{- if .Values.lifecycle }}
+          {{- if .Values.preStopSleepSeconds }}
+          {{- fail "lifecycle replaces the preStop that preStopSleepSeconds renders; set one of them" }}
+          {{- end }}
+          {{- if and .Values.lifecycle.preStop (not .Values.terminationGracePeriodSeconds) }}
+          {{- fail "lifecycle.preStop needs an explicit terminationGracePeriodSeconds that covers the preStop plus shutdownTimeout" }}
+          {{- end }}
+          lifecycle:
+            {{- toYaml .Values.lifecycle | nindent 12 }}
+          {{- else if .Values.preStopSleepSeconds }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          {{- end }}
+          {{- include "pgdog.resources" (dict "resources" .Values.resources "noCpuLimits" .Values.noCpuLimits) | nindent 10 }}
+          {{- if .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgdog
+            - name: users
+              mountPath: /etc/secrets/pgdog
+            {{- if and .Values.statefulSet.enabled .Values.statefulSet.walPvc.enabled }}
+            - name: wal
+              mountPath: /var/lib/pgdog
+            {{- end }}
+            {{- if .Values.tlsGenerateSelfSignedCert }}
+            - name: tls
+              mountPath: /etc/pgdog-tls
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.rdsCertificateBundle .Values.rdsCertificateBundle.enabled }}
+            - name: rds-ca
+              mountPath: /etc/pgdog-rds-ca
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- if .Values.prometheusPort }}
+        - name: prom
+          image: prom/prometheus
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["prometheus"]
+          args:
+            - "--config.file=/etc/prom/prom.yml"
+            - >-
+              --web.listen-address=:{{
+              .Values.prometheusPort | default "9091" }}
+            - "--enable-feature=expand-external-labels"
+            - "--web.enable-lifecycle"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: DEPLOYMENT_NAME
+              value: {{ include "pgdog.fullname" . | quote }}
+            {{- if .Values.clusterName }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.clusterName | quote }}
+            {{- end }}
+          ports:
+            - name: prom
+              containerPort: {{ .Values.prometheusPort }}
+          {{- include "pgdog.resources" (dict "resources" .Values.prometheusResources "noCpuLimits" .Values.noCpuLimits) | nindent 10 }}
+          volumeMounts:
+            - name: prom
+              mountPath: /etc/prom
+        {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: config
+          {{- if .Values.configSecret.name }}
+          secret:
+            secretName: {{ .Values.configSecret.name }}
+            items:
+              - key: {{ .Values.configSecret.key | default "pgdog.toml" }}
+                path: pgdog.toml
+          {{- else }}
+          configMap:
+            name: {{ include "pgdog.fullname" . }}
+          {{- end }}
+        - name: users
+          secret:
+            {{- if .Values.usersSecret.name }}
+            secretName: {{ .Values.usersSecret.name }}
+            items:
+              - key: {{ .Values.usersSecret.key | default "users.toml" }}
+                path: users.toml
+            {{- else if and .Values.externalSecrets.enabled
+                       .Values.externalSecrets.secretName }}
+            secretName: {{ .Values.externalSecrets.secretName }}
+            {{- else }}
+            secretName: {{ include "pgdog.fullname" . }}
+            {{- end }}
+        - name: prom
+          configMap:
+            name: {{ include "pgdog.fullname" . }}-prom
+        {{- if .Values.tlsGenerateSelfSignedCert }}
+        - name: tls
+          secret:
+            secretName: {{ include "pgdog.fullname" . }}-tls
+        {{- end }}
+        {{- if and .Values.rdsCertificateBundle .Values.rdsCertificateBundle.enabled }}
+        - name: rds-ca
+          configMap:
+            name: {{ include "pgdog.fullname" . }}-rds-ca
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.affinity .Values.podAntiAffinity.enabled }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else if .Values.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          {{- if eq .Values.podAntiAffinity.type "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                {{- include "pgdog.selectorLabels" . | nindent 16 }}
+            topologyKey: kubernetes.io/hostname
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "pgdog.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- if or .Values.multiAz.enabled .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- if .Values.multiAz.enabled }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ .Values.multiAz.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "pgdog.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- with .Values.topologySpreadConstraints }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+  {{- if and .Values.statefulSet.enabled .Values.statefulSet.walPvc.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if hasKey .Values.statefulSet.walPvc "storageClassName" }}
+        storageClassName: {{ .Values.statefulSet.walPvc.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.statefulSet.walPvc.size | quote }}
+  {{- end }}

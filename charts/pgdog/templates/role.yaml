@@ -1,0 +1,24 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pgdog.fullname" . }}
+  labels:
+    {{- include "pgdog.labels" . | nindent 4 }}
+rules:
+  # Allow reading ConfigMaps for configuration
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Allow reading Secrets for credentials
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  {{- if .Values.prometheusCollector.enabled }}
+  # Allow Prometheus to discover pods for scraping
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+{{- end }}
+

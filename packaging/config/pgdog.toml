@@ -1,0 +1,24 @@
+# PgDog configuration.
+#
+# Reference: https://docs.pgdog.dev/configuration/pgdog.toml/
+# Examples:  /usr/share/doc/pgdog/
+#
+# Apply changes with `systemctl reload pgdog` (`rc-service pgdog reload` on
+# Alpine). `host` and `port` need a restart.
+
+[general]
+# Listen on localhost only. Use "0.0.0.0" to accept remote clients.
+host = "127.0.0.1"
+port = 6432
+
+# Prometheus metrics on http://<host>:9090/metrics.
+# openmetrics_port = 9090
+
+# One entry per Postgres server. Clients connect to PgDog using `name` as the
+# database name; users are in users.toml.
+#
+# [[databases]]
+# name = "app"
+# host = "127.0.0.1"
+# port = 5432
+# database_name = "app"

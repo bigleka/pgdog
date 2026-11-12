@@ -20,14 +20,65 @@ PgDog is an open source proxy for scaling PostgreSQL. It supports connection poo
 
 ## Quick start
 
-### Kubernetes
+### Linux packages
 
-Helm chart is **[here](https://github.com/pgdogdev/helm)**. To install it, run:
+`.deb` (Debian 12+, Ubuntu 22.04+), `.rpm` (RHEL/Rocky/Alma 9+) and `.apk`
+(Alpine) for amd64 and arm64, from a signed package repository or the
+[releases page](https://github.com/bigleka/pgdog/releases). They install a
+`pgdog` systemd service (OpenRC on Alpine) running as its own user, with the
+configuration in `/etc/pgdog`:
 
 ```bash
-helm repo add pgdogdev https://helm.pgdog.dev
-helm install pgdog pgdogdev/pgdog
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://bigleka.github.io/pgdog/pgdog.asc -o /etc/apt/keyrings/pgdog.asc
+echo "deb [signed-by=/etc/apt/keyrings/pgdog.asc] https://bigleka.github.io/pgdog/deb stable main" \
+    | sudo tee /etc/apt/sources.list.d/pgdog.list
+sudo apt update && sudo apt install pgdog
+sudoedit /etc/pgdog/pgdog.toml /etc/pgdog/users.toml
+sudo systemctl enable --now pgdog
+sudo systemctl reload pgdog                     # after config changes
 ```
+
+See [packaging/README.md](packaging/README.md) for RHEL and Alpine, what
+gets installed, several instances per host and building the packages.
+
+### Container image
+
+`ghcr.io/bigleka/pgdog`, for amd64 and arm64:
+
+| Tag | |
+|-----|-|
+| `1.1.0`, `1.1`, `latest` | Releases (each version also keeps its own tags, e.g. `1.0.0`). |
+| `main` | The latest commit on `main`. |
+| `<short SHA>` | One commit. |
+
+PgDog reads `pgdog.toml` and `users.toml` from its working directory,
+`/pgdog`:
+
+```bash
+docker run -p 6432:6432 \
+    -v ./pgdog.toml:/pgdog/pgdog.toml:ro -v ./users.toml:/pgdog/users.toml:ro \
+    -e PGDOG_RESULT_CACHE_ENCRYPTION_KEY \
+    ghcr.io/bigleka/pgdog:1.1
+```
+
+It stops gracefully on `SIGINT`, the image's stop signal: give it up to
+`general.shutdown_timeout` (60 s by default) to finish running transactions,
+e.g. `docker stop -t 90`.
+
+### Kubernetes
+
+This fork's chart is in [charts/pgdog](charts/pgdog): upstream's
+[chart](https://github.com/pgdogdev/helm) with this fork's image, the
+result cache settings, the encryption key from a Secret and an optional
+Valkey. It's published with every release:
+
+```bash
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.1.0 -f values.yaml
+```
+
+Upstream's chart (`helm repo add pgdogdev https://helm.pgdog.dev`) deploys
+upstream PgDog, without the result cache.
 
 ### AWS
 
@@ -61,6 +112,81 @@ SELECT * FROM payments WHERE user_id = 1;
 ```
 
 ## Features
+
+### Result Cache (Redis)
+
+PgDog includes a **Redis-backed query result cache** capable of caching `SELECT` queries to drastically improve read latency. It intelligently invalidates cache entries *only* when a DML/DDL transaction is successfully committed.
+
+#### How it works
+
+- **Caching**: Stores the Postgres protocol response for read queries directly in Redis. Subsequent identical queries will hit the cache instead of the Postgres shards.
+- **Smart Invalidation**: When an `INSERT`, `UPDATE`, or `DELETE` statement is parsed, PgDog identifies the affected tables. It waits for the transaction to successfully `COMMIT` (or the autocommit to finish) before removing the associated keys from Redis. If the transaction rolls back or fails, the cache is preserved.
+
+#### Configuration
+
+To enable the result cache, add the `[result_cache]` section to your `pgdog.toml`:
+
+```toml
+[result_cache]
+enabled = true
+# Provide the URL of your Redis server
+redis_url = "redis://127.0.0.1:6379"
+# Default Time-To-Live for cache entries
+expire_seconds = 30
+# Maximum size of a single cached response
+max_entry_bytes = 524288
+# Prefix for all Redis keys
+key_prefix = "pgdog:result_cache"
+```
+
+#### Read-after-write with replicas
+
+For `read_after_write_window_ms` (default `1000`) after a write, reads of the written tables go to the primary: for the client that wrote, other clients, and other PgDogs sharing Redis. This keeps a lagging replica from returning stale rows, and keeps those rows out of the cache. Set it above your replicas' usual lag, or `0` to turn it off. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#read-after-write-replicas).
+
+#### Performance
+
+A cached aggregate that takes Postgres 600ms comes back in 0.5ms, while a primary-key lookup costs about as much from the cache as from Postgres. Numbers and the script to reproduce them: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#benchmark).
+
+#### Transactions
+
+Reads inside read-only `READ COMMITTED` transactions use the cache too (`BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED`). For `BEGIN READ ONLY` without a level, as pgjdbc and Spring send, set `cache_read_only_transactions = true`, unless a role or database defaults to `repeatable read` or `serializable`. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#transactions).
+
+#### Monitoring
+
+A Grafana dashboard, Prometheus alerts and Kubernetes `PodMonitor`/`PrometheusRule` for PgDog and the result cache are in [examples/grafana](examples/grafana).
+
+#### Redis timeouts
+
+If Redis is slow or down, PgDog skips the cache and sends queries straight to Postgres. You control how fast that happens:
+
+```toml
+[result_cache]
+redis_connect_timeout_ms = 500       # opening a connection
+redis_response_timeout_ms = 500      # each Redis command: the most a slow Redis adds to a query
+redis_connect_retries = 1            # extra connection attempts before Redis counts as down
+redis_unavailable_backoff_ms = 5000  # how long the cache stays off before reconnecting
+```
+
+The defaults fit a Redis in the same datacenter. Keep them unless measurements say otherwise. Before changing one:
+
+- Measure Redis latency from the PgDog host (`redis-cli --latency-history`), through any proxy or TLS.
+- Keep the response timeout at 5 to 10 times the p99 you measured, and well below your applications' query timeouts.
+- Change one option at a time, then watch `result_cache_redis_errors` and the hit rate.
+
+Too short marks a healthy Redis as down and the cache keeps switching off. Too long makes queries wait on a sick Redis. With Sentinel, how fast a new primary takes over is set by Sentinel's `down-after-milliseconds`, not by PgDog. Full guide: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#redis-timeouts).
+
+#### Encryption
+
+Cached results are the rows your queries return: whoever can read Redis can read them, without any access to Postgres. With an encryption key, PgDog encrypts each entry (AES-256-GCM) before storing it and decrypts it on a hit. An entry it can't decrypt, written with another key or before encryption was on, is a miss: the query goes to Postgres.
+
+Keep the key out of `pgdog.toml`:
+
+```toml
+[result_cache]
+encryption_key_file = "/etc/pgdog/cache.key"  # e.g. a mounted Kubernetes Secret
+```
+
+or set the `PGDOG_RESULT_CACHE_ENCRYPTION_KEY` environment variable, which takes precedence over the file and over `encryption_key`. Generate one with `openssl rand -base64 32`. Details: [docs/RESULT_CACHE.md](docs/RESULT_CACHE.md#encryption).
 
 &#128216; **[Configuration](https://docs.pgdog.dev/configuration/)**
 

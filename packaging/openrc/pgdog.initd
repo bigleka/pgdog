@@ -1,0 +1,36 @@
+#!/sbin/openrc-run
+
+name="PgDog"
+description="PostgreSQL connection pooler, load balancer and sharder"
+
+: ${PGDOG_CONFIG:=/etc/pgdog/pgdog.toml}
+: ${PGDOG_USERS:=/etc/pgdog/users.toml}
+: ${RUST_LOG:=info}
+export RUST_LOG
+
+command="/usr/bin/pgdog"
+command_args="--config ${PGDOG_CONFIG} --users ${PGDOG_USERS}"
+command_user="pgdog:pgdog"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/pgdog/${RC_SVCNAME}.log"
+error_log="/var/log/pgdog/${RC_SVCNAME}.log"
+# SIGINT drains clients for up to general.shutdown_timeout (default 60 s).
+retry="SIGINT/90/SIGKILL/5"
+extra_started_commands="reload"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath -d -m 0750 -o pgdog:pgdog /var/log/pgdog
+}
+
+# SIGHUP reloads pgdog.toml and users.toml without dropping clients.
+reload() {
+	ebegin "Reloading ${name}"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}

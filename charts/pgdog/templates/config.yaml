@@ -1,0 +1,736 @@
+{{- if not .Values.configSecret.name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: {{ include "pgdog.fullname" . }}
+data:
+    # This is pgdog.toml. You can configure anything here, incl. databases.
+    pgdog.toml: |
+        [general]
+        {{- if hasKey .Values "host" }}
+        host                      =   {{ .Values.host | quote }}
+        {{- end }}
+        {{- if hasKey .Values "port" }}
+        port                      =   {{ include "pgdog.intval" .Values.port }}
+        {{- end }}
+        {{- if hasKey .Values "listenBacklog" }}
+        listen_backlog            =   {{ include "pgdog.intval" .Values.listenBacklog }}
+        {{- end }}
+        {{- if hasKey .Values "workers" }}
+        workers                   =   {{ include "pgdog.intval" .Values.workers }}
+        {{- end }}
+        {{- if hasKey .Values "defaultPoolSize" }}
+        default_pool_size         =   {{ include "pgdog.intval" .Values.defaultPoolSize }}
+        {{- end }}
+        {{- if hasKey .Values "logFormat" }}
+        log_format                =   {{ .Values.logFormat | quote }}
+        {{- end }}
+        {{- if hasKey .Values "logLevel" }}
+        log_level                 =   {{ .Values.logLevel | quote }}
+        {{- end }}
+        {{- if hasKey .Values "queryLogStdout" }}
+        query_log_stdout          =   {{ .Values.queryLogStdout }}
+        {{- end }}
+        {{- if hasKey .Values "minPoolSize" }}
+        min_pool_size             =   {{ include "pgdog.intval" .Values.minPoolSize }}
+        {{- end }}
+        {{- if hasKey .Values "poolerMode" }}
+        pooler_mode               =   {{ .Values.poolerMode | quote }}
+        {{- end }}
+        {{- if hasKey .Values "healthcheckPort" }}
+        healthcheck_port          =   {{ include "pgdog.intval" .Values.healthcheckPort }}
+        {{- end }}
+        {{- if hasKey .Values "healthcheckInterval" }}
+        healthcheck_interval      =   {{ include "pgdog.intval" .Values.healthcheckInterval }}
+        {{- end }}
+        {{- if hasKey .Values "idleHealthcheckInterval" }}
+        idle_healthcheck_interval =   {{ include "pgdog.intval" .Values.idleHealthcheckInterval }}
+        {{- end }}
+        {{- if hasKey .Values "idleHealthcheckDelay" }}
+        idle_healthcheck_delay    =   {{ include "pgdog.intval" .Values.idleHealthcheckDelay }}
+        {{- end }}
+        {{- if hasKey .Values "healthcheckTimeout" }}
+        healthcheck_timeout       =   {{ include "pgdog.intval" .Values.healthcheckTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "requireHealthcheckOnDiscovery" }}
+        require_healthcheck_on_discovery = {{ .Values.requireHealthcheckOnDiscovery }}
+        {{- end }}
+        {{- if hasKey .Values "banTimeout" }}
+        ban_timeout               =   {{ include "pgdog.intval" .Values.banTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "banReplicaLag" }}
+        ban_replica_lag           =   {{ include "pgdog.intval" .Values.banReplicaLag }}
+        {{- end }}
+        {{- if hasKey .Values "banReplicaLagBytes" }}
+        ban_replica_lag_bytes     =   {{ include "pgdog.intval" .Values.banReplicaLagBytes }}
+        {{- end }}
+        {{- if hasKey .Values "rollbackTimeout" }}
+        rollback_timeout          =   {{ include "pgdog.intval" .Values.rollbackTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "loadBalancingStrategy" }}
+        load_balancing_strategy   =   {{ .Values.loadBalancingStrategy | quote }}
+        {{- end }}
+        {{- if hasKey .Values "readWriteStrategy" }}
+        read_write_strategy       =   {{ .Values.readWriteStrategy | quote }}
+        {{- end }}
+        {{- if hasKey .Values "readWriteSplit" }}
+        read_write_split          =   {{ .Values.readWriteSplit | quote }}
+        {{- end }}
+        {{- if .Values.tlsGenerateSelfSignedCert }}
+        tls_certificate           =   "/etc/pgdog-tls/tls.crt"
+        tls_private_key           =   "/etc/pgdog-tls/tls.key"
+        {{- else }}
+        {{- if .Values.tlsCertificate }}
+        tls_certificate           =   {{ .Values.tlsCertificate | quote }}
+        {{- end }}
+        {{- if .Values.tlsPrivateKey }}
+        tls_private_key           =   {{ .Values.tlsPrivateKey | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.tlsClientCaCertificate }}
+        tls_client_ca_certificate =   {{ .Values.tlsClientCaCertificate | quote }}
+        {{- end }}
+        {{- if hasKey .Values "tlsClientRequired" }}
+        tls_client_required       =   {{ .Values.tlsClientRequired }}
+        {{- end }}
+        {{- if hasKey .Values "tlsVerify" }}
+        tls_verify                =   {{ .Values.tlsVerify | quote }}
+        {{- end }}
+        {{- if and .Values.rdsCertificateBundle .Values.rdsCertificateBundle.enabled }}
+        tls_server_ca_certificate =   "/etc/pgdog-rds-ca/rds-ca-bundle.pem"
+        {{- else if .Values.tlsServerCaCertificate }}
+        tls_server_ca_certificate =   {{ .Values.tlsServerCaCertificate | quote }}
+        {{- end}}
+        {{- if .Values.tlsServerCertificate }}
+        tls_server_certificate    =   {{ .Values.tlsServerCertificate | quote }}
+        {{- end }}
+        {{- if .Values.tlsServerPrivateKey }}
+        tls_server_private_key    =   {{ .Values.tlsServerPrivateKey | quote }}
+        {{- end }}
+        {{- if hasKey .Values "shutdownTimeout" }}
+        shutdown_timeout          =   {{ include "pgdog.intval" .Values.shutdownTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "shutdownTerminationTimeout" }}
+        shutdown_termination_timeout =   {{ include "pgdog.intval" .Values.shutdownTerminationTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "preparedStatements" }}
+        prepared_statements       =   {{ .Values.preparedStatements | quote }}
+        {{- end }}
+        {{- with .Values.queryParser }}
+        query_parser              =   {{ . | quote }}
+        {{- else }}
+        {{- with .Values.queryParserEnabled }}
+        query_parser_enabled      =   {{ . }}
+        {{- end }}
+        {{- end }}
+        {{- if hasKey .Values "queryParserEngine" }}
+        query_parser_engine       =   {{ .Values.queryParserEngine | quote }}
+        {{- end }}
+        {{- if hasKey .Values "logMinDurationParse" }}
+        log_min_duration_parse    =   {{ include "pgdog.intval" .Values.logMinDurationParse }}
+        {{- end }}
+        {{- if hasKey .Values "logQuerySampleLength" }}
+        log_query_sample_length   =   {{ include "pgdog.intval" .Values.logQuerySampleLength }}
+        {{- end }}
+        {{- if hasKey .Values "regexParserLimit" }}
+        regex_parser_limit        =   {{ include "pgdog.intval" .Values.regexParserLimit }}
+        {{- end }}
+        {{- if hasKey .Values "preparedStatementsLimit" }}
+        prepared_statements_limit =   {{ include "pgdog.intval" .Values.preparedStatementsLimit }}
+        {{- end}}
+        {{- if hasKey .Values "queryCacheLimit" }}
+        query_cache_limit         =   {{ include "pgdog.intval" .Values.queryCacheLimit }}
+        {{- end }}
+        {{- if hasKey .Values "passthroughAuth" }}
+        passthrough_auth          =   {{ .Values.passthroughAuth | quote }}
+        {{- end }}
+        {{- if hasKey .Values "connectTimeout" }}
+        connect_timeout           =   {{ include "pgdog.intval" .Values.connectTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "connectAttempts" }}
+        connect_attempts          =   {{ include "pgdog.intval" .Values.connectAttempts }}
+        {{- end }}
+        {{- if hasKey .Values "connectAttemptDelay" }}
+        connect_attempt_delay     =   {{ include "pgdog.intval" .Values.connectAttemptDelay }}
+        {{- end }}
+        {{- if hasKey .Values "queryTimeout" }}
+        query_timeout             =   {{ include "pgdog.intval" .Values.queryTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "clientIdleInTransactionTimeout" }}
+        client_idle_in_transaction_timeout =   {{ include "pgdog.intval" .Values.clientIdleInTransactionTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "checkoutTimeout" }}
+        checkout_timeout          =   {{ include "pgdog.intval" .Values.checkoutTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "dryRun" }}
+        dry_run                   =   {{ .Values.dryRun }}
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommit" }}
+        two_phase_commit          =   {{ .Values.twoPhaseCommit }}
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommitAuto" }}
+        two_phase_commit_auto     =   {{ .Values.twoPhaseCommitAuto }}
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommitWalDir" }}
+        two_phase_commit_wal_dir  =   {{ .Values.twoPhaseCommitWalDir | quote }}
+        {{- else if and .Values.statefulSet.enabled .Values.statefulSet.walPvc.enabled }}
+        two_phase_commit_wal_dir  =   "/var/lib/pgdog/wal"
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommitWalSegmentSize" }}
+        two_phase_commit_wal_segment_size      =   {{ include "pgdog.intval" .Values.twoPhaseCommitWalSegmentSize }}
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommitWalFsyncInterval" }}
+        two_phase_commit_wal_fsync_interval    =   {{ include "pgdog.intval" .Values.twoPhaseCommitWalFsyncInterval }}
+        {{- end }}
+        {{- if hasKey .Values "twoPhaseCommitWalCheckpointInterval" }}
+        two_phase_commit_wal_checkpoint_interval =   {{ include "pgdog.intval" .Values.twoPhaseCommitWalCheckpointInterval }}
+        {{- end }}
+        {{- if hasKey .Values "systemCatalogs" }}
+        system_catalogs           =   {{ .Values.systemCatalogs | quote }}
+        {{- end }}
+        {{- if hasKey .Values "omnishardedSticky" }}
+        omnisharded_sticky        =   {{ .Values.omnishardedSticky }}
+        {{- end }}
+        {{- if hasKey .Values "reshardingCopyFormat" }}
+        resharding_copy_format    =   {{ .Values.reshardingCopyFormat | quote }}
+        {{- end }}
+        {{- if hasKey .Values "reshardingParallelCopies" }}
+        resharding_parallel_copies =   {{ include "pgdog.intval" .Values.reshardingParallelCopies }}
+        {{- end }}
+        {{- if hasKey .Values "reshardingCopyRetryMaxAttempts" }}
+        resharding_copy_retry_max_attempts =   {{ include "pgdog.intval" .Values.reshardingCopyRetryMaxAttempts }}
+        {{- end }}
+        {{- if hasKey .Values "reshardingCopyRetryMinDelay" }}
+        resharding_copy_retry_min_delay =   {{ include "pgdog.intval" .Values.reshardingCopyRetryMinDelay }}
+        {{- end }}
+        {{- if hasKey .Values "reloadSchemaOnDdl" }}
+        reload_schema_on_ddl      =   {{ .Values.reloadSchemaOnDdl }}
+        {{- end }}
+        {{- if hasKey .Values "loadSchema" }}
+        load_schema               =   {{ .Values.loadSchema | quote }}
+        {{- end }}
+        {{- if hasKey .Values "idleTimeout" }}
+        idle_timeout              =   {{ include "pgdog.intval" .Values.idleTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "clientIdleTimeout" }}
+        client_idle_timeout       =   {{ include "pgdog.intval" .Values.clientIdleTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "clientLoginTimeout" }}
+        client_login_timeout      =   {{ include "pgdog.intval" .Values.clientLoginTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "mirrorQueue" }}
+        mirror_queue              =   {{ include "pgdog.intval" .Values.mirrorQueue }}
+        {{- end }}
+        {{- if hasKey .Values "mirrorExposure" }}
+        mirror_exposure           =   {{ .Values.mirrorExposure }}
+        {{- end }}
+        {{- if hasKey .Values "authType" }}
+        auth_type                 =   {{ .Values.authType | quote }}
+        {{- end }}
+        {{- if hasKey .Values "authTokenCacheSize" }}
+        auth_token_cache_size     =   {{ include "pgdog.intval" .Values.authTokenCacheSize }}
+        {{- end }}
+        {{- if hasKey .Values "crossShardDisabled" }}
+        cross_shard_disabled      =   {{ .Values.crossShardDisabled }}
+        {{- end }}
+        {{- if hasKey .Values "dnsTtl" }}
+        dns_ttl                   =   {{ include "pgdog.intval" .Values.dnsTtl }}
+        {{- end }}
+        {{- if hasKey .Values "pubSubChannelSize" }}
+        pub_sub_channel_size      =   {{ include "pgdog.intval" .Values.pubSubChannelSize }}
+        {{- end }}
+        {{- if hasKey .Values "openMetricsPort" }}
+        openmetrics_port = {{ include "pgdog.intval" .Values.openMetricsPort }}
+        {{- end }}
+        {{- if hasKey .Values "openMetricsNamespace" }}
+        openmetrics_namespace = {{ .Values.openMetricsNamespace | quote }}
+        {{- end }}
+        {{- if hasKey .Values "serverLifetime" }}
+        server_lifetime = {{ include "pgdog.intval" .Values.serverLifetime }}
+        {{- end }}
+        {{- if hasKey .Values "serverLifetimeJitter" }}
+        server_lifetime_jitter = {{ include "pgdog.intval" .Values.serverLifetimeJitter }}
+        {{- end }}
+        {{- if hasKey .Values "logConnections" }}
+        log_connections = {{ .Values.logConnections }}
+        {{- end }}
+        {{- if hasKey .Values "logDisconnections" }}
+        log_disconnections = {{ .Values.logDisconnections }}
+        {{- end }}
+        {{- if hasKey .Values "logDedupThreshold" }}
+        log_dedup_threshold = {{ include "pgdog.intval" .Values.logDedupThreshold }}
+        {{- end }}
+        {{- if hasKey .Values "logDedupWindow" }}
+        log_dedup_window = {{ include "pgdog.intval" .Values.logDedupWindow }}
+        {{- end }}
+        {{- if hasKey .Values "statsPeriod" }}
+        stats_period              =   {{ include "pgdog.intval" .Values.statsPeriod }}
+        {{- end }}
+        {{- if hasKey .Values "connectionRecovery" }}
+        connection_recovery      =   {{ .Values.connectionRecovery | quote }}
+        {{- end }}
+        {{- if hasKey .Values "clientConnectionRecovery" }}
+        client_connection_recovery =   {{ .Values.clientConnectionRecovery | quote }}
+        {{- end }}
+        {{- if hasKey .Values "expandedExplain" }}
+        expanded_explain = {{ .Values.expandedExplain }}
+        {{- end }}
+        {{- if hasKey .Values "lsnCheckDelay" }}
+        lsn_check_delay           =   {{ include "pgdog.intval" .Values.lsnCheckDelay }}
+        {{- end }}
+        {{- if hasKey .Values "lsnCheckInterval" }}
+        lsn_check_interval        =   {{ include "pgdog.intval" .Values.lsnCheckInterval }}
+        {{- end }}
+        {{- if hasKey .Values "lsnCheckTimeout" }}
+        lsn_check_timeout         =   {{ include "pgdog.intval" .Values.lsnCheckTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "rewriteShardKeyUpdates" }}
+        rewrite_shard_key_updates =   {{ .Values.rewriteShardKeyUpdates | quote }}
+        {{- end }}
+        {{- if hasKey .Values "uniqueIdMin" }}
+        unique_id_min             =   {{ include "pgdog.intval" .Values.uniqueIdMin }}
+        {{- end }}
+        {{- if hasKey .Values "uniqueIdFunction" }}
+        unique_id_function        =   {{ .Values.uniqueIdFunction | quote }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverTrafficStopThreshold" }}
+        cutover_traffic_stop_threshold     =   {{ include "pgdog.intval" .Values.cutoverTrafficStopThreshold }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverReplicationLagThreshold" }}
+        cutover_replication_lag_threshold  =   {{ include "pgdog.intval" .Values.cutoverReplicationLagThreshold }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverLastTransactionDelay" }}
+        cutover_last_transaction_delay     =   {{ include "pgdog.intval" .Values.cutoverLastTransactionDelay }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverTimeout" }}
+        cutover_timeout           =   {{ include "pgdog.intval" .Values.cutoverTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverTimeoutAction" }}
+        cutover_timeout_action    =   {{ .Values.cutoverTimeoutAction | quote }}
+        {{- end }}
+        {{- if hasKey .Values "cutoverSaveConfig" }}
+        cutover_save_config       =   {{ .Values.cutoverSaveConfig }}
+        {{- end }}
+
+        {{- range .Values.databases }}
+        [[databases]]
+        name = {{ .name | quote }}
+        host = {{ .host | quote }}
+        {{- if hasKey . "port" }}
+        port = {{ include "pgdog.intval" .port }}
+        {{- end }}
+        {{- if hasKey . "shard" }}
+        shard = {{ include "pgdog.intval" .shard }}
+        {{- end }}
+        {{- if hasKey . "databaseName" }}
+        database_name = {{ .databaseName | quote }}
+        {{- end }}
+        {{- if hasKey . "user" }}
+        user = {{ .user | quote }}
+        {{- end }}
+        {{- if hasKey . "password" }}
+        password = {{ .password | quote }}
+        {{- end }}
+        {{- if hasKey . "poolSize" }}
+        pool_size = {{ include "pgdog.intval" .poolSize }}
+        {{- end }}
+        {{- if hasKey . "minPoolSize" }}
+        min_pool_size = {{ include "pgdog.intval" .minPoolSize }}
+        {{- end }}
+        {{- if hasKey . "poolerMode" }}
+        pooler_mode = {{ .poolerMode | quote }}
+        {{- end }}
+        {{- if hasKey . "statementTimeout" }}
+        statement_timeout = {{ include "pgdog.intval" .statementTimeout }}
+        {{- end }}
+        {{- if hasKey . "idleTimeout" }}
+        idle_timeout = {{ include "pgdog.intval" .idleTimeout }}
+        {{- end }}
+        {{- if hasKey . "readOnly" }}
+        read_only = {{ .readOnly }}
+        {{- end }}
+        {{- if hasKey . "role" }}
+        role = {{ .role | quote }}
+        {{- end }}
+        {{- if hasKey . "serverLifetime" }}
+        server_lifetime = {{ include "pgdog.intval" .serverLifetime }}
+        {{- end }}
+        {{- if hasKey . "reshardingOnly" }}
+        resharding_only = {{ .reshardingOnly }}
+        {{- end }}
+        {{- if hasKey . "lbWeight" }}
+        lb_weight = {{ include "pgdog.intval" .lbWeight }}
+        {{- end }}
+        {{- if .tlsServerCertificate }}
+        tls_server_certificate = {{ .tlsServerCertificate | quote }}
+        {{- end }}
+        {{- if .tlsServerPrivateKey }}
+        tls_server_private_key = {{ .tlsServerPrivateKey | quote }}
+        {{- end }}
+        {{- end }}
+
+        {{- range .Values.mirrors }}
+        [[mirroring]]
+        source_db = {{ .sourceDb | quote }}
+        destination_db = {{ .destinationDb | quote }}
+        {{- if hasKey . "queueLength" }}
+        queue_length = {{ include "pgdog.intval" .queueLength }}
+        {{- else if hasKey . "queueDepth" }}
+        queue_length = {{ include "pgdog.intval" .queueDepth }}
+        {{- end}}
+        {{- if hasKey . "exposure" }}
+        exposure = {{ .exposure }}
+        {{- end }}
+        {{- if hasKey . "level" }}
+        level = {{ .level | quote }}
+        {{- end }}
+        {{- end }}
+
+        {{- range .Values.queryParsers }}
+        [[query_parsers]]
+        database = {{ .database | quote }}
+        level = {{ .level | quote }}
+        {{- if hasKey . "engine" }}
+        engine = {{ .engine | quote }}
+        {{- end }}
+        {{- end }}
+
+        {{- range .Values.shardedSchemas }}
+        [[sharded_schemas]]
+        database = {{ .database | quote }}
+        {{- if hasKey . "name" }}
+        name = {{ .name | quote }}
+        {{- end }}
+        shard = {{ include "pgdog.intval" .shard }}
+        {{- end }}
+
+        {{- range .Values.shardedTables }}
+        [[sharded_tables]]
+        database = {{ .database | quote }}
+        {{- if hasKey . "name" }}
+        name = {{ .name | quote }}
+        {{- end }}
+        column = {{ .column | quote }}
+        {{- with .dataType }}
+        data_type = {{ . | quote }}
+        {{- end }}
+        {{- range .mapping }}
+        [[sharded_tables.mapping]]
+        {{- if hasKey . "values" }}
+        values = {{ include "pgdog.flexlist" .values }}
+        {{- end }}
+        {{- if hasKey . "start" }}
+        start = {{ include "pgdog.flexval" .start }}
+        {{- end }}
+        {{- if hasKey . "end" }}
+        end = {{ include "pgdog.flexval" .end }}
+        {{- end }}
+        shard = {{ include "pgdog.intval" .shard }}
+        {{- end }}
+        {{- end }}
+
+        {{- range .Values.shardedMappings }}
+        [[sharded_mappings]]
+        database = {{ .database | quote }}
+        column = {{ .column | quote }}
+        kind = {{ .kind | quote }}
+        shard = {{ include "pgdog.intval" .shard }}
+        {{- if hasKey . "values" }}
+        values = {{ include "pgdog.flexlist" .values }}
+        {{- end }}
+        {{- if hasKey . "start" }}
+        start = {{ include "pgdog.flexval" .start }}
+        {{- end }}
+        {{- if hasKey . "end" }}
+        end = {{ include "pgdog.flexval" .end }}
+        {{- end}}
+        {{- end }}
+
+        {{- range .Values.omnishardedTables }}
+        [[omnisharded_tables]]
+        database = {{ .database | quote }}
+        {{- if hasKey . "sticky" }}
+        sticky = {{ .sticky }}
+        {{- end }}
+        tables = {{ .tables | toToml }}
+        {{- end }}
+
+        {{- with .Values.autodiscovery }}
+        [autodiscovery]
+        {{- if hasKey . "enabled" }}
+        enabled = {{ .enabled }}
+        {{- end }}
+        {{- if hasKey . "checkInterval" }}
+        check_interval = {{ include "pgdog.intval" .checkInterval }}
+        {{- end }}
+        {{- if hasKey . "checkDelay" }}
+        check_delay = {{ include "pgdog.intval" .checkDelay }}
+        {{- end }}
+        {{- if hasKey . "checkTimeout" }}
+        check_timeout = {{ include "pgdog.intval" .checkTimeout }}
+        {{- end }}
+        {{- range .databases }}
+        [[autodiscovery.databases]]
+        name = {{ .name | quote }}
+        {{- if hasKey . "replicasOnly" }}
+        replicas_only = {{ .replicasOnly }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+
+        {{- range .Values.plugins }}
+        [[plugins]]
+        name = {{ .name | quote }}
+        {{- if .config }}
+        config = "/etc/pgdog/{{ .name }}.toml"
+        {{- end }}
+        {{- end }}
+
+        {{- if or (hasKey .Values "tcpKeepalive") (hasKey .Values "tcpTime") (hasKey .Values "tcpInterval") (hasKey .Values "tcpRetries") (hasKey .Values "tcpUserTimeout") (hasKey .Values "tcpCongestionControl") }}
+        [tcp]
+        {{- if hasKey .Values "tcpKeepalive" }}
+        keepalive = {{ .Values.tcpKeepalive }}
+        {{- end }}
+        {{- if hasKey .Values "tcpTime" }}
+        time = {{ include "pgdog.intval" .Values.tcpTime }}
+        {{- end }}
+        {{- if hasKey .Values "tcpInterval" }}
+        interval = {{ include "pgdog.intval" .Values.tcpInterval }}
+        {{- end }}
+        {{- if hasKey .Values "tcpRetries" }}
+        retries = {{ include "pgdog.intval" .Values.tcpRetries }}
+        {{- end }}
+        {{- if hasKey .Values "tcpUserTimeout" }}
+        user_timeout = {{ include "pgdog.intval" .Values.tcpUserTimeout }}
+        {{- end }}
+        {{- if hasKey .Values "tcpCongestionControl" }}
+        congestion_control = {{ .Values.tcpCongestionControl | quote }}
+        {{- end }}
+        {{- end }}
+
+        {{- if or (hasKey .Values "memoryNetBuffer") (hasKey .Values "memoryMessageBuffer") (hasKey .Values "memoryStackSize") }}
+        [memory]
+        {{- if hasKey .Values "memoryNetBuffer" }}
+        net_buffer = {{ .Values.memoryNetBuffer | int }}
+        {{- end }}
+        {{- if hasKey .Values "memoryMessageBuffer" }}
+        message_buffer = {{ .Values.memoryMessageBuffer | int }}
+        {{- end }}
+        {{- if hasKey .Values "memoryStackSize" }}
+        stack_size = {{ .Values.memoryStackSize | int }}
+        {{- end }}
+        {{- end }}
+
+        {{- if .Values.adminPassword }}
+        [admin]
+        password = {{ .Values.adminPassword | quote }}
+        {{- end }}
+
+        {{- if .Values.qos }}
+        [qos]
+        {{- if hasKey .Values.qos "enabled" }}
+        enabled = {{ .Values.qos.enabled }}
+        {{- end }}
+        {{- if hasKey .Values.qos "maxEntries" }}
+        max_entries = {{ include "pgdog.intval" .Values.qos.maxEntries }}
+        {{- end }}
+        {{- if hasKey .Values.qos "writeBackoffDelay" }}
+        write_backoff_delay = {{ include "pgdog.intval" .Values.qos.writeBackoffDelay }}
+        {{- end }}
+        {{- if hasKey .Values.qos "writeBackoffDelayJitter" }}
+        write_backoff_delay_jitter = {{ include "pgdog.intval" .Values.qos.writeBackoffDelayJitter }}
+        {{- end }}
+        {{- if hasKey .Values.qos "writeBackoffQueueSize" }}
+        write_backoff_queue_size = {{ include "pgdog.intval" .Values.qos.writeBackoffQueueSize }}
+        {{- end }}
+        {{- end }}
+
+        {{- with .Values.queryStats }}
+        {{- if .enabled }}
+        [query_stats]
+        enabled = {{ .enabled }}
+        {{- if hasKey . "maxEntries" }}
+        max_entries = {{ include "pgdog.intval" .maxEntries }}
+        {{- end }}
+        {{- if hasKey . "queryPlansThreshold" }}
+        query_plans_threshold = {{ include "pgdog.intval" .queryPlansThreshold }}
+        {{- end }}
+        {{- if hasKey . "queryPlansCache" }}
+        query_plans_cache = {{ include "pgdog.intval" .queryPlansCache }}
+        {{- end }}
+        {{- if hasKey . "queryPlansSampleRate" }}
+        query_plans_sample_rate = {{ .queryPlansSampleRate }}
+        {{- end }}
+        {{- if hasKey . "queryPlansMaxAge" }}
+        query_plans_max_age = {{ include "pgdog.intval" .queryPlansMaxAge }}
+        {{- end }}
+        {{- if hasKey . "maxErrors" }}
+        max_errors = {{ include "pgdog.intval" .maxErrors }}
+        {{- end }}
+        {{- if hasKey . "maxErrorAge" }}
+        max_error_age = {{ include "pgdog.intval" .maxErrorAge }}
+        {{- end }}
+        {{- if hasKey . "idleInTransactionThreshold" }}
+        idle_in_transaction_threshold = {{ include "pgdog.intval" .idleInTransactionThreshold }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+
+        {{- with .Values.control }}
+        {{- if .enabled }}
+        [control]
+        {{- if hasKey . "required" }}
+        required = {{ .required }}
+        {{- end }}
+        {{- if .endpoint }}
+        endpoint = {{ .endpoint | quote }}
+        {{- end }}
+        {{- if .token }}
+        token = {{ .token | quote }}
+        {{- end }}
+        {{- if hasKey . "metricsInterval" }}
+        metrics_interval = {{ include "pgdog.intval" .metricsInterval }}
+        {{- end }}
+        {{- if hasKey . "statsInterval" }}
+        stats_interval = {{ include "pgdog.intval" .statsInterval }}
+        {{- end }}
+        {{- if hasKey . "activeQueriesInterval" }}
+        active_queries_interval = {{ include "pgdog.intval" .activeQueriesInterval }}
+        {{- end }}
+        {{- if hasKey . "errorsInterval" }}
+        errors_interval = {{ include "pgdog.intval" .errorsInterval }}
+        {{- end }}
+        {{- if hasKey . "requestTimeout" }}
+        request_timeout = {{ include "pgdog.intval" .requestTimeout }}
+        {{- end }}
+        {{- if hasKey . "queryTimingsChunkSize" }}
+        query_timings_chunk_size = {{ include "pgdog.intval" .queryTimingsChunkSize }}
+        {{- end }}
+        {{- if hasKey . "queryTimingsNewQueryQueueSize" }}
+        query_timings_new_query_queue_size = {{ include "pgdog.intval" .queryTimingsNewQueryQueueSize }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+
+        {{- if .Values.rewrite }}
+        [rewrite]
+        {{- if hasKey .Values.rewrite "enabled" }}
+        enabled = {{ .Values.rewrite.enabled }}
+        {{- end }}
+        {{- if hasKey .Values.rewrite "shardKey" }}
+        shard_key = {{ .Values.rewrite.shardKey | quote }}
+        {{- end }}
+        {{- if hasKey .Values.rewrite "splitInserts" }}
+        split_inserts = {{ .Values.rewrite.splitInserts | quote }}
+        {{- end }}
+        {{- if hasKey .Values.rewrite "primaryKey" }}
+        primary_key = {{ .Values.rewrite.primaryKey | quote }}
+        {{- end }}
+        {{- if hasKey .Values.rewrite "nonDeterministicFunctions" }}
+        non_deterministic_functions = {{ .Values.rewrite.nonDeterministicFunctions | quote }}
+        {{- end }}
+        {{- end }}
+
+        {{- if .Values.multiTenant }}
+        [multi_tenant]
+        column = {{ .Values.multiTenant.column | quote }}
+        {{- end }}
+
+        {{- with .Values.vault }}
+        [vault]
+        url = {{ required "vault.url is required" .url | quote }}
+        auth_method = {{ required "vault.authMethod is required" .authMethod | quote }}
+        {{- if .authMount }}
+        auth_mount = {{ .authMount | quote }}
+        {{- end }}
+        {{- if .namespace }}
+        namespace = {{ .namespace | quote }}
+        {{- end }}
+        {{- if .kubernetesRole }}
+        kubernetes_role = {{ .kubernetesRole | quote }}
+        {{- end }}
+        {{- if .kubernetesJwtPath }}
+        kubernetes_jwt_path = {{ .kubernetesJwtPath | quote }}
+        {{- end }}
+        {{- if .approleRoleId }}
+        approle_role_id = {{ .approleRoleId | quote }}
+        {{- end }}
+        {{- if .approleSecretIdFile }}
+        approle_secret_id_file = {{ .approleSecretIdFile | quote }}
+        {{- end }}
+        {{- if hasKey . "clientTokenTtl" }}
+        client_token_ttl = {{ include "pgdog.intval" .clientTokenTtl }}
+        {{- end }}
+        {{- end }}
+
+        {{- with .Values.resultCache }}
+        {{- if .enabled }}
+        [result_cache]
+        enabled = true
+        {{- if .redisUrl }}
+        redis_url = {{ .redisUrl | quote }}
+        {{- else if .valkey.enabled }}
+        redis_url = {{ printf "redis://%s-valkey:6379" (include "pgdog.fullname" $) | quote }}
+        {{- end }}
+        {{- if .redisMode }}
+        redis_mode = {{ .redisMode | quote }}
+        {{- end }}
+        {{- if .redisUrls }}
+        redis_urls = {{ .redisUrls | toToml }}
+        {{- end }}
+        {{- if .redisSentinelMaster }}
+        redis_sentinel_master = {{ .redisSentinelMaster | quote }}
+        {{- end }}
+        {{- range $field, $toml := dict "expireSeconds" "expire_seconds" "maxEntryBytes" "max_entry_bytes" "adaptiveTtlMaxSeconds" "adaptive_ttl_max_seconds" "singleflightLockMs" "singleflight_lock_ms" "readAfterWriteWindowMs" "read_after_write_window_ms" "redisConnectTimeoutMs" "redis_connect_timeout_ms" "redisResponseTimeoutMs" "redis_response_timeout_ms" "redisConnectRetries" "redis_connect_retries" "redisUnavailableBackoffMs" "redis_unavailable_backoff_ms" }}
+        {{- if hasKey $.Values.resultCache $field }}
+        {{ $toml }} = {{ include "pgdog.intval" (index $.Values.resultCache $field) }}
+        {{- end }}
+        {{- end }}
+        {{- if .keyPrefix }}
+        key_prefix = {{ .keyPrefix | quote }}
+        {{- end }}
+        {{- if hasKey . "xfetchBeta" }}
+        xfetch_beta = {{ .xfetchBeta | float64 }}
+        {{- end }}
+        {{- if hasKey . "cacheReadOnlyTransactions" }}
+        cache_read_only_transactions = {{ .cacheReadOnlyTransactions }}
+        {{- end }}
+        {{- range $field, $toml := dict "cacheSafeSchemaList" "cache_safe_schema_list" "cacheUnsafeSchemaList" "cache_unsafe_schema_list" "cacheSafeTableList" "cache_safe_table_list" "cacheUnsafeTableList" "cache_unsafe_table_list" }}
+        {{- if hasKey $.Values.resultCache $field }}
+        {{ $toml }} = {{ index $.Values.resultCache $field | toToml }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+
+        {{- if .Values.otel }}
+        [otel]
+        {{- if hasKey .Values.otel "endpoint" }}
+        endpoint = {{ .Values.otel.endpoint | quote }}
+        {{- end }}
+        {{- if hasKey .Values.otel "namespace" }}
+        namespace = {{ .Values.otel.namespace | quote }}
+        {{- end }}
+        {{- if hasKey .Values.otel "datadogApiKey" }}
+        datadog_api_key = {{ .Values.otel.datadogApiKey | quote }}
+        {{- end }}
+        {{- if hasKey .Values.otel "pushInterval" }}
+        push_interval = {{ include "pgdog.intval" .Values.otel.pushInterval }}
+        {{- end }}
+        {{- if hasKey .Values.otel "temporality" }}
+        temporality = {{ .Values.otel.temporality | quote }}
+        {{- end }}
+        {{- if hasKey .Values.otel "headers" }}
+        [otel.headers]
+        {{- range $k, $v := .Values.otel.headers }}
+        {{ $k }} = {{ $v | quote }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+    {{- range .Values.plugins }}
+    {{- if .config }}
+    {{ .name }}.toml: |
+{{ .config | indent 8 }}
+    {{- end }}
+    {{- end }}
+{{- end }}

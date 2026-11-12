@@ -1,0 +1,5 @@
+# Test externalTrafficPolicy / internalTrafficPolicy rendering
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  internalTrafficPolicy: Cluster

@@ -1,0 +1,18 @@
+# PgDog users. Readable by root and the pgdog group only: it holds passwords.
+#
+# Reference: https://docs.pgdog.dev/configuration/users.toml/
+#
+# Store hashes instead of plaintext: `pgdog hash <password>`.
+#
+# [[users]]
+# name = "app"
+# database = "app"
+# password = "secret"
+
+# Admin database (SHOW POOLS, SHOW STATS, RELOAD...). Without it the password
+# is random and the admin database is unreachable.
+#
+# [admin]
+# name = "admin"
+# user = "admin"
+# password = "change-me"
