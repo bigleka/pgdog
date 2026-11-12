@@ -52,9 +52,9 @@ the one in [repo/README.md](repo/README.md#keys).
 Or download the package from the release and install the file:
 
 ```bash
-sudo apt install ./pgdog_1.0.0-1_amd64.deb
-sudo dnf install ./pgdog-1.0.0-1.x86_64.rpm
-sudo apk add ./pgdog_1.0.0-r1_x86_64.apk    # with the key in /etc/apk/keys
+sudo apt install ./pgdog_1.1.0-1_amd64.deb
+sudo dnf install ./pgdog-1.1.0-1.x86_64.rpm
+sudo apk add ./pgdog_1.1.0-r1_x86_64.apk    # with the key in /etc/apk/keys
 ```
 
 Check the download against `SHA256SUMS` from the same release:

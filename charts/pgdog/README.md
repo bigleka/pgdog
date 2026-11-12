@@ -11,7 +11,7 @@ plus:
 - a check that refuses settings this fork's PgDog doesn't support yet.
 
 ```bash
-helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.0.0 -f values.yaml
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.1.0 -f values.yaml
 ```
 
 ### Result cache

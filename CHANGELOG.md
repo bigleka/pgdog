@@ -3,7 +3,10 @@
 This fork has its own version numbers. It forked from upstream
 [pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) at 0.1.38.
 
-## Unreleased
+## 1.1.0
+
+Helm chart and release images, result cache in read-only transactions,
+schema-aware invalidation, and a pgbench benchmark.
 
 ### Helm chart
 
