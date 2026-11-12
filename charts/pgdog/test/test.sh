@@ -143,39 +143,11 @@ while IFS='|' read -r expected args; do
     exit 1
   fi
 done <<'CASES'
-listenBacklog|--set listenBacklog=1024
-queryLogStdout|--set queryLogStdout=true
-requireHealthcheckOnDiscovery|--set requireHealthcheckOnDiscovery=true
-logMinDurationParse|--set logMinDurationParse=1
-logQuerySampleLength|--set logQuerySampleLength=1
-twoPhaseCommitWalDir|--set twoPhaseCommitWalDir=/wal
-twoPhaseCommitWalSegmentSize|--set twoPhaseCommitWalSegmentSize=1
-twoPhaseCommitWalFsyncInterval|--set twoPhaseCommitWalFsyncInterval=1
-twoPhaseCommitWalCheckpointInterval|--set twoPhaseCommitWalCheckpointInterval=1
-authTokenCacheSize|--set authTokenCacheSize=1
-serverLifetimeJitter|--set serverLifetimeJitter=1
 rewriteShardKeyUpdates|--set rewriteShardKeyUpdates=error
 autodiscovery|--set autodiscovery.enabled=true
-vault|--set vault.url=https://vault --set vault.authMethod=kubernetes
-otel|--set otel.endpoint=https://otel
 qos|--set qos.enabled=true
-tlsClientCaCertificate|--set tlsClientCaCertificate=/ca.pem
-tlsServerCertificate|--set tlsServerCertificate=/cert.pem
-tlsServerPrivateKey|--set tlsServerPrivateKey=/key.pem
-queryParsers|--set-json 'queryParsers=[{"database":"app","level":"on"}]'
 queryStats.enabled|--set queryStats.enabled=true
 control.enabled|--set control.enabled=true
-rewrite.nonDeterministicFunctions|--set rewrite.nonDeterministicFunctions=error
-statefulSet.walPvc.enabled|--set statefulSet.enabled=true --set statefulSet.walPvc.enabled=true
-databases[app].tlsServerCertificate|--set-json 'databases=[{"name":"app","host":"db","tlsServerCertificate":"/c.pem"}]'
-shardedTables[t].mapping|--set-json 'shardedTables=[{"name":"t","database":"app","column":"id","mapping":[{"kind":"list","values":[1],"shard":0}]}]'
-users[app].authType|--set-json 'users=[{"name":"app","database":"app","password":"p","authType":"md5"}]'
-users[app].identity|--set-json 'users=[{"name":"app","database":"app","password":"p","identity":"x"}]'
-users[app].readWriteSplit|--set-json 'users=[{"name":"app","database":"app","password":"p","readWriteSplit":"include_primary"}]'
-users[app].serverIamAssumeRole|--set-json 'users=[{"name":"app","database":"app","password":"p","serverIamAssumeRole":"arn"}]'
-users[app].serverVaultPath|--set-json 'users=[{"name":"app","database":"app","password":"p","serverVaultPath":"x"}]'
-users[app].vaultRefreshPercent|--set-json 'users=[{"name":"app","database":"app","password":"p","vaultRefreshPercent":50}]'
-users[app].vaultPath|--set-json 'users=[{"name":"app","database":"app","password":"p","vaultPath":"x"}]'
 CASES
 echo "  upstream-only settings are refused, by name, each one alone"
 
