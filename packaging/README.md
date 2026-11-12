@@ -128,7 +128,7 @@ Signing and the package repository: [repo/README.md](repo/README.md).
 ## Releasing
 
 1. Bump `version` in `pgdog/Cargo.toml` and merge it.
-2. Tag the merge commit: `git tag v1.0.1 && git push origin v1.0.1`.
+2. Tag the merge commit: `git tag -a v2.0.1 -m "PgDog 2.0.1" && git push origin v2.0.1`.
 
 The `release` workflow builds, signs and tests the packages, attaches them
 and `SHA256SUMS` to the release, and publishes the repository with every

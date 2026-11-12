@@ -1,13 +1,20 @@
 # Security Policy
 
+This is a fork of [pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) with
+its own releases. Report vulnerabilities in it here, not to upstream.
+
 ## Supported Versions
 
-Since the project is currently pre-v1.0, only the latest released version
-is supported with security updates. Users are expected to upgrade to the
-newest version to receive security fixes.
+Only the latest 2.x release gets security fixes. Upgrade to the newest
+release to receive them.
 
 ## Reporting a Vulnerability
 
-Please report any vulnerabilities to security@pgdog.dev. You'll get a acknowledgement
-within 24 hours. Any high priority vulnerabilities will be fixed within 72 hours.
+Report it privately through GitHub: on the repository's
+[Security tab](https://github.com/bigleka/pgdog/security), choose
+**Report a vulnerability**
+([direct link](https://github.com/bigleka/pgdog/security/advisories/new)).
+Don't open a public issue for it.
 
+If the vulnerability is in upstream PgDog as well, it's also worth reporting
+to upstream as their own policy describes.
