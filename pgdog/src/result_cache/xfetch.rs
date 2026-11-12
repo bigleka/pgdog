@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 /// Whether a hit should refresh the entry now, given `u` drawn uniformly from (0, 1].
 ///

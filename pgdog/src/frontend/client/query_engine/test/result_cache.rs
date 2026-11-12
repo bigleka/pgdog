@@ -5,10 +5,10 @@ use std::{ops::Deref, time::Duration};
 use futures::future::join_all;
 
 use pgdog_config::{QueryParserLevel, ResultCache};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 use crate::{
-    backend::{databases::reload_from_existing, server::test::test_server, Server},
+    backend::{Server, databases::reload_from_existing, server::test::test_server},
     config::{config, load_test, load_test_sharded, set},
     net::{DataRow, Message, ReadyForQuery},
 };
@@ -338,7 +338,11 @@ async fn test_hit_inside_transaction_reports_transaction_status() {
     prime_cache(&mut client, &mut table).await;
 
     table.update_directly(1000).await;
-    simple(&mut client, "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await;
+    simple(
+        &mut client,
+        "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED",
+    )
+    .await;
     let reply = simple(&mut client, &table.select()).await;
     simple(&mut client, "ROLLBACK").await;
     table.drop().await;
@@ -575,7 +579,11 @@ async fn test_split_query_not_served_from_cache() {
     let mut client = TestClient::new(Parameters::default()).await;
 
     for _ in 0..2 {
-        simple(&mut client, "SELECT 1 AS cached; SET statement_timeout TO '10s'").await;
+        simple(
+            &mut client,
+            "SELECT 1 AS cached; SET statement_timeout TO '10s'",
+        )
+        .await;
     }
 
     assert_eq!(

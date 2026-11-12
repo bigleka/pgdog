@@ -7,7 +7,7 @@ use std::{
 
 use futures::future::join;
 use pgdog_config::QueryParserLevel;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 use crate::{
     backend::server::test::test_server,
@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, select_value, TestTable},
+    result_cache::{TestTable, enable_result_cache, select_value},
 };
 
 /// Large enough that any hit refreshes the entry.
@@ -116,13 +116,14 @@ async fn test_hits_during_refresh_are_served_from_cache() {
         Some("1")
     );
 
-    let (refreshed, (read, read_time)) = join(select_value(&mut refresher, &select), async {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let start = Instant::now();
-        let value = select_value(&mut reader, &select).await;
-        (value, start.elapsed())
-    })
-    .await;
+    let (refreshed, (read, read_time)) =
+        Box::pin(join(select_value(&mut refresher, &select), async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let start = Instant::now();
+            let value = select_value(&mut reader, &select).await;
+            (value, start.elapsed())
+        }))
+        .await;
 
     direct
         .execute(format!("DROP FUNCTION {function}(); DROP TABLE {calls}"))

@@ -297,7 +297,10 @@ impl Stream {
     ///
     /// `bytes` is expected to contain one or more complete protocol messages
     /// (type byte + length + payload) concatenated.
-    pub(crate) async fn send_raw_flush(&mut self, bytes: &[u8]) -> Result<usize, crate::net::Error> {
+    pub(crate) async fn send_raw_flush(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<usize, crate::net::Error> {
         self.io_in_progress = true;
         let result = async {
             match &mut self.inner {

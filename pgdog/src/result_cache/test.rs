@@ -1,4 +1,4 @@
-use crate::{frontend::ClientRequest, net::messages::Query as QueryMsg, net::ProtocolMessage};
+use crate::{frontend::ClientRequest, net::ProtocolMessage, net::messages::Query as QueryMsg};
 
 use super::CacheableRequest;
 
@@ -39,18 +39,18 @@ mod redis {
     };
 
     use pgdog_config::{RedisMode, ResultCache};
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     use crate::{
-        config::{set, ConfigAndUsers},
-        result_cache::tables::OwnedTable,
+        config::{ConfigAndUsers, set},
         parameters::ParameterStore,
+        result_cache::tables::OwnedTable,
         result_cache::{
+            CacheableRequest, ResultCacheKey,
             entry::Entry,
             lock::{Lock, Remote},
             redis::RedisResultCache,
             singleflight::Flight,
-            CacheableRequest, ResultCacheKey,
         },
     };
 
@@ -175,7 +175,6 @@ mod redis {
         OwnedTable {
             name: name.into(),
             schema: Some(schema.into()),
-            ..Default::default()
         }
     }
 

@@ -3,7 +3,11 @@
 
 use std::fmt::{self, Display};
 
-use pg_raw_parse::{Node, nodes::ObjectType, walk::{Recurse, walk_manual}};
+use pg_raw_parse::{
+    Node,
+    nodes::ObjectType,
+    walk::{Recurse, walk_manual},
+};
 
 use crate::frontend::router::parser::{Ast, Table};
 
@@ -130,8 +134,14 @@ mod test {
 
     #[test]
     fn test_dml_tables() {
-        assert_eq!(tables_of("INSERT INTO a SELECT * FROM b"), ["\"a\"", "\"b\""]);
-        assert_eq!(tables_of("UPDATE s.a SET x = 1 FROM b"), ["\"b\"", "\"s\".\"a\""]);
+        assert_eq!(
+            tables_of("INSERT INTO a SELECT * FROM b"),
+            ["\"a\"", "\"b\""]
+        );
+        assert_eq!(
+            tables_of("UPDATE s.a SET x = 1 FROM b"),
+            ["\"b\"", "\"s\".\"a\""]
+        );
         assert_eq!(tables_of("DELETE FROM a USING b"), ["\"a\"", "\"b\""]);
     }
 
@@ -147,7 +157,10 @@ mod test {
         assert_eq!(tables_of("TRUNCATE a, s.b"), ["\"a\"", "\"s\".\"b\""]);
         assert_eq!(tables_of("ALTER TABLE a ADD COLUMN x int"), ["\"a\""]);
         assert_eq!(tables_of("ALTER TABLE a RENAME TO b"), ["\"a\""]);
-        assert_eq!(tables_of("CREATE TABLE a AS SELECT * FROM b"), ["\"a\"", "\"b\""]);
+        assert_eq!(
+            tables_of("CREATE TABLE a AS SELECT * FROM b"),
+            ["\"a\"", "\"b\""]
+        );
         assert_eq!(tables_of("COPY a FROM STDIN"), ["\"a\""]);
     }
 
@@ -163,12 +176,21 @@ mod test {
 
     #[test]
     fn test_multiple_statements() {
-        assert_eq!(tables_of("SELECT 1 FROM a; UPDATE b SET x = 1"), ["\"a\"", "\"b\""]);
+        assert_eq!(
+            tables_of("SELECT 1 FROM a; UPDATE b SET x = 1"),
+            ["\"a\"", "\"b\""]
+        );
     }
 
     #[test]
     fn test_statements_without_tables() {
-        for query in ["BEGIN", "SET search_path TO s", "SHOW work_mem", "VACUUM", "SELECT 1"] {
+        for query in [
+            "BEGIN",
+            "SET search_path TO s",
+            "SHOW work_mem",
+            "VACUUM",
+            "SELECT 1",
+        ] {
             assert!(tables_of(query).is_empty(), "{query}");
         }
     }

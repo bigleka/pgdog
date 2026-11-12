@@ -3,9 +3,9 @@
 //! through the other. Require Redis on 127.0.0.1:6379.
 
 use pgdog_config::QueryParserLevel;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
-use crate::backend::{server::test::test_server, Server};
+use crate::backend::{Server, server::test::test_server};
 
 use super::{
     prelude::*,

@@ -28,7 +28,8 @@ pub(crate) fn plain_select(select: &nodes::SelectStmt) -> bool {
 pub(crate) fn only_reads(ast: &Ast) -> bool {
     let mut statements = ast.ast.stmts().peekable();
     statements.peek().is_some()
-        && statements.all(|statement| matches!(statement, Node::SelectStmt(select) if plain_select(select)))
+        && statements
+            .all(|statement| matches!(statement, Node::SelectStmt(select) if plain_select(select)))
 }
 
 #[cfg(test)]

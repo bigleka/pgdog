@@ -11,8 +11,8 @@ use crate::sharding::ShardedSchema;
 use crate::util::random_string;
 use crate::{
     EnumeratedDatabase, Memory, OmnishardedTable, PassthroughAuth, PreparedStatementsLevel,
-    QueryParser, QueryParserLevel, ReadWriteSplit, ResultCache, RewriteMode, Role, ShardedMappingKey,
-    ShardedTableConfig, SystemCatalogsBehavior, system_catalogs,
+    QueryParser, QueryParserLevel, ReadWriteSplit, ResultCache, RewriteMode, Role,
+    ShardedMappingKey, ShardedTableConfig, SystemCatalogsBehavior, system_catalogs,
 };
 
 use super::database::Database;

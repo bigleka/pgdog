@@ -9,13 +9,13 @@ pub(crate) mod otel;
 pub(crate) mod otel_exporter;
 pub(crate) mod pools;
 pub(crate) use open_metric::*;
+#[cfg(test)]
+mod grafana;
 pub(crate) mod listeners;
 pub(crate) mod logger;
 pub(crate) mod memory;
 pub(crate) mod query_cache;
 pub(crate) mod result_cache;
-#[cfg(test)]
-mod grafana;
 pub(crate) mod token_cache;
 pub(crate) mod two_pc;
 

@@ -9,7 +9,7 @@ use crate::config::{config, set};
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, select_value, TestTable},
+    result_cache::{TestTable, enable_result_cache, select_value},
     result_cache_distributed::{key_prefix, redis},
 };
 
