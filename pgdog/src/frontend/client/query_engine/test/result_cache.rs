@@ -333,11 +333,22 @@ async fn test_hit_inside_transaction_reports_transaction_status() {
     let mut client = TestClient::new(Parameters::default()).await;
     prime_cache(&mut client, &mut table).await;
 
-    simple(&mut client, "BEGIN").await;
+    table.update_directly(1000).await;
+    simple(
+        &mut client,
+        "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED",
+    )
+    .await;
     let reply = simple(&mut client, &table.select()).await;
     simple(&mut client, "ROLLBACK").await;
     table.drop().await;
 
+    let value = reply
+        .iter()
+        .find(|message| message.code() == 'D')
+        .and_then(|message| DataRow::try_from(message.clone()).ok())
+        .and_then(|row| row.get_text(0));
+    assert_eq!(value.as_deref(), Some("1"), "precondition: a cache hit");
     let rfq = ReadyForQuery::try_from(reply.last().unwrap().clone()).unwrap();
     assert_eq!(
         rfq.status, 'T',
