@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "pgdog"
-version = "0.1.64"
+version = "2.0.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",

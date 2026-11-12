@@ -1,7 +1,27 @@
 # Changelog
 
-This fork has its own version numbers. It forked from upstream
-[pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) at 0.1.38.
+This fork has its own version numbers. 1.x is based on upstream
+[pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) 0.1.38, 2.x on 0.1.64.
+Upstream's changes are in [CHANGELOG-UPSTREAM.md](CHANGELOG-UPSTREAM.md).
+
+## Unreleased: 2.0.0
+
+The fork's changes, carried over to upstream PgDog 0.1.64. Everything
+upstream changed from 0.1.39 to 0.1.64 comes with it: see
+[CHANGELOG-UPSTREAM.md](CHANGELOG-UPSTREAM.md). Read upstream's breaking
+changes before upgrading from 1.x.
+
+### Result cache (Redis)
+
+- Same features and configuration as 1.1.0.
+- A query PgDog splits into several requests, such as some simple queries
+  with several statements on sharded databases, isn't served from the
+  cache.
+
+### Building
+
+- Rust 1.96. Building PgDog now builds part of Postgres too: it needs
+  bison, flex and the ICU, readline and zlib headers (see the README).
 
 ## 1.1.0
 

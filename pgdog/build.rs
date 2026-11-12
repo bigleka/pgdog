@@ -10,19 +10,20 @@ fn main() {
         .compile("postgres_hash");
 
     println!("cargo:rerun-if-env-changed=GIT_HASH");
+    // Every commit and checkout appends to it: keeps GIT_HASH current.
+    println!("cargo:rerun-if-changed=../.git/logs/HEAD");
 
+    // "unknown" outside a git checkout, e.g. a source tarball.
     let git_hash = std::env::var("GIT_HASH").unwrap_or_else(|_| {
         Command::new("git")
-            .args(["rev-parse", "HEAD"])
+            .args(["rev-parse", "--short=7", "HEAD"])
             .output()
-            .map(|output| {
-                String::from_utf8(output.stdout)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(7)
-                    .collect()
-            })
-            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|hash| hash.trim().to_owned())
+            .filter(|hash| !hash.is_empty())
+            .unwrap_or_else(|| "unknown".into())
     });
 
     println!("cargo:rustc-env=GIT_HASH={git_hash}");

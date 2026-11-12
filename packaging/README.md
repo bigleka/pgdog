@@ -52,9 +52,9 @@ the one in [repo/README.md](repo/README.md#keys).
 Or download the package from the release and install the file:
 
 ```bash
-sudo apt install ./pgdog_1.1.0-1_amd64.deb
-sudo dnf install ./pgdog-1.1.0-1.x86_64.rpm
-sudo apk add ./pgdog_1.1.0-r1_x86_64.apk    # with the key in /etc/apk/keys
+sudo apt install ./pgdog_2.0.0-1_amd64.deb
+sudo dnf install ./pgdog-2.0.0-1.x86_64.rpm
+sudo apk add ./pgdog_2.0.0-r1_x86_64.apk    # with the key in /etc/apk/keys
 ```
 
 Check the download against `SHA256SUMS` from the same release:
@@ -100,8 +100,9 @@ Several PgDogs on one host: put each configuration in `/etc/pgdog/<name>/`
 
 ## Versions
 
-PgDog in this fork has its own version numbers, starting at 1.0.0. It forked
-from upstream [pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) at 0.1.38.
+PgDog in this fork has its own version numbers, starting at 1.0.0. 1.x is
+based on upstream [pgdogdev/pgdog](https://github.com/pgdogdev/pgdog) 0.1.38,
+2.x on 0.1.64.
 `pgdog --version` and `SHOW VERSION` print the package version.
 
 ## Building

@@ -48,7 +48,7 @@ gets installed, several instances per host and building the packages.
 
 | Tag | |
 |-----|-|
-| `1.1.0`, `1.1`, `latest` | Releases (each version also keeps its own tags, e.g. `1.0.0`). |
+| `2.0.0`, `2.0`, `latest` | Releases (each version also keeps its own tags, e.g. `1.1.0`). |
 | `main` | The latest commit on `main`. |
 | `<short SHA>` | One commit. |
 
@@ -59,7 +59,7 @@ PgDog reads `pgdog.toml` and `users.toml` from its working directory,
 docker run -p 6432:6432 \
     -v ./pgdog.toml:/pgdog/pgdog.toml:ro -v ./users.toml:/pgdog/users.toml:ro \
     -e PGDOG_RESULT_CACHE_ENCRYPTION_KEY \
-    ghcr.io/bigleka/pgdog:1.1
+    ghcr.io/bigleka/pgdog:2.0
 ```
 
 It stops gracefully on `SIGINT`, the image's stop signal: give it up to
@@ -74,7 +74,7 @@ result cache settings, the encryption key from a Secret and an optional
 Valkey. It's published with every release:
 
 ```bash
-helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.1.0 -f values.yaml
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 2.0.0 -f values.yaml
 ```
 
 Upstream's chart (`helm repo add pgdogdev https://helm.pgdog.dev`) deploys
@@ -712,6 +712,13 @@ We include two examples:
 ## Running PgDog locally
 
 Install the latest version of the Rust compiler from [rust-lang.org](https://rust-lang.org).
+PgDog builds Postgres' parser too, which needs clang, bison, flex and the
+ICU, readline and zlib headers. On Debian and Ubuntu:
+
+```bash
+sudo apt install clang libclang-dev pkg-config bison flex libicu-dev libreadline-dev zlib1g-dev
+```
+
 Clone this repository and build the project in release mode:
 
 ```bash

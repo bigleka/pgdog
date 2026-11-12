@@ -230,6 +230,18 @@
         "two_pc_cleanup_timeout": 600000
       }
     },
+    "result_cache": {
+      "description": "Result cache settings control Redis-backed caching of SELECT results.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultCache"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "rewrite": {
       "description": "Controls PgDog's automatic SQL rewrites for sharded databases. It affects sharding key updates and multi-tuple inserts.\n\n**Note:** Consider enabling two-phase commit when either feature is set to `rewrite`. Without it, rewrites are committed shard-by-shard and can leave partial changes if a transaction fails.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/rewrite/>",
       "$ref": "#/$defs/Rewrite",
@@ -1974,6 +1986,26 @@
         }
       ]
     },
+    "RedisMode": {
+      "description": "How the result cache connects to Redis.",
+      "oneOf": [
+        {
+          "description": "One Redis server at `redis_url`, or a proxy such as twemproxy or Envoy in front of several.",
+          "type": "string",
+          "const": "standalone"
+        },
+        {
+          "description": "Redis Cluster, discovered from `redis_urls`.",
+          "type": "string",
+          "const": "cluster"
+        },
+        {
+          "description": "Primary `redis_sentinel_master`, found through the Sentinels in `redis_urls`.",
+          "type": "string",
+          "const": "sentinel"
+        }
+      ]
+    },
     "ReplicaLag": {
       "description": "Replica lag banning configuration. When a replica's replication lag exceeds the threshold, it is banned from serving read queries.",
       "type": "object",
@@ -2016,6 +2048,189 @@
           "format": "uint64",
           "default": 600000,
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResultCache": {
+      "type": "object",
+      "properties": {
+        "adaptive_ttl_max_seconds": {
+          "description": "Enable adaptive TTL: each hit pushes the entry's expiry to\n`expire_seconds` from now, so frequently read entries stay cached,\nbut never longer than this many seconds after the query ran.\n\n**Note:** changes made outside PgDog can stay invisible for up to\nthis long, instead of `expire_seconds`. Writes through PgDog still\ninvalidate entries immediately.\n\n_Default:_ disabled",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cache_read_only_transactions": {
+          "description": "Use the cache in read-only transactions that don't name an isolation\nlevel (`BEGIN READ ONLY`), as if they were `READ COMMITTED`.\n\nRead-only transactions that say `ISOLATION LEVEL READ COMMITTED` use\nthe cache regardless, and `REPEATABLE READ` or `SERIALIZABLE` ones\nnever do: each of their statements must see the same snapshot.\n\n**Note:** PgDog can't see `default_transaction_isolation` set with\n`ALTER ROLE` or `ALTER DATABASE`. Don't enable this if a role or\ndatabase defaults to `repeatable read` or `serializable`.\n\n_Default:_ `false`",
+          "type": "boolean",
+          "default": false
+        },
+        "cache_safe_schema_list": {
+          "description": "Optional allow-list of schemas whose tables can be cached.\n\nEach entry is treated as a regular expression.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_safe_table_list": {
+          "description": "Optional allow-list of tables whose results can be cached.\n\nEach entry is treated as a regular expression and matched against\neither `table` or `schema.table` when schema is present.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_unsafe_schema_list": {
+          "description": "Optional deny-list of schemas whose tables should never be cached.\n\nTakes precedence over `cache_safe_schema_list`.\nEach entry is treated as a regular expression.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_unsafe_table_list": {
+          "description": "Optional deny-list of tables whose results should never be cached.\n\nTakes precedence over `cache_safe_table_list`.\nEach entry is treated as a regular expression and matched against\neither `table` or `schema.table` when schema is present.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "description": "Enable Redis/RESP result cache.",
+          "type": "boolean",
+          "default": false
+        },
+        "encryption_key": {
+          "description": "Encrypts cached results in Redis (AES-256-GCM), so whoever can read\nRedis can't read the data. Use a long random string, e.g.\n`openssl rand -base64 32`.\n\nPrefer `encryption_key_file` or the `PGDOG_RESULT_CACHE_ENCRYPTION_KEY`\nenvironment variable, which overrides both, to keep the key out of\nthis file.\n\n_Default:_ none, results are stored unencrypted",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "encryption_key_file": {
+          "description": "File holding `encryption_key`, e.g. a mounted Kubernetes Secret.\nTrailing whitespace and newlines are ignored. Can't be set together with\n`encryption_key`. Read when the configuration is loaded or reloaded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expire_seconds": {
+          "description": "Optional expiration time for cached entries (seconds).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "key_prefix": {
+          "description": "Key prefix in Redis.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_entry_bytes": {
+          "description": "Maximum entry size to cache (bytes). If not set, PgDog uses a safe default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "read_after_write_window_ms": {
+          "description": "With replicas: for this many milliseconds after a write to a table,\nreads of that table go to the primary instead of a replica that may\nnot have the write yet. Covers the client that wrote, other clients,\nand other PgDogs sharing Redis, and keeps stale replica results out of\nthe cache. Set it above your replicas' usual lag.\n\n`0` disables it. No effect without replicas.\n\n_Default:_ `1000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redis_connect_retries": {
+          "description": "How many times connecting to Redis is retried before it counts as down.\n\n_Default:_ `1`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "redis_connect_timeout_ms": {
+          "description": "How long connecting to Redis may take before it counts as down\n(milliseconds). See \"Redis timeouts\" in docs/RESULT_CACHE.md before\nchanging it.\n\n_Default:_ `500`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redis_mode": {
+          "description": "How PgDog connects to Redis.\n\n_Default:_ `standalone`",
+          "$ref": "#/$defs/RedisMode",
+          "default": "standalone"
+        },
+        "redis_response_timeout_ms": {
+          "description": "How long a Redis command may take before Redis counts as down\n(milliseconds). Every cacheable query waits on Redis at least once, so\nthis is also the most a slow Redis adds to a query.\n\n_Default:_ `500`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redis_sentinel_master": {
+          "description": "Name of the primary Sentinel monitors, for `redis_mode = \"sentinel\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redis_unavailable_backoff_ms": {
+          "description": "Once Redis counts as down, how long the cache is skipped, queries\ngoing straight to Postgres, before connecting again (milliseconds).\n`0` tries again on the next query.\n\n_Default:_ `5000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "redis_url": {
+          "description": "Redis connection URL, e.g. redis://127.0.0.1:6379",
+          "type": "string",
+          "default": ""
+        },
+        "redis_urls": {
+          "description": "Redis nodes for `redis_mode = \"cluster\"` (one or more cluster nodes to\ndiscover the cluster from) or `\"sentinel\"` (the Sentinels). Falls back\nto `redis_url` when empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "singleflight_lock_ms": {
+          "description": "Coalesce misses between PgDogs sharing Redis: the first one to miss\non a query takes a lock in Redis and runs it, the others wait for its\nresult instead of running the same query.\n\nThe lock is renewed while the query runs and expires this many\nmilliseconds after the PgDog holding it stops renewing it, e.g. when\nit dies. That's how long the others wait before running the query\nthemselves.\n\n`0` disables the lock: each PgDog only coalesces its own clients.\n\n_Default:_ `1000`",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "xfetch_beta": {
+          "description": "How eagerly hits refresh entries before they expire (XFetch).\n\nA hit refreshes its entry when `-compute_time * xfetch_beta * ln(rand)`\nreaches the entry's remaining TTL, so hot and slow queries are\nrecomputed by one client ahead of expiry instead of by every client\nafter it. Values above `1.0` refresh earlier, below later; `0` disables\nearly refresh.\n\n_Default:_ `1.0`",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         }
       },
       "additionalProperties": false
