@@ -12,7 +12,7 @@ use crate::{
 use super::prelude::*;
 
 /// SHOW SERVERS command.
-pub struct ShowServers {
+pub(crate) struct ShowServers {
     row: NamedRow,
 }
 
@@ -73,13 +73,13 @@ impl Command for ShowServers {
     }
 
     async fn execute(&self) -> Result<Vec<Message>, Error> {
-        let mut messages = vec![self.row.row_description().message()?];
+        let mut messages = vec![self.row.row_description().message()];
 
         let stats = stats();
         let now = Instant::now();
         let now_time = SystemTime::now();
 
-        for (_, server) in stats {
+        for server in stats {
             let age = now.duration_since(server.stats.created_at);
             let request_age = now.duration_since(server.stats.last_used);
             let request_time = now_time - request_age;
@@ -98,11 +98,8 @@ impl Command for ShowServers {
                     format_time(server.stats.created_at_time.into()),
                 )
                 .add("request_time", format_time(request_time.into()))
-                .add("remote_pid", server.stats.id.pid as i64)
-                .add(
-                    "client_id",
-                    server.stats.client_id.map(|client| client.pid as i64),
-                )
+                .add("remote_pid", server.stats.id)
+                .add("client_id", server.stats.client_id)
                 .add("transactions", server.stats.total.transactions)
                 .add("queries", server.stats.total.queries)
                 .add("rollbacks", server.stats.total.rollbacks)
@@ -122,7 +119,7 @@ impl Command for ShowServers {
                 .add("age", age.as_secs() as i64)
                 .add("application_name", server.application_name.as_str())
                 .data_row();
-            messages.push(dr.message()?);
+            messages.push(dr.message());
         }
 
         Ok(messages)

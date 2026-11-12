@@ -1,14 +1,31 @@
 use super::*;
 use parking_lot::RwLock;
-use std::time::Instant;
+use std::{fmt::Display, time::Instant};
 
 use tracing::{error, warn};
 
 /// Load balancer target ban.
 #[derive(Clone, Debug)]
-pub struct Ban {
+pub(crate) struct Ban {
     inner: Arc<RwLock<BanInner>>,
     pool: Pool,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum UnbanReason {
+    AllTargetsBanned,
+    Expired,
+    Manual,
+}
+
+impl Display for UnbanReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllTargetsBanned => write!(f, "all targets banned"),
+            Self::Expired => write!(f, "expired"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
 }
 
 impl Ban {
@@ -21,35 +38,71 @@ impl Ban {
     }
 
     /// Check if the database is banned.
-    pub fn banned(&self) -> bool {
+    pub(crate) fn banned(&self) -> bool {
         self.inner.read().ban.is_some()
     }
 
+    /// Carry manual ban over to the new ban state.
+    pub(crate) fn carry_manual_ban(&self, from: &Self) {
+        let ban = from
+            .inner
+            .read()
+            .ban
+            .as_ref()
+            .filter(|ban| ban.error == Error::ManualBan)
+            .cloned();
+        if let Some(ban) = ban {
+            self.inner.write().ban = Some(ban);
+        }
+    }
+
     /// Get ban error, if any.
-    pub fn error(&self) -> Option<Error> {
+    pub(crate) fn error(&self) -> Option<Error> {
         self.inner.read().ban.as_ref().map(|b| b.error)
     }
 
+    /// Time remaining before the ban expires.
+    ///
+    /// Returns `None` when the pool isn't banned or the ban is manual, since
+    /// manual bans never expire on their own.
+    pub(crate) fn time_remaining(&self, now: Instant) -> Option<Duration> {
+        self.inner.read().ban.as_ref().and_then(|ban| {
+            if ban.error == Error::ManualBan {
+                None
+            } else {
+                Some(
+                    ban.ban_timeout
+                        .saturating_sub(now.saturating_duration_since(ban.created_at)),
+                )
+            }
+        })
+    }
+
     /// Unban the database.
-    pub fn unban(&self, manual_check: bool) {
+    ///
+    /// FIXME(lev): `reason` seems like it should be
+    /// used as an operand but it's only used for logging.
+    /// We should unify methods and provide one public interface to this.
+    ///
+    pub(crate) fn unban(&self, manual_check: bool, reason: UnbanReason) {
         let mut guard = self.inner.upgradable_read();
         if let Some(ref ban) = guard.ban {
+            let mut unbanned = false;
             if ban.error != Error::ManualBan || !manual_check {
                 guard.with_upgraded(|guard| {
                     guard.ban = None;
                 });
+                unbanned = true;
             }
-            warn!("resuming read queries [{}]", self.pool.addr());
+
+            if unbanned {
+                warn!("resuming read queries: {} [{}]", reason, self.pool.addr());
+            }
         }
     }
 
-    /// Get reference to the connection pool.
-    pub fn pool(&self) -> &Pool {
-        &self.pool
-    }
-
     /// Ban the database for the ban_timeout duration.
-    pub fn ban(&self, error: Error, ban_timeout: Duration) -> bool {
+    pub(crate) fn ban(&self, error: Error, ban_timeout: Duration) -> bool {
         let created_at = Instant::now();
         let mut guard = self.inner.upgradable_read();
 
@@ -97,13 +150,17 @@ impl Ban {
         };
         drop(guard);
         if unbanned {
-            warn!("resuming read queries [{}]", self.pool.addr());
+            warn!(
+                "resuming read queries: {} [{}]",
+                UnbanReason::Expired,
+                self.pool.addr()
+            );
         }
         unbanned
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BanEntry {
     created_at: Instant,
     error: Error,
@@ -168,7 +225,7 @@ mod tests {
         let pool = Pool::new_test();
         let ban = Ban::new(&pool);
         ban.ban(Error::ServerError, Duration::from_secs(1));
-        ban.unban(false);
+        ban.unban(false, UnbanReason::Expired);
         assert!(!ban.banned());
         assert!(ban.error().is_none());
     }
@@ -178,7 +235,7 @@ mod tests {
         let pool = Pool::new_test();
         let ban = Ban::new(&pool);
         ban.ban(Error::ManualBan, Duration::from_secs(1));
-        ban.unban(true);
+        ban.unban(true, UnbanReason::Expired);
         assert!(ban.banned());
         assert_eq!(ban.error(), Some(Error::ManualBan));
     }
@@ -188,7 +245,7 @@ mod tests {
         let pool = Pool::new_test();
         let ban = Ban::new(&pool);
         ban.ban(Error::ServerError, Duration::from_secs(1));
-        ban.unban(true);
+        ban.unban(true, UnbanReason::Manual);
         assert!(!ban.banned());
         assert!(ban.error().is_none());
     }
@@ -230,7 +287,7 @@ mod tests {
     fn test_pool_reference() {
         let pool = Pool::new_test();
         let ban = Ban::new(&pool);
-        assert_eq!(ban.pool().id(), pool.id());
+        assert_eq!(ban.pool.id(), pool.id());
     }
 
     #[test]
@@ -286,7 +343,7 @@ mod tests {
 
         for _ in 0..100 {
             ban.ban(Error::ServerError, Duration::from_secs(1));
-            ban.unban(false);
+            ban.unban(false, UnbanReason::Expired);
         }
 
         h1.join().unwrap();
@@ -357,7 +414,7 @@ mod tests {
         for _ in 0..10 {
             assert!(ban.ban(Error::ServerError, Duration::from_secs(1)));
             assert!(ban.banned());
-            ban.unban(false);
+            ban.unban(false, UnbanReason::AllTargetsBanned);
             assert!(!ban.banned());
         }
     }

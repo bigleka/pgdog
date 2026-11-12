@@ -1,11 +1,23 @@
+mod benchmark_simd;
+mod distance_simd_rust;
+mod vector;
+
 use std::{collections::HashSet, str::from_utf8};
 
+use pgdog_config::{
+    FlexibleType, ShardedMappingConfig, ShardedMappingDeprecated, ShardedMappingKindDeprecated,
+    ShardedMappingList, ShardedMappingRange, ShardedTableConfig,
+};
 use rand::seq::SliceRandom;
 
 use crate::{
-    backend::server::test::test_server,
-    config::{FlexibleType, ShardedMapping, ShardedMappingKind},
-    net::{bind::Parameter, Bind, DataRow, Execute, FromBytes, Parse, Protocol, Query, Sync},
+    backend::{ShardingSchema, server::test::test_server},
+    config::DataType,
+    frontend::router::parser::Shard,
+    net::{
+        Bind, DataRow, Execute, FromBytes, Parse, Protocol, Query, Sync, bind::Parameter,
+        messages::Format,
+    },
 };
 
 use super::*;
@@ -29,9 +41,15 @@ async fn test_shard_varchar() {
     let mut queries = vec![
         Query::new("BEGIN"),
         Query::new("CREATE TABLE test_shard_varchar (c VARCHAR) PARTITION BY HASH(c)"),
-        Query::new("CREATE TABLE test_shard_varchar_0 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 0)"),
-        Query::new("CREATE TABLE test_shard_varchar_1 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 1)"),
-        Query::new("CREATE TABLE test_shard_varchar_2 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 2)"),
+        Query::new(
+            "CREATE TABLE test_shard_varchar_0 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 0)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_varchar_1 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 1)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_varchar_2 PARTITION OF test_shard_varchar FOR VALUES WITH (modulus 3, remainder 2)",
+        ),
     ];
     queries.extend(inserts);
 
@@ -78,11 +96,6 @@ async fn test_shard_varchar() {
 }
 
 fn assert_shard(val: &[u8], expected_shard: usize) {
-    let schema = ShardingSchema {
-        shards: 3,
-        ..Default::default()
-    };
-
     let table = ShardedTable {
         data_type: DataType::Varchar,
         ..Default::default()
@@ -91,8 +104,6 @@ fn assert_shard(val: &[u8], expected_shard: usize) {
     assert_eq!(varchar(val) as usize % 3, expected_shard);
 
     let s = from_utf8(val).unwrap();
-    let shard = shard_str(s, &schema, &vec![], 0);
-    assert_eq!(shard, Shard::Direct(expected_shard));
     let shard = shard_value(
         s,
         &crate::config::DataType::Varchar,
@@ -162,9 +173,15 @@ async fn test_shard_by_range() {
     let mut queries = vec![
         Query::new("BEGIN"),
         Query::new("CREATE TABLE test_shard_bigint_range (c BIGINT) PARTITION BY RANGE(c)"),
-        Query::new("CREATE TABLE test_shard_bigint_range_0 PARTITION OF test_shard_bigint_range FOR VALUES FROM (0) TO (33)"),
-        Query::new("CREATE TABLE test_shard_bigint_range_1 PARTITION OF test_shard_bigint_range FOR VALUES FROM (33) TO (66)"),
-        Query::new("CREATE TABLE test_shard_bigint_range_2 PARTITION OF test_shard_bigint_range FOR VALUES FROM (66) TO (99)"),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_range_0 PARTITION OF test_shard_bigint_range FOR VALUES FROM (0) TO (33)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_range_1 PARTITION OF test_shard_bigint_range FOR VALUES FROM (33) TO (66)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_range_2 PARTITION OF test_shard_bigint_range FOR VALUES FROM (66) TO (99)",
+        ),
     ];
     queries.extend(inserts);
 
@@ -173,13 +190,13 @@ async fn test_shard_by_range() {
     let table = ShardedTable {
         data_type: DataType::Bigint,
         mapping: Mapping::new(
-            &(0..3)
-                .map(|s| ShardedMapping {
-                    kind: ShardedMappingKind::Range,
-                    start: Some(FlexibleType::Integer(s * 33)),
-                    end: Some(FlexibleType::Integer((s + 1) * 33)),
-                    shard: s as usize,
-                    ..Default::default()
+            (0..3)
+                .map(|s| {
+                    ShardedMappingConfig::Range(ShardedMappingRange {
+                        start: Some(FlexibleType::Integer(s * 33)),
+                        end: Some(FlexibleType::Integer((s + 1) * 33)),
+                        shard: s as usize,
+                    })
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -220,9 +237,15 @@ async fn test_shard_by_list() {
     let mut queries = vec![
         Query::new("BEGIN"),
         Query::new("CREATE TABLE test_shard_bigint_list (c BIGINT) PARTITION BY LIST(c)"),
-        Query::new("CREATE TABLE test_shard_bigint_list_0 PARTITION OF test_shard_bigint_list FOR VALUES IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)"),
-        Query::new("CREATE TABLE test_shard_bigint_list_1 PARTITION OF test_shard_bigint_list FOR VALUES IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19)"),
-        Query::new("CREATE TABLE test_shard_bigint_list_2 PARTITION OF test_shard_bigint_list FOR VALUES IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29)"),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_list_0 PARTITION OF test_shard_bigint_list FOR VALUES IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_list_1 PARTITION OF test_shard_bigint_list FOR VALUES IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_bigint_list_2 PARTITION OF test_shard_bigint_list FOR VALUES IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29)",
+        ),
     ];
     queries.extend(inserts);
 
@@ -231,14 +254,14 @@ async fn test_shard_by_list() {
     let table = ShardedTable {
         data_type: DataType::Bigint,
         mapping: Mapping::new(
-            &(0..3)
-                .map(|s| ShardedMapping {
-                    kind: ShardedMappingKind::List,
-                    values: (s * 10..((s + 1) * 10))
-                        .map(FlexibleType::Integer)
-                        .collect::<HashSet<_>>(),
-                    shard: s as usize,
-                    ..Default::default()
+            (0..3)
+                .map(|s| {
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: (s * 10..((s + 1) * 10))
+                            .map(FlexibleType::Integer)
+                            .collect::<Vec<_>>(),
+                        shard: s as usize,
+                    })
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -302,15 +325,27 @@ async fn test_shard_by_uuid_list() {
         Query::new("CREATE TABLE test_shard_uuid_list (id UUID) PARTITION BY LIST(id)"),
         Query::new(format!(
             "CREATE TABLE test_shard_uuid_list_0 PARTITION OF test_shard_uuid_list FOR VALUES IN ({})",
-            shard_0_uuids.iter().map(|u| format!("'{}'", u)).collect::<Vec<_>>().join(", ")
+            shard_0_uuids
+                .iter()
+                .map(|u| format!("'{}'", u))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         Query::new(format!(
             "CREATE TABLE test_shard_uuid_list_1 PARTITION OF test_shard_uuid_list FOR VALUES IN ({})",
-            shard_1_uuids.iter().map(|u| format!("'{}'", u)).collect::<Vec<_>>().join(", ")
+            shard_1_uuids
+                .iter()
+                .map(|u| format!("'{}'", u))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         Query::new(format!(
             "CREATE TABLE test_shard_uuid_list_2 PARTITION OF test_shard_uuid_list FOR VALUES IN ({})",
-            shard_2_uuids.iter().map(|u| format!("'{}'", u)).collect::<Vec<_>>().join(", ")
+            shard_2_uuids
+                .iter()
+                .map(|u| format!("'{}'", u))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     ];
 
@@ -322,17 +357,17 @@ async fn test_shard_by_uuid_list() {
     let table = ShardedTable {
         data_type: DataType::Uuid,
         mapping: Mapping::new(
-            &uuid_sets
+            uuid_sets
                 .into_iter()
                 .enumerate()
-                .map(|(shard, uuids)| ShardedMapping {
-                    kind: ShardedMappingKind::List,
-                    values: uuids
-                        .into_iter()
-                        .map(FlexibleType::Uuid)
-                        .collect::<HashSet<_>>(),
-                    shard,
-                    ..Default::default()
+                .map(|(shard, uuids)| {
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: uuids
+                            .into_iter()
+                            .map(FlexibleType::Uuid)
+                            .collect::<Vec<_>>(),
+                        shard,
+                    })
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -369,9 +404,15 @@ async fn test_shard_by_list_with_default() {
     let queries = vec![
         Query::new("BEGIN"),
         Query::new("CREATE TABLE test_shard_list_default (c BIGINT) PARTITION BY LIST(c)"),
-        Query::new("CREATE TABLE test_shard_list_default_0 PARTITION OF test_shard_list_default FOR VALUES IN (0, 1, 2)"),
-        Query::new("CREATE TABLE test_shard_list_default_1 PARTITION OF test_shard_list_default FOR VALUES IN (10, 11, 12)"),
-        Query::new("CREATE TABLE test_shard_list_default_2 PARTITION OF test_shard_list_default DEFAULT"),
+        Query::new(
+            "CREATE TABLE test_shard_list_default_0 PARTITION OF test_shard_list_default FOR VALUES IN (0, 1, 2)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_list_default_1 PARTITION OF test_shard_list_default FOR VALUES IN (10, 11, 12)",
+        ),
+        Query::new(
+            "CREATE TABLE test_shard_list_default_2 PARTITION OF test_shard_list_default DEFAULT",
+        ),
     ];
     server.execute_batch(&queries).await.unwrap();
 
@@ -390,27 +431,19 @@ async fn test_shard_by_list_with_default() {
     // Create mapping with explicit lists and a default shard
     let table = ShardedTable {
         data_type: DataType::Bigint,
-        mapping: Mapping::new(&[
-            ShardedMapping {
-                kind: ShardedMappingKind::List,
+        mapping: Mapping::new(vec![
+            ShardedMappingConfig::List(ShardedMappingList {
                 values: [0, 1, 2].into_iter().map(FlexibleType::Integer).collect(),
                 shard: 0,
-                ..Default::default()
-            },
-            ShardedMapping {
-                kind: ShardedMappingKind::List,
+            }),
+            ShardedMappingConfig::List(ShardedMappingList {
                 values: [10, 11, 12]
                     .into_iter()
                     .map(FlexibleType::Integer)
                     .collect(),
                 shard: 1,
-                ..Default::default()
-            },
-            ShardedMapping {
-                kind: ShardedMappingKind::Default,
-                shard: 2,
-                ..Default::default()
-            },
+            }),
+            ShardedMappingConfig::Default { shard: 2 },
         ]),
         ..Default::default()
     };
@@ -466,4 +499,500 @@ async fn test_shard_by_list_with_default() {
     );
 
     server.execute("ROLLBACK").await.unwrap();
+}
+
+fn make_sharding_schema(
+    sharded_tables: Vec<ShardedTableConfig>,
+    sharded_mappings: Vec<ShardedMappingDeprecated>,
+) -> ShardingSchema {
+    use crate::backend::databases::from_config;
+    use crate::config::{Config, ConfigAndUsers, Database, Role, User, Users};
+    use std::path::PathBuf;
+
+    let config = Config {
+        databases: vec![
+            Database {
+                name: "db".into(),
+                host: "localhost".into(),
+                port: 5432,
+                role: Role::Primary,
+                shard: 0,
+                ..Default::default()
+            },
+            Database {
+                name: "db".into(),
+                host: "localhost".into(),
+                port: 5432,
+                role: Role::Primary,
+                shard: 1,
+                ..Default::default()
+            },
+        ],
+        sharded_tables,
+        sharded_mappings,
+        ..Default::default()
+    };
+    let users = Users {
+        users: vec![User {
+            name: "user".into(),
+            database: "db".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let databases = from_config(&ConfigAndUsers {
+        config,
+        users,
+        config_path: PathBuf::new(),
+        users_path: PathBuf::new(),
+        ..Default::default()
+    });
+    databases
+        .cluster(("user", "db"))
+        .unwrap()
+        .sharding_schema()
+        .clone()
+}
+
+fn route(schema: &ShardingSchema, table_name: &str, value: i64) -> Shard {
+    use crate::frontend::router::parser::Column;
+
+    let col = Column {
+        name: "id",
+        table: Some(table_name),
+        schema: None,
+    };
+
+    let t = schema
+        .tables()
+        .get_table(col)
+        .expect("table/column not found in schema");
+
+    ContextBuilder::new(t)
+        .data(value)
+        .shards(schema.shards)
+        .build()
+        .unwrap()
+        .apply()
+        .unwrap()
+}
+
+/// Tests for the deprecated top-level `sharded_mappings` config format.
+///
+/// This whole module can be dropped when `ShardedMappingDeprecated` support is
+/// removed.
+mod deprecated_mappings {
+    use super::*;
+
+    #[test]
+    fn test_same_tables_specific_and_mapping_specific() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("users".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                ..Default::default()
+            }],
+            vec![
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    table: Some("users".into()),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 0,
+                    ..Default::default()
+                },
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    table: Some("users".into()),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 1,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        for v in [1, 2, 3] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(0),
+                "id={v} should go to shard 0"
+            );
+        }
+        for v in [4, 5, 6] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(1),
+                "id={v} should go to shard 1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_different_tables_specific_and_mapping_specific() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("users".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                ..Default::default()
+            }],
+            vec![ShardedMappingDeprecated {
+                database: "db".into(),
+                column: "id".into(),
+                table: Some("orders".into()),
+                kind: ShardedMappingKindDeprecated::List,
+                values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                shard: 0,
+                ..Default::default()
+            }],
+        );
+
+        for v in [1i64, 2, 3, 4, 5, 6] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(bigint(v) as usize % 2),
+                "id={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tables_all_and_mapping_all() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                ..Default::default()
+            }],
+            vec![
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 0,
+                    ..Default::default()
+                },
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 1,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        for i in [1, 2, 3] {
+            assert_eq!(route(&schema, "users", i), Shard::Direct(0));
+            assert_eq!(route(&schema, "orders", i), Shard::Direct(0));
+        }
+
+        for i in [4, 5, 6] {
+            assert_eq!(route(&schema, "users", i), Shard::Direct(1));
+            assert_eq!(route(&schema, "orders", i), Shard::Direct(1));
+        }
+    }
+
+    #[test]
+    fn test_tables_specific_and_mapping_all() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("users".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                ..Default::default()
+            }],
+            vec![
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 0,
+                    ..Default::default()
+                },
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 1,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        assert!(
+            schema
+                .tables()
+                .tables()
+                .iter()
+                .next()
+                .unwrap()
+                .mapping
+                .is_none(),
+            "column-wide mapping must not apply to a named table"
+        );
+
+        for v in [1i64, 2, 3, 4, 5, 6] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(bigint(v) as usize % 2),
+                "id={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tables_all_and_mapping_specific() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                ..Default::default()
+            }],
+            vec![
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    table: Some("users".into()),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 0,
+                    ..Default::default()
+                },
+                ShardedMappingDeprecated {
+                    database: "db".into(),
+                    table: Some("users".into()),
+                    column: "id".into(),
+                    kind: ShardedMappingKindDeprecated::List,
+                    values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                    shard: 1,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        assert!(
+            schema
+                .tables()
+                .tables()
+                .iter()
+                .next()
+                .unwrap()
+                .mapping
+                .is_none(),
+            "table-specific mapping must not apply to a column-wide table"
+        );
+
+        for v in [1i64, 2, 3, 4, 5, 6] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(bigint(v) as usize % 2),
+                "id={v}"
+            );
+        }
+    }
+}
+
+mod mappings {
+    use super::*;
+
+    #[test]
+    fn test_inline_list_mapping_table_specific() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("users".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                mapping: Some(vec![
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 0,
+                    }),
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 1,
+                    }),
+                ]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        for v in [1, 2, 3] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(0),
+                "id={v} → shard 0"
+            );
+        }
+        for v in [4, 5, 6] {
+            assert_eq!(
+                route(&schema, "users", v),
+                Shard::Direct(1),
+                "id={v} → shard 1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_list_mapping_column_wide() {
+        // No table name: mapping applies to any table sharded on column "id".
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                mapping: Some(vec![
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [1, 2, 3].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 0,
+                    }),
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [4, 5, 6].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 1,
+                    }),
+                ]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        for v in [1, 2, 3] {
+            assert_eq!(route(&schema, "users", v), Shard::Direct(0));
+            assert_eq!(route(&schema, "orders", v), Shard::Direct(0));
+        }
+        for v in [4, 5, 6] {
+            assert_eq!(route(&schema, "users", v), Shard::Direct(1));
+            assert_eq!(route(&schema, "orders", v), Shard::Direct(1));
+        }
+    }
+
+    #[test]
+    fn test_inline_range_mapping_table_specific() {
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("orders".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                mapping: Some(
+                    (0..2)
+                        .map(|s| {
+                            ShardedMappingConfig::Range(ShardedMappingRange {
+                                start: Some(FlexibleType::Integer(s * 50)),
+                                end: Some(FlexibleType::Integer((s + 1) * 50)),
+                                shard: s as usize,
+                            })
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        // [0, 50) → shard 0; [50, 100) → shard 1
+        for v in [0, 25, 49] {
+            assert_eq!(
+                route(&schema, "orders", v),
+                Shard::Direct(0),
+                "id={v} → shard 0"
+            );
+        }
+        for v in [50, 75, 99] {
+            assert_eq!(
+                route(&schema, "orders", v),
+                Shard::Direct(1),
+                "id={v} → shard 1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_mapping_unmatched_value_routes_to_all() {
+        // Range mapping with no Default entry: a value outside every range has no
+        // home shard, so it must broadcast to all shards (Shard::All).
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("orders".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                mapping: Some(vec![
+                    ShardedMappingConfig::Range(ShardedMappingRange {
+                        start: Some(FlexibleType::Integer(0)),
+                        end: Some(FlexibleType::Integer(50)),
+                        shard: 0,
+                    }),
+                    ShardedMappingConfig::Range(ShardedMappingRange {
+                        start: Some(FlexibleType::Integer(50)),
+                        end: Some(FlexibleType::Integer(100)),
+                        shard: 1,
+                    }),
+                ]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        // In-range values still route directly.
+        assert_eq!(route(&schema, "orders", 25), Shard::Direct(0));
+        // Above the top range and below the bottom range fall through to all shards.
+        assert_eq!(
+            route(&schema, "orders", 1000),
+            Shard::All,
+            "above max → all"
+        );
+        assert_eq!(route(&schema, "orders", -1), Shard::All, "below min → all");
+    }
+
+    #[test]
+    fn test_inline_list_duplicate_value_last_wins() {
+        // A value present in two list entries is not rejected (uniqueness is not
+        // validated); Mapping::new folds entries into an IndexMap, so the LAST
+        // insertion wins. This pins that documented behavior.
+        let schema = make_sharding_schema(
+            vec![ShardedTableConfig {
+                database: "db".into(),
+                name: Some("users".into()),
+                column: "id".into(),
+                data_type: DataType::Bigint,
+                mapping: Some(vec![
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [1, 2].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 0,
+                    }),
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        values: [2].into_iter().map(FlexibleType::Integer).collect(),
+                        shard: 1,
+                    }),
+                ]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        // 1 appears only in the first entry.
+        assert_eq!(route(&schema, "users", 1), Shard::Direct(0));
+        // 2 appears in both; the last entry (shard 1) wins.
+        assert_eq!(
+            route(&schema, "users", 2),
+            Shard::Direct(1),
+            "duplicate value → last entry wins"
+        );
+    }
 }

@@ -1,36 +1,42 @@
 //! Prepared statements cache.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use tokio::{spawn, time::sleep};
-use tracing::debug;
 
 use crate::{
-    config::{config, PreparedStatements as PreparedStatementsLevel},
-    net::{Parse, ProtocolMessage},
+    config::PreparedStatementsLevel,
+    frontend::router::parser::rewrite::statement::{offset::OffsetPlan, plan::BindParams},
+    net::{Parse, Prepare, ProtocolMessage},
 };
 
-pub mod error;
-pub mod global_cache;
-pub mod rewrite;
+mod cache_key;
+mod cached_statement;
+pub(crate) mod error;
+pub(crate) mod global_cache;
+mod maintenance;
+mod prelude;
+pub(crate) mod rewrite;
+pub(crate) mod statement;
 
-pub use error::Error;
-pub use global_cache::GlobalCache;
-pub use rewrite::Rewrite;
+pub(crate) use cache_key::CacheKey;
+pub(crate) use cached_statement::global_name;
+pub(crate) use cached_statement::{CachedStmt, Counter};
+pub(crate) use error::Error;
+pub(crate) use global_cache::GlobalCache;
+// Maintenance tasks are spawned in main.rs.
+pub(crate) use maintenance::*;
+pub(crate) use rewrite::Rewrite;
+pub(crate) use statement::{PreparedPlan, Statement, StatementType};
 
 static CACHE: Lazy<PreparedStatements> = Lazy::new(PreparedStatements::default);
 
-/// Approximate memory used by a String.
-#[inline]
-fn str_mem(s: &str) -> usize {
-    s.len() + std::mem::size_of::<String>()
-}
-
 #[derive(Clone, Debug)]
-pub struct PreparedStatements {
+pub(crate) struct PreparedStatements {
     pub(super) global: Arc<RwLock<GlobalCache>>,
+    // mapping the client statement name -> __pgdog__ name from global cache
     pub(super) local: HashMap<String, String>,
     pub(super) level: PreparedStatementsLevel,
     pub(super) memory_used: usize,
@@ -48,93 +54,126 @@ impl Default for PreparedStatements {
 }
 
 impl PreparedStatements {
-    /// New shared prepared statements cache.
-    pub fn new() -> Self {
+    /// New shared prepared statements cache instance.
+    ///
+    /// Has access to the global cache singleton.
+    ///
+    pub(crate) fn new() -> Self {
         CACHE.clone()
     }
 
-    /// Get global cache.
-    pub fn global() -> Arc<RwLock<GlobalCache>> {
+    /// Get global prepared statements cache singleton.
+    pub(crate) fn global() -> Arc<RwLock<GlobalCache>> {
         Self::new().global.clone()
     }
 
-    /// Maybe rewrite message.
-    pub fn maybe_rewrite(&mut self, message: &mut ProtocolMessage) -> Result<(), Error> {
+    pub(crate) fn cross_shard_variant(name: &str, query: &str) -> Option<String> {
+        let cache = Self::global();
+        // Existing variants are the hot path; only creation needs the global
+        // write lock.
+        if let Some(variant) = cache.read().existing_cross_shard_variant_name(name) {
+            return Some(variant);
+        }
+
+        cache.write().cross_shard_variant(name, query)
+    }
+
+    /// Rewrite extended protocol messages to use global names. This allows multiple
+    /// clients to re-use the same statement prepared on a Postgres server.
+    ///
+    /// # Arguments
+    ///
+    /// * `message`: Any protocol message. Unsupported messages are not rewritten.
+    ///
+    pub(crate) fn maybe_rewrite(&mut self, message: &mut ProtocolMessage) -> Result<(), Error> {
         let mut rewrite = Rewrite::new(self);
         rewrite.rewrite(message)?;
         Ok(())
     }
 
-    /// Register prepared statement with the global cache.
-    pub fn insert(&mut self, parse: &mut Parse) {
+    /// Register prepared statement with the global cache and rewrite it
+    /// to use the globally unique name.
+    ///
+    /// # Arguments
+    ///
+    /// * `parse`: [`Parse`] message. It will be renamed in-place.
+    ///
+    pub(super) fn insert(&mut self, parse: &mut Parse) {
         let (_new, name) = { self.global.write().insert(parse) };
         let key = parse.name();
-        let existed = self.local.insert(key.to_owned(), name.clone());
 
-        // Client prepared it again because it got an error the first time.
-        // We can check if this is a new statement first, but this is an error
-        // condition which happens very infrequently, so we optimize for the happy path.
-        if let Some(old_value) = existed {
-            // Key already existed, only value changed.
-            self.memory_used = self.memory_used.saturating_sub(str_mem(&old_value));
-            self.memory_used += str_mem(&name);
-            self.global.write().decrement(&old_value);
-        } else {
-            // New entry.
-            self.memory_used += str_mem(key) + str_mem(&name);
-        }
+        self.insert_internal(key, &name);
 
-        parse.rename_fast(&name)
+        parse.rename(&name)
     }
 
-    /// Insert statement into the cache bypassing duplicate checks.
-    pub fn insert_anyway(&mut self, parse: &mut Parse) {
-        let name = { self.global.write().insert_anyway(parse) };
-        let key = parse.name();
-        let existed = self.local.insert(key.to_owned(), name.clone());
+    fn insert_internal(&mut self, local: &str, global: &str) {
+        let existed = self.local.insert(local.to_owned(), global.to_owned());
 
         if let Some(old_value) = existed {
             // Key already existed, only value changed.
             self.memory_used = self.memory_used.saturating_sub(str_mem(&old_value));
-            self.memory_used += str_mem(&name);
+            self.memory_used += str_mem(local);
+            self.global.write().close(&old_value);
         } else {
             // New entry.
-            self.memory_used += str_mem(key) + str_mem(&name);
+            self.memory_used += str_mem(local) + str_mem(global);
         }
-
-        parse.rename_fast(&name)
     }
 
-    /// Get global statement counter.
-    pub fn name(&self, name: &str) -> Option<&String> {
+    /// Insert PREPARE statement into the cache.
+    pub(in crate::frontend) fn insert_prepare(
+        &mut self,
+        name: &str,
+        original_query: Bytes,
+        rewritten_query: Option<Bytes>,
+        offset_plan: Option<OffsetPlan>,
+        bind_params: BindParams,
+    ) -> Prepare {
+        let (_new, prepare) = {
+            self.global.write().insert_prepare(
+                original_query,
+                rewritten_query,
+                offset_plan,
+                bind_params,
+            )
+        };
+
+        self.insert_internal(name, prepare.name());
+
+        prepare
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_test(&mut self, name: &str, original_query: Bytes) -> Prepare {
+        self.insert_prepare(name, original_query, None, None, Default::default())
+    }
+
+    /// Get the global unique name for a prepared statement
+    /// using the name the client gave us as key.
+    pub(crate) fn name(&self, name: &str) -> Option<&String> {
         self.local.get(name)
     }
 
-    /// Get globally-prepared statement by local name.
-    pub fn parse(&self, name: &str) -> Option<Parse> {
+    /// Get a globally unique `PreparedPlan` using the client name as key.
+    pub(crate) fn prepared_plan(&self, name: &str) -> Option<PreparedPlan> {
         self.local
             .get(name)
-            .and_then(|name| self.global.read().parse(name))
+            .and_then(|name| self.global.read().prepared_plan(name))
     }
 
-    /// Number of prepared statements in the local cache.
-    pub fn len_local(&self) -> usize {
+    /// Number of prepared statements in the client's cache.
+    pub(crate) fn num_statements(&self) -> usize {
         self.local.len()
     }
 
-    /// Current prepared statements compatibility level.
-    #[cfg(test)]
-    pub fn level(&self) -> PreparedStatementsLevel {
-        self.level
-    }
-
-    /// Is the local cache empty?
-    pub fn is_empty(&self) -> bool {
-        self.len_local() == 0
-    }
-
-    /// Remove prepared statement from local cache.
-    pub fn close(&mut self, name: &str) {
+    /// Remove prepared statement from client's cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`: Name of the prepared statement according to the client.
+    ///
+    pub(crate) fn close(&mut self, name: &str) {
         if let Some(global_name) = self.local.remove(name) {
             self.global.write().close(&global_name);
             self.memory_used = self
@@ -144,7 +183,10 @@ impl PreparedStatements {
     }
 
     /// Close all prepared statements on this client.
-    pub fn close_all(&mut self) {
+    ///
+    /// Called when the client disconnects or runs `DISCARD`. Updates
+    /// the global usage counters of all of the client's prepared statements.
+    pub(crate) fn close_all(&mut self) {
         if !self.local.is_empty() {
             let mut global = self.global.write();
 
@@ -157,41 +199,97 @@ impl PreparedStatements {
         self.memory_used = 0;
     }
 
-    /// How much memory is used, approx.
-    pub fn memory_used(&self) -> usize {
+    /// How much memory is used, approximately, by the prepared statements cache
+    /// for this client.
+    pub(crate) fn memory_used(&self) -> usize {
         self.memory_used
     }
 
     /// Set the prepared statements level.
-    pub fn set_level(&mut self, level: PreparedStatementsLevel) {
+    pub(crate) fn set_level(&mut self, level: PreparedStatementsLevel) {
         self.level = level;
     }
 }
 
-/// Run prepared statements maintenance task
-/// every second.
-pub fn start_maintenance() {
-    spawn(async move {
-        debug!("prepared statements cache maintenance started");
-        loop {
-            sleep(Duration::from_secs(1)).await;
-            run_maintenance();
-        }
-    });
-}
-
-/// Check prepared statements cache for overflows
-/// and remove any unused statements exceeding the limit.
-pub fn run_maintenance() {
-    let capacity = config().config.general.prepared_statements_limit;
-    PreparedStatements::global().write().close_unused(capacity);
+/// Approximate memory used by a String.
+fn str_mem(s: &str) -> usize {
+    s.len() + std::mem::size_of::<String>()
 }
 
 #[cfg(test)]
 mod test {
+
+    impl PreparedStatements {
+        /// Current prepared statements compatibility level.
+        pub(crate) fn level(&self) -> PreparedStatementsLevel {
+            self.level
+        }
+    }
+
+    use crate::backend::Server;
+    use crate::backend::server::test::{execute_prepared, prepared_in_postgres, test_server};
     use crate::net::messages::Bind;
 
     use super::*;
+
+    async fn prepared_names(server: &mut Server) -> Vec<String> {
+        prepared_in_postgres(server)
+            .await
+            .into_iter()
+            .map(|statement| statement.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_close_unused_does_not_reuse_names() {
+        let mut client = PreparedStatements::new();
+
+        let mut first = Parse::named("client_a", "SELECT $1::bigint");
+        client.insert(&mut first);
+        let first_name = first.name();
+
+        let mut server = test_server().await;
+        assert_eq!(execute_prepared(&mut server, first_name, b"1").await, [1]);
+        assert_eq!(prepared_names(&mut server).await, [first_name]);
+
+        client.close("client_a");
+        PreparedStatements::global().write().close_unused(0);
+        assert!(PreparedStatements::global().read().is_empty());
+
+        assert_eq!(prepared_names(&mut server).await, [first_name]);
+
+        let mut second = Parse::named("client_b", "SELECT $1::bigint + 100");
+        client.insert(&mut second);
+        let second_name = second.name();
+        assert_ne!(second_name, first_name);
+
+        assert_eq!(
+            execute_prepared(&mut server, second_name, b"1").await,
+            [101]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_unused_keeps_statements_clients_still_hold() {
+        let mut client = PreparedStatements::new();
+
+        let mut parse = Parse::named("client_a", "SELECT $1::bigint");
+        client.insert(&mut parse);
+        let name = parse.name();
+
+        let mut warm = test_server().await;
+        assert_eq!(execute_prepared(&mut warm, name, b"1").await, [1]);
+        assert_eq!(prepared_names(&mut warm).await, [name]);
+
+        PreparedStatements::global().write().close_unused(0);
+
+        assert_eq!(execute_prepared(&mut warm, name, b"1").await, [1]);
+
+        let mut cold = test_server().await;
+        assert!(prepared_names(&mut cold).await.is_empty());
+        assert_eq!(execute_prepared(&mut cold, name, b"1").await, [1]);
+        assert_eq!(prepared_names(&mut cold).await, [name]);
+    }
 
     #[test]
     fn test_maybe_rewrite() {
@@ -325,5 +423,21 @@ mod test {
         // The other two should have used=0.
         let unused = global.statements().values().filter(|s| s.used == 0).count();
         assert_eq!(unused, 2, "old statements should be unused");
+
+        let live = global
+            .statements()
+            .values()
+            .find(|stmt| stmt.used == 1)
+            .unwrap()
+            .name();
+        drop(global);
+
+        // Both replaced statements are evicted.
+        assert_eq!(statements.global.write().close_unused(0), 2);
+
+        // The statement the client still holds survives.
+        let global = statements.global.read();
+        assert_eq!(global.len(), 1);
+        assert!(global.names().contains_key(&live));
     }
 }

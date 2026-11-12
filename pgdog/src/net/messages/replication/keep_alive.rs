@@ -1,25 +1,18 @@
 use bytes::BytesMut;
 
-use crate::net::replication::ReplicationMeta;
-use crate::net::CopyData;
-
 use super::super::code;
 use super::super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct KeepAlive {
-    pub wal_end: i64,
-    pub system_clock: i64,
-    pub reply: u8,
+pub(crate) struct KeepAlive {
+    pub(crate) wal_end: u64,
+    pub(crate) system_clock: i64,
+    pub(crate) reply: u8,
 }
 
 impl KeepAlive {
-    pub fn wrapped(self) -> Result<CopyData, Error> {
-        Ok(CopyData::new(&ReplicationMeta::KeepAlive(self).to_bytes()?))
-    }
-
     /// Origin expects reply.
-    pub fn reply(&self) -> bool {
+    pub(crate) fn reply(&self) -> bool {
         self.reply == 1
     }
 }
@@ -28,7 +21,7 @@ impl FromBytes for KeepAlive {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
         code!(bytes, 'k');
         Ok(Self {
-            wal_end: bytes.get_i64(),
+            wal_end: bytes.get_u64(),
             system_clock: bytes.get_i64(),
             reply: bytes.get_u8(),
         })
@@ -36,20 +29,21 @@ impl FromBytes for KeepAlive {
 }
 
 impl ToBytes for KeepAlive {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = BytesMut::new();
         payload.put_u8(b'k');
-        payload.put_i64(self.wal_end);
+        payload.put_u64(self.wal_end);
         payload.put_i64(self.system_clock);
         payload.put_u8(self.reply);
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::{CopyData, replication::ReplicationMeta};
 
     #[test]
     fn keep_alive_roundtrip_and_reply_flag() {
@@ -61,7 +55,7 @@ mod tests {
 
         assert!(ka.reply());
 
-        let bytes = ka.to_bytes().expect("serialize keepalive");
+        let bytes = ka.to_bytes();
         let decoded = KeepAlive::from_bytes(bytes).expect("decode keepalive");
 
         assert_eq!(decoded.wal_end, 9876);
@@ -69,7 +63,7 @@ mod tests {
         assert_eq!(decoded.reply, 1);
         assert!(decoded.reply());
 
-        let wrapped = decoded.wrapped().expect("wrap keepalive copydata");
+        let wrapped = CopyData::new(&ReplicationMeta::KeepAlive(decoded).to_bytes());
         let meta = wrapped.replication_meta().expect("decode replication meta");
         matches!(meta, ReplicationMeta::KeepAlive(_))
             .then_some(())

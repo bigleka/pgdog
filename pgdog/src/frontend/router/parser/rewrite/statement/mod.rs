@@ -1,58 +1,65 @@
 //! Statement rewriter.
 
-use pg_query::protobuf::ParseResult;
-use pg_query::Node;
-use pgdog_config::QueryParserEngine;
-
 use crate::backend::schema::Schema;
-use crate::backend::ShardingSchema;
-use crate::frontend::router::parser::AstContext;
+use crate::config::config;
 use crate::frontend::PreparedStatements;
+use crate::frontend::router::parser::rewrite::statement::plan::{BindParam, BindParams};
 use crate::net::parameter::ParameterValue;
+use crate::{backend::ShardingSchema, frontend::client::QueryTimestamps};
+use pg_raw_parse::{Node, NodeMut, make, nodes, transform, walk};
 
-pub mod aggregate;
-pub mod auto_id;
-pub mod error;
-pub mod insert;
-pub mod offset;
-pub mod plan;
-pub mod simple_prepared;
-pub mod unique_id;
-pub mod update;
-pub mod visitor;
+pub(crate) mod aggregate;
+pub(crate) mod auto_id;
+pub(crate) mod error;
+mod having;
+pub(crate) mod insert;
+pub(crate) mod insert_split_plan;
+pub(crate) mod nextval;
+pub(crate) mod non_deterministic_funcs;
+pub(crate) mod offset;
+pub(crate) mod order_by;
+pub(crate) mod plan;
+pub(crate) mod projection;
+pub(crate) mod simple_prepared;
+pub(crate) mod subquery;
+pub(crate) mod unique_id;
+pub(crate) mod update;
 
-pub use error::Error;
-pub use insert::InsertSplit;
+pub(crate) use error::Error;
+pub(crate) use insert::InsertSplit;
+use pgdog_config::RewriteMode;
+//use pgdog_config::RewriteMode;
+pub(crate) use insert_split_plan::InsertSplitRewriteResult;
 pub(crate) use plan::RewritePlan;
-pub use simple_prepared::SimplePreparedResult;
+pub(crate) use simple_prepared::PrepareExecute;
 pub(crate) use update::*;
 
 /// Statement rewrite engine context.
 #[derive(Debug)]
-pub struct StatementRewriteContext<'a> {
-    /// The AST of the statement we are rewriting.
-    pub stmt: &'a mut ParseResult,
+pub(crate) struct StatementRewriteContext<'a> {
     /// The statement is using the extended protocol with placeholders.
-    pub extended: bool,
+    pub(crate) extended: bool,
     /// The statement is named, so we need to save any derivatives into the global
     /// statement cache.
-    pub prepared: bool,
+    pub(crate) prepared: bool,
     /// Reference to global prepared stmt cache.
-    pub prepared_statements: &'a mut PreparedStatements,
+    pub(crate) prepared_statements: &'a mut PreparedStatements,
     /// Sharding schema.
-    pub schema: &'a ShardingSchema,
+    pub(crate) schema: &'a ShardingSchema,
     /// Database schema with table/column info.
-    pub db_schema: &'a Schema,
+    pub(crate) db_schema: &'a Schema,
     /// User name for search_path resolution.
-    pub user: &'a str,
+    pub(crate) user: &'a str,
     /// Search path for table lookups.
-    pub search_path: Option<&'a ParameterValue>,
+    pub(crate) search_path: Option<&'a ParameterValue>,
+    /// Timezone for now() time generation for TIMEZONE columns.
+    pub(crate) timezone: Option<&'a ParameterValue>,
+    /// Statement, and transaction DateTime<Utc> relevant to the current Query (if not being cached)
+    pub(crate) query_timestamps: QueryTimestamps,
 }
 
 #[derive(Debug)]
-pub struct StatementRewrite<'a> {
-    /// SQL statement.
-    stmt: &'a mut ParseResult,
+pub(crate) struct StatementRewrite<'a> {
     /// The statement was rewritten.
     rewritten: bool,
     /// Statement is using the extended protocol, so
@@ -72,6 +79,10 @@ pub struct StatementRewrite<'a> {
     user: &'a str,
     /// Search path for table lookups.
     search_path: Option<&'a ParameterValue>,
+    /// Timezone for now() time generation for TIMEZONE columns.
+    timezone: Option<&'a ParameterValue>,
+    /// Statement, and transaction DateTime<Utc> relevant to the current Query (if not being cached)
+    query_timestamps: QueryTimestamps,
 }
 
 impl<'a> StatementRewrite<'a> {
@@ -79,9 +90,8 @@ impl<'a> StatementRewrite<'a> {
     ///
     /// More often than not, it won't do anything.
     ///
-    pub fn new(ctx: StatementRewriteContext<'a>) -> Self {
+    pub(crate) fn new(ctx: StatementRewriteContext<'a>) -> Self {
         Self {
-            stmt: ctx.stmt,
             rewritten: false,
             extended: ctx.extended,
             prepared: ctx.prepared,
@@ -90,68 +100,148 @@ impl<'a> StatementRewrite<'a> {
             db_schema: ctx.db_schema,
             user: ctx.user,
             search_path: ctx.search_path,
-        }
-    }
-
-    /// Create an AstContext from this rewriter's fields.
-    fn ast_context(&self) -> AstContext<'a> {
-        AstContext {
-            sharding_schema: self.schema.clone(),
-            db_schema: self.db_schema.clone(),
-            user: self.user,
-            search_path: self.search_path,
+            timezone: ctx.timezone,
+            query_timestamps: ctx.query_timestamps,
         }
     }
 
     /// Maybe rewrite the statement and produce a rewrite plan
     /// we can apply to Bind messages.
-    pub fn maybe_rewrite(&mut self) -> Result<RewritePlan, Error> {
-        let params = visitor::count_params(self.stmt);
-        let mut plan = RewritePlan {
-            params,
-            ..Default::default()
+    pub(crate) fn maybe_rewrite<'mem>(
+        &mut self,
+        mut stmt: nodes::RawStmtMut<'mem, '_>,
+        mem: make::MemoryToken<'mem>,
+    ) -> Result<RewritePlan, Error> {
+        let mut plan = RewritePlan::default();
+
+        let node = stmt.stmt();
+        let parameterized_stmt = match node {
+            Node::InsertStmt(_)
+            | Node::SelectStmt(_)
+            | Node::UpdateStmt(_)
+            | Node::DeleteStmt(_) => Some(node),
+            Node::PrepareStmt(prepare) => {
+                // Will use parameters for replacing args, not materialize values.
+                self.extended = true;
+                Some(prepare.query())
+            }
+            Node::ExecuteStmt(_) | Node::ExplainStmt(_) => None,
+            // We can't do anything with DDL statements
+            _ => return Ok(plan),
         };
 
-        // Handle top-level PREPARE/EXECUTE statements.
-        let prepared_result = self.rewrite_simple_prepared()?;
-        if prepared_result.rewritten {
-            self.rewritten = true;
-            plan.prepares = prepared_result.prepares;
+        let mut param_count = 0;
+        if let Some(parameterized_stmt) = parameterized_stmt {
+            walk::walk(parameterized_stmt, |node| {
+                if let Node::ParamRef(param) = node {
+                    param_count = param_count.max(param.number as u16)
+                }
+            });
         }
+        plan.bind_params = BindParams::Original { param_count };
 
         // Inject pgdog.unique_id() for missing BIGINT primary keys.
         // This must run BEFORE the unique_id rewriter so the injected
         // function calls get processed.
-        self.inject_auto_id(&mut plan)?;
-
-        // Track the next parameter number to use
-        let mut next_param = plan.params as i32 + 1;
-
-        // if self.schema.rewrite.enabled {
-        let extended = self.extended;
-        visitor::visit_and_mutate_nodes(self.stmt, |node| -> Result<Option<Node>, Error> {
-            match Self::rewrite_unique_id(node, extended, &mut next_param)? {
-                Some(replacement) => {
-                    plan.unique_ids += 1;
-                    self.rewritten = true;
-                    Ok(Some(replacement))
-                }
-                None => Ok(None),
+        match stmt.stmt_mut() {
+            NodeMut::InsertStmt(insert) => {
+                self.inject_auto_id(insert, mem)?;
             }
-        })?;
-
-        self.rewrite_aggregates(&mut plan)?;
-        self.limit_offset(&mut plan)?;
-
-        if self.rewritten {
-            plan.stmt = Some(match self.schema.query_parser_engine {
-                QueryParserEngine::PgQueryProtobuf => self.stmt.deparse(),
-                QueryParserEngine::PgQueryRaw => self.stmt.deparse_raw(),
-            }?);
+            NodeMut::PrepareStmt(mut prepare) => {
+                if let NodeMut::InsertStmt(insert) = prepare.query_mut() {
+                    self.inject_auto_id(insert, mem)?;
+                }
+            }
+            _ => {}
         }
 
-        self.split_insert(&mut plan)?;
-        self.sharding_key_update(&mut plan)?;
+        // Track the next parameter number to use
+        let mut err = None;
+        transform::transform_node(
+            stmt.stmt_mut(),
+            &mut transform::TransformClosure::new(|node| match node.as_ref() {
+                Node::FuncCall(func) if Self::is_unique_id(func) => {
+                    match Self::unique_id_value(mem, self.extended, &mut plan.bind_params) {
+                        Ok(replacement) => {
+                            self.rewritten = true;
+                            node.replace(replacement);
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                        }
+                    }
+                    None
+                }
+                node_ref
+                    if let Some(replacement) =
+                        self.rewrite_sequence(node_ref, mem, &mut plan.bind_params) =>
+                {
+                    node.replace(replacement);
+                    None
+                }
+                _ => Some(node),
+            }),
+        );
+        if let Some(err) = err {
+            return Err(err);
+        }
+
+        if let NodeMut::SelectStmt(select) = stmt.stmt_mut() {
+            self.limit_offset(&select, &mut plan);
+        }
+
+        let nd_function_rewrite = !matches!(
+            config().config.rewrite.non_deterministic_functions,
+            RewriteMode::Ignore
+        );
+
+        if nd_function_rewrite {
+            match stmt.stmt_mut() {
+                NodeMut::InsertStmt(_)
+                | NodeMut::SelectStmt(_)
+                | NodeMut::UpdateStmt(_)
+                | NodeMut::DeleteStmt(_) => {
+                    self.rewrite_nd_functions(stmt.stmt_mut(), mem, &mut plan.bind_params)?;
+                }
+                NodeMut::PrepareStmt(mut prepare) => {
+                    if matches!(
+                        prepare.query_mut(),
+                        NodeMut::InsertStmt(_)
+                            | NodeMut::SelectStmt(_)
+                            | NodeMut::UpdateStmt(_)
+                            | NodeMut::DeleteStmt(_)
+                    ) {
+                        self.rewrite_nd_functions(prepare.query_mut(), mem, &mut plan.bind_params)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle top-level PREPARE/EXECUTE statements.
+        let prepared_result =
+            self.rewrite_simple_prepared(stmt.stmt_mut(), mem, &mut plan, nd_function_rewrite)?;
+        if prepared_result.rewritten {
+            self.rewritten = true;
+            plan.prepare_rewrites = prepared_result.rewrites;
+        }
+
+        if self.rewritten {
+            plan.stmt = Some(pg_raw_parse::deparse(&*stmt)?.as_str().to_owned());
+        }
+
+        if let Node::InsertStmt(insert) = stmt.stmt() {
+            self.split_insert(insert, &mut plan)?;
+        }
+
+        // Handle planning subqueries
+        if config().config.rewrite.subqueries == RewriteMode::Rewrite {
+            plan.subquery = self.plan_subquery(stmt.stmt())?;
+        }
+
+        if let Node::UpdateStmt(stmt) = stmt.stmt() {
+            self.sharding_key_update(stmt, &mut plan)?;
+        }
 
         Ok(plan)
     }

@@ -6,30 +6,39 @@ use super::rewrite::statement::Error as RewriteError;
 use crate::frontend::router::sharding;
 
 #[derive(Debug, Error)]
-pub enum Error {
-    #[error("{0}")]
-    PgQuery(pg_query::Error),
+pub(crate) enum Error {
+    #[error("Error parsing query: {0}")]
+    Parse(#[from] pg_raw_parse::Error),
 
-    #[error("only CSV is supported for sharded copy")]
-    OnlyCsv,
+    // Technically, the user is not aware that we hash the IDs to shards,
+    // and thus might be confused by this message.
+    //
+    // A better message could advise them to use a singular advisory lock
+    // per query. However, that's not necessarily the limitation at hand...
+    //
+    // We could also tell them the algorithm used internally in the docs.
+    // Or, perhaps, make it configurable to an extent, e.g., with what we
+    // do with sharding keys (mapping specific lock IDs to specific shards)
+    #[error("the advisory locks in this query resolve to different shards")]
+    CrossShardAdvisoryLockAttempt,
 
     #[error("no sharding column in CSV")]
     NoShardingColumn,
+
+    #[error("cannot translate a binary sharding key of this data type through a lookup")]
+    LookupBinaryCopy,
+
+    #[error("sharding key lookup failed: {0}")]
+    Lookup(String),
+
+    #[error("cannot write to an omnisharded table with a shard directive")]
+    OmniWriteWithDirective,
 
     #[error("{0}")]
     Net(#[from] crate::net::Error),
 
     #[error("empty query")]
     EmptyQuery,
-
-    #[error("not in sync")]
-    NotInSync,
-
-    #[error("no query in buffer")]
-    NoQueryInBuffer,
-
-    #[error("copy out of sync")]
-    CopyOutOfSync,
 
     #[error("exceeded maximum number of rows in CSV parser")]
     MaxCsvParserRows,
@@ -43,9 +52,6 @@ pub enum Error {
     #[error("unexpected header extension")]
     BinaryHeaderExtension,
 
-    #[error("set shard syntax error")]
-    SetShard,
-
     #[error("no multi tenant id")]
     MultiTenantId,
 
@@ -55,14 +61,14 @@ pub enum Error {
     #[error("missing parameter: ${0}")]
     MissingParameter(usize),
 
+    #[error("expected parameter ${0} to be an integer, got \'{1}\' instead")]
+    ParameterNotInteger(usize, String),
+
     #[error("column has no associated table")]
     ColumnNoTable,
 
     #[error("query is blocked by plugin \"{0}\"")]
     BlockedByPlugin(String),
-
-    #[error("this command requires a transaction")]
-    RequiresTransaction,
 
     #[error("two-phase transaction control statements are not allowed when two-phase is enabled")]
     NoTwoPc,
@@ -73,20 +79,11 @@ pub enum Error {
     #[error("cross-shard truncate not supported when schema-sharding is used")]
     CrossShardTruncateSchemaSharding,
 
-    #[error("prepared statement \"{0}\" doesn't exist")]
-    PreparedStatementDoesntExist(String),
-
     #[error("column decode error")]
     ColumnDecode,
 
     #[error("table decode error")]
     TableDecode,
-
-    #[error("parameter ${0} not in bind")]
-    BindParameterMissing(i32),
-
-    #[error("statement is not a SELECT")]
-    NotASelect,
 
     #[error("rewrite: {0}")]
     Rewrite(#[from] RewriteError),
@@ -96,4 +93,19 @@ pub enum Error {
 
     #[error("multi-statement queries cannot mix SET with other commands")]
     MultiStatementMixedSet,
+
+    #[error("unsupported SET statement kind: {0}")]
+    UnsupportedSetKind(u32),
+
+    #[error("multi-query statement cannot be safely executed")]
+    MultiStatementSafety,
+
+    #[error("unmapped sharding key was specified")]
+    UnmappedShardKey(String),
+
+    #[error("execute requires prepared statements to be set to full")]
+    ExecuteRequiresFull,
+
+    #[error("unknown DISCARD target: {0}")]
+    UnknownDiscardTarget(u32),
 }

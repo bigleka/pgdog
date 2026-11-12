@@ -4,12 +4,13 @@ pub mod lock;
 pub mod redis;
 pub mod singleflight;
 pub mod statements;
+pub mod tables;
 pub mod ttl;
 pub mod xfetch;
 
 use std::{borrow::Cow, time::Duration};
 
-use crate::frontend::router::parser::OwnedTable;
+use self::tables::OwnedTable;
 use crate::frontend::ClientRequest;
 use crate::net::{ProtocolMessage, ToBytes};
 
@@ -69,7 +70,7 @@ impl CacheableRequest {
         if client_request
             .ast
             .as_ref()
-            .is_some_and(|ast| !statements::only_reads(ast.parse_result()))
+            .is_some_and(|ast| !statements::only_reads(ast))
         {
             return None;
         }
@@ -82,7 +83,7 @@ impl CacheableRequest {
         let tables = client_request
             .ast
             .as_ref()
-            .map(|ast| ast.tables().into_iter().map(|t| t.to_owned()).collect())
+            .map(|ast| tables::tables(ast))
             .unwrap_or_default();
 
         Some(Self {
@@ -151,7 +152,7 @@ fn variant(messages: &[ProtocolMessage]) -> Option<Vec<u8>> {
     // Formats and values, not statement names: they're the client's.
     let mut bind = bind.clone();
     bind.rename("");
-    variant.extend_from_slice(&bind.to_bytes().ok()?);
+    variant.extend_from_slice(&bind.to_bytes());
     Some(variant)
 }
 

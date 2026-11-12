@@ -4,11 +4,11 @@ use super::super::super::code;
 use super::super::super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct Commit {
-    pub flags: i8,
-    pub commit_lsn: i64,
-    pub end_lsn: i64,
-    pub commit_timestamp: i64,
+pub(crate) struct Commit {
+    pub(crate) flags: i8,
+    pub(crate) commit_lsn: u64,
+    pub(crate) end_lsn: u64,
+    pub(crate) commit_timestamp: i64,
 }
 
 impl FromBytes for Commit {
@@ -16,23 +16,23 @@ impl FromBytes for Commit {
         code!(bytes, 'C');
         Ok(Self {
             flags: bytes.get_i8(),
-            commit_lsn: bytes.get_i64(),
-            end_lsn: bytes.get_i64(),
+            commit_lsn: bytes.get_u64(),
+            end_lsn: bytes.get_u64(),
             commit_timestamp: bytes.get_i64(),
         })
     }
 }
 
 impl ToBytes for Commit {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::new();
         bytes.put_u8(self.code() as u8);
         bytes.put_i8(self.flags);
-        bytes.put_i64(self.commit_lsn);
-        bytes.put_i64(self.end_lsn);
+        bytes.put_u64(self.commit_lsn);
+        bytes.put_u64(self.end_lsn);
         bytes.put_i64(self.commit_timestamp);
 
-        Ok(bytes.freeze())
+        bytes.freeze()
     }
 }
 

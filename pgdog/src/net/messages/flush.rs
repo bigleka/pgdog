@@ -5,7 +5,7 @@ use super::prelude::*;
 
 /// Flush (F) message.
 #[derive(Debug)]
-pub struct Flush;
+pub(crate) struct Flush;
 
 impl FromBytes for Flush {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
@@ -17,9 +17,9 @@ impl FromBytes for Flush {
 }
 
 impl ToBytes for Flush {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let payload = Payload::named(self.code());
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 

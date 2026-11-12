@@ -24,13 +24,7 @@ CREATE TABLE IF NOT EXISTS copy_data.orders (
     refunded_at TIMESTAMPTZ
 );
 
--- TODO: remove the surrogate `id` column once pgdog supports replicating tables
--- that have no primary key and no `REPLICA IDENTITY USING INDEX`. Without a PK
--- (or unique index promoted via REPLICA IDENTITY USING INDEX), no column carries
--- the replica identity flag, Table::valid() fails with NoIdentityColumns, and the
--- table is rejected before the copy starts. See docs/FIX_ISSUE_914.md, Fix 2.
 CREATE TABLE IF NOT EXISTS copy_data.order_items (
-    id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL,
     tenant_id BIGINT NOT NULL,
     order_id BIGINT NOT NULL REFERENCES copy_data.orders(id),
@@ -39,12 +33,20 @@ CREATE TABLE IF NOT EXISTS copy_data.order_items (
     refunded_at TIMESTAMPTZ
 );
 
+-- No primary key: replica identity is carried by all columns.
+ALTER TABLE copy_data.order_items REPLICA IDENTITY FULL;
+
 CREATE TABLE IF NOT EXISTS copy_data.log_actions(
     id BIGSERIAL PRIMARY KEY,
     tenant_id BIGINT,
+    user_id BIGINT,
     action VARCHAR,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT log_actions_user_fk FOREIGN KEY (user_id, tenant_id)
+        REFERENCES copy_data.users (id, tenant_id)
 );
+
+CREATE INDEX log_actions_user_idx ON copy_data.log_actions (user_id, tenant_id);
 
 CREATE TABLE copy_data.with_identity(
     id BIGINT PRIMARY KEY GENERATED ALWAYS AS identity,
@@ -96,18 +98,18 @@ SELECT
                     END,
         'notifications', (random() > 0.5)
     ) AS settings
-FROM generate_series(1, 10000) AS gs(id);
+FROM generate_series(1, 100000) AS gs(id);
 
 
 WITH u AS (
-  -- Pull the 10k users we inserted earlier
+  -- Pull the 100k users we inserted earlier
   SELECT id AS user_id, tenant_id
   FROM copy_data.users
-  WHERE id BETWEEN 1 AND 10000
+  WHERE id BETWEEN 1 AND 100000
   ORDER BY id
 ),
 orders_base AS (
-  -- One order per user (10k orders), deterministic order_id = user_id
+  -- One order per user (100k orders), deterministic order_id = user_id
   SELECT
       u.user_id AS order_id,
       u.user_id,
@@ -157,7 +159,7 @@ order_totals AS (
 ins_orders AS (
   INSERT INTO copy_data.orders (id, user_id, tenant_id, amount, created_at, refunded_at)
   SELECT
-      ot.order_id,        -- id = user_id = 1..10000
+      ot.order_id,        -- id = user_id = 1..100000
       ot.user_id,
       ot.tenant_id,
       ot.order_amount,
@@ -182,11 +184,16 @@ SELECT
     (ARRAY['login', 'logout', 'click', 'purchase', 'view', 'error'])[
         floor(random() * 6 + 1)::int
     ] AS action
-FROM generate_series(1, 10000);
+FROM generate_series(1, 100000);
+
+INSERT INTO copy_data.log_actions (tenant_id, user_id, action)
+SELECT tenant_id, id, 'fk_seed'
+FROM copy_data.users
+WHERE id <= 100;
 
 
 INSERT INTO copy_data.with_identity (tenant_id)
-SELECT floor(random() * 10000)::bigint FROM generate_series(1, 10000);
+SELECT floor(random() * 10000)::bigint FROM generate_series(1, 100000);
 
 INSERT INTO copy_data.countries (code, name) VALUES
     ('US', 'United States'), ('GB', 'United Kingdom'), ('DE', 'Germany'),
@@ -204,3 +211,106 @@ INSERT INTO copy_data.categories (name, parent_id) VALUES
     ('Home & Garden', NULL), ('Sports', NULL);
 INSERT INTO copy_data.categories (name, parent_id) VALUES
     ('Phones', 1), ('Laptops', 1), ('Shirts', 2), ('Pants', 2), ('Fiction', 3);
+
+
+-- Table used to verify unchanged-TOAST replication.
+--
+-- `body` is forced to out-of-line EXTERNAL storage so that any UPDATE which
+-- does not touch `body` will emit a 'u' marker for that column in the logical
+-- replication stream. The replication subscriber must NOT write an empty string
+-- into `body` when it sees that marker — it must issue a filtered UPDATE that
+-- skips `body` entirely.
+CREATE TABLE IF NOT EXISTS copy_data.posts (
+    id        BIGINT PRIMARY KEY,
+    tenant_id BIGINT NOT NULL,
+    title     TEXT NOT NULL,
+    body      TEXT NOT NULL
+);
+
+ALTER TABLE copy_data.posts ALTER COLUMN body SET STORAGE EXTERNAL;
+
+INSERT INTO copy_data.posts (id, tenant_id, title, body)
+SELECT
+    gs.id,
+    ((gs.id - 1) % 20) + 1,
+    format('title_%s', gs.id),
+    -- ~32 KB per row: large enough to guarantee out-of-line TOAST storage.
+    repeat(md5(gs.id::text), 1024)
+FROM generate_series(1, 50) AS gs(id);
+
+
+-- Sharded table with no primary key and REPLICA IDENTITY FULL.
+-- Rows are uniquely identifiable by (tenant_id, seq) for controlled UPDATE/DELETE testing.
+-- seq 1..50 will be UPDATEd (label set to 'updated_N'); seq 51..100 will be DELETEd.
+--
+-- `body` is forced to EXTERNAL storage so that the seq 1..50 UPDATE (which only
+-- changes `label`) produces 'u' in NEW for `body`, exercising the subscriber
+-- slow-path. PG materialises OLD fully inline (toast_flatten_tuple) so OLD carries
+-- all 4 columns; NEW carries 3 present + 1 'u'. The slow path must bind only the 3
+-- present columns (not all 4 from OLD) or PG rejects with a param-count mismatch.
+CREATE TABLE IF NOT EXISTS copy_data.full_identity_events (
+    tenant_id BIGINT  NOT NULL,
+    seq       INT     NOT NULL,
+    label     VARCHAR NOT NULL,
+    body      TEXT    NOT NULL
+);
+
+ALTER TABLE copy_data.full_identity_events REPLICA IDENTITY FULL;
+-- Force out-of-line storage: any UPDATE that leaves `body` unchanged emits 'u' in NEW.
+ALTER TABLE copy_data.full_identity_events ALTER COLUMN body SET STORAGE EXTERNAL;
+
+INSERT INTO copy_data.full_identity_events (tenant_id, seq, label, body)
+SELECT
+    ((gs.id - 1) % 10) + 1         AS tenant_id,
+    gs.id                           AS seq,
+    'event_' || gs.id               AS label,
+    repeat(md5(gs.id::text), 1024)  AS body  -- ~32 KB per row
+FROM generate_series(1, 100) AS gs(id);
+
+-- Two identical rows for the duplicate-row ctid test.
+-- seq=200 is outside the 1..100 range used by the UPDATE/DELETE DML.
+-- Both rows are byte-for-byte identical; one WAL UPDATE must change exactly one.
+INSERT INTO copy_data.full_identity_events (tenant_id, seq, label, body) VALUES
+    (1, 200, 'dup_label', repeat(md5('dup_label'), 1024)),
+    (1, 200, 'dup_label', repeat(md5('dup_label'), 1024));
+
+-- One replication sentinel per destination shard. Keys 1 and 3 route to different
+-- shards; observing one shard's marker cannot establish progress on the other.
+INSERT INTO copy_data.full_identity_events (tenant_id, seq, label, body) VALUES
+    (1, 999, 'sentinel', repeat(md5('sentinel'), 1024)),
+    (3, 998, 'sentinel', repeat(md5('sentinel'), 1024));
+
+-- Omni (non-sharded) table with REPLICA IDENTITY FULL.
+-- 'click' row will be UPDATEd (label set to 'Click Updated') during the test run.
+CREATE TABLE IF NOT EXISTS copy_data.event_types (
+    code        VARCHAR NOT NULL,
+    label       VARCHAR NOT NULL,
+    description TEXT
+);
+
+CREATE UNIQUE INDEX ON copy_data.event_types (code);
+ALTER TABLE copy_data.event_types REPLICA IDENTITY FULL;
+
+INSERT INTO copy_data.event_types (code, label, description) VALUES
+    ('click',    'Click',    'User clicked an element'),
+    ('view',     'View',     'User viewed a page'),
+    ('purchase', 'Purchase', 'User made a purchase'),
+    ('login',    'Login',    'User logged in'),
+    ('logout',   'Logout',   'User logged out'),
+    -- NULL description: exercises IS NOT DISTINCT FROM NULL in the FULL identity WHERE clause.
+    -- A plain = predicate would silently skip this row on UPDATE/DELETE.
+    ('null_desc', 'Null Description', NULL);
+
+CREATE TABLE copy_data.index_identity_events (
+    code TEXT NOT NULL,
+    label TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX index_identity_events_code_idx
+    ON copy_data.index_identity_events (code);
+ALTER TABLE copy_data.index_identity_events
+    REPLICA IDENTITY USING INDEX index_identity_events_code_idx;
+
+INSERT INTO copy_data.index_identity_events (code, label) VALUES
+    ('original', 'Original'),
+    ('removed', 'Removed');

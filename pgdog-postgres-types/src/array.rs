@@ -5,43 +5,35 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use super::{Error, Format};
 use crate::{DataType, Datum};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Array {
-    elements: Vec<Option<Datum>>,
-    element_oid: i32,
+    elements: Vec<Datum>,
+    pub(crate) element_oid: i32,
     dim: Dimension,
 }
 
-impl PartialEq for Array {
-    fn eq(&self, other: &Self) -> bool {
-        self.elements == other.elements
-            && self.element_oid == other.element_oid
-            && self.dim == other.dim
-    }
-}
-
-impl Eq for Array {}
-
 impl PartialOrd for Array {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+        for (left, right) in self.elements.iter().zip(&other.elements) {
+            // PostgreSQL orders NULL array elements after all non-NULL elements.
+            let ordering = match (left, right) {
+                (Datum::Null, Datum::Null) => Ordering::Equal,
+                (Datum::Null, _) => Ordering::Greater,
+                (_, Datum::Null) => Ordering::Less,
+                _ => left.partial_cmp(right)?,
+            };
+            if ordering != Ordering::Equal {
+                return Some(ordering);
+            }
+        }
 
-impl Ord for Array {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.elements
-            .cmp(&other.elements)
-            .then(self.element_oid.cmp(&other.element_oid))
-            .then(self.dim.cmp(&other.dim))
-    }
-}
-
-impl std::hash::Hash for Array {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.elements.hash(state);
-        self.element_oid.hash(state);
-        self.dim.hash(state);
+        Some(
+            self.elements
+                .len()
+                .cmp(&other.elements.len())
+                .then_with(|| self.element_oid.cmp(&other.element_oid))
+                .then_with(|| self.dim.cmp(&other.dim)),
+        )
     }
 }
 
@@ -111,8 +103,8 @@ impl Array {
                 result.push(',');
             }
             match element {
-                None => result.push_str("NULL"),
-                Some(datum) => {
+                Datum::Null => result.push_str("NULL"),
+                datum => {
                     let encoded = datum.encode(Format::Text)?;
                     let text = std::str::from_utf8(&encoded)?;
                     if needs_quoting(text) {
@@ -141,7 +133,7 @@ impl Array {
         // Non-default bounds need ndims=1 + size=0 to preserve the bounds.
         let has_dim = !self.elements.is_empty() || self.dim.lower_bound != 1;
         let dims = if has_dim { 1i32 } else { 0 };
-        let has_nulls = self.elements.iter().any(|e| e.is_none());
+        let has_nulls = self.elements.iter().any(|e| e.is_null());
         buf.put_i32(dims);
         buf.put_i32(if has_nulls { 1 } else { 0 });
         buf.put_i32(self.element_oid);
@@ -151,8 +143,8 @@ impl Array {
         }
         for element in &self.elements {
             match element {
-                None => buf.put_i32(-1),
-                Some(datum) => {
+                Datum::Null => buf.put_i32(-1),
+                datum => {
                     let encoded = datum.encode(Format::Binary)?;
                     buf.put_i32(encoded.len() as i32);
                     buf.extend_from_slice(&encoded);
@@ -265,7 +257,7 @@ fn decode_text(input: &str, element_oid: i32) -> Result<Array, Error> {
                     }
                 }
                 let datum = Datum::new(elem.as_bytes(), element_type, Format::Text, false)?;
-                elements.push(Some(datum));
+                elements.push(datum);
             }
             Some(_) => {
                 let mut elem = String::new();
@@ -295,18 +287,18 @@ fn decode_text(input: &str, element_oid: i32) -> Result<Array, Error> {
                         return Err(Error::UnexpectedPayload);
                     }
                     let datum = Datum::new(elem.as_bytes(), element_type, Format::Text, false)?;
-                    elements.push(Some(datum));
+                    elements.push(datum);
                 } else {
                     let trimmed = elem.trim_end_matches(|c: char| c.is_ascii_whitespace());
                     if trimmed.is_empty() {
                         return Err(Error::UnexpectedPayload);
                     }
                     if trimmed.eq_ignore_ascii_case("NULL") {
-                        elements.push(None);
+                        elements.push(Datum::Null);
                     } else {
                         let datum =
                             Datum::new(trimmed.as_bytes(), element_type, Format::Text, false)?;
-                        elements.push(Some(datum));
+                        elements.push(datum);
                     }
                 }
             }
@@ -400,7 +392,7 @@ fn decode_binary(bytes: &[u8], expected_element_oid: i32) -> Result<Array, Error
         }
         let len = bytes.get_i32();
         if len == -1 {
-            elements.push(None);
+            elements.push(Datum::Null);
         } else if len < 0 {
             return Err(Error::UnexpectedPayload);
         } else {
@@ -409,7 +401,7 @@ fn decode_binary(bytes: &[u8], expected_element_oid: i32) -> Result<Array, Error
             }
             let element_bytes = bytes.split_to(len as usize);
             let datum = Datum::new(&element_bytes, element_type, Format::Binary, false)?;
-            elements.push(Some(datum));
+            elements.push(datum);
         }
     }
 
@@ -429,11 +421,50 @@ mod tests {
     use super::*;
     use crate::ToDataRowColumn;
 
+    #[test]
+    fn test_array_null_element_ordering() {
+        let ordered = [
+            "{}",
+            "{1}",
+            "{1,2}",
+            "{1,NULL}",
+            "{2}",
+            "{NULL}",
+            "[0:1]={NULL,1}",
+            "{NULL,1}",
+            "{NULL,2}",
+            "{NULL,NULL}",
+        ];
+        for format in [Format::Text, Format::Binary] {
+            let arrays: Vec<_> = ordered
+                .iter()
+                .map(|text| {
+                    let array = Array::decode_typed(text.as_bytes(), Format::Text, 23)
+                        .expect("valid integer array");
+                    let encoded = array.encode(format).expect("array encoding");
+                    Array::decode_typed(&encoded, format, 23).expect("array decoding")
+                })
+                .collect();
+            for (left_index, left) in arrays.iter().enumerate() {
+                for (right_index, right) in arrays.iter().enumerate() {
+                    assert_eq!(
+                        left.partial_cmp(right),
+                        Some(left_index.cmp(&right_index)),
+                        "{} vs {} ({format:?})",
+                        ordered[left_index],
+                        ordered[right_index]
+                    );
+                }
+            }
+        }
+    }
+
     // ── Text decode ──────────────────────────────────────────────────
 
     #[test]
     fn test_text_decode_table() {
-        let cases: Vec<(&str, &str, i32, Vec<Option<&str>>, i32)> = vec![
+        type TestCase<'a> = (&'a str, &'a str, i32, Vec<Option<&'a str>>, i32);
+        let cases: Vec<TestCase<'_>> = vec![
             ("empty", "{}", 23, vec![], 1),
             ("single int", "{1}", 23, vec![Some("1")], 1),
             (
@@ -518,8 +549,8 @@ mod tests {
                 .enumerate()
             {
                 match (got, want) {
-                    (None, None) => {}
-                    (Some(datum), Some(expected)) => {
+                    (Datum::Null, None) => {}
+                    (datum, Some(expected)) => {
                         let encoded = datum.encode(Format::Text).expect(name);
                         assert_eq!(
                             std::str::from_utf8(&encoded).unwrap(),

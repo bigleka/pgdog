@@ -19,7 +19,7 @@
 //!
 //! ## Dependencies
 //!
-//! PgDog is using [`pg_query`] to parse SQL. It produces an Abstract Syntax Tree (AST) which plugins can use to inspect queries
+//! PgDog is using [`pg_raw_parse`] to parse SQL. It produces an Abstract Syntax Tree (AST) which plugins can use to inspect queries
 //! and make statement routing decisions.
 //!
 //! The AST is computed by PgDog at runtime. It then passes it down to plugins, using a FFI interface. To make this safe, plugins must follow the
@@ -40,14 +40,23 @@
 //!
 //! # Required methods
 //!
-//! All plugins need to implement a set of functions that PgDog calls at runtime to load the plugin. You can implement them automatically
-//! using a macro. Inside the plugin's `src/lib.rs` file, add the following code:
+//! All plugins need to implement a set of functions that PgDog calls at runtime
+//! to load the plugin. These functions are defined by implementing the
+//! [`Plugin`] trait. The only required function is the version of your
+//! plugin. All others have a default implementations. You can then pass the
+//! name of your struct to the [`plugin!`] macro.
 //!
 //! ```
 //! // src/lib.rs
-//! use pgdog_plugin::macros;
+//! pgdog_plugin::plugin!(MyPlugin);
 //!
-//! macros::plugin!();
+//! struct MyPlugin;
+//!
+//! impl pgdog_plugin::Plugin for MyPlugin {
+//!     extern "C-unwind" fn version() -> pgdog_plugin::PdStr<'static> {
+//!         env!("CARGO_PKG_VERSION").into()
+//!     }
+//! }
 //! ```
 //!
 //! # Routing queries
@@ -59,29 +68,26 @@
 //!
 //! ```no_run
 //! use pgdog_plugin::prelude::*;
-//! use pg_query::{protobuf::{Node, RawStmt}, NodeEnum};
+//! use pg_raw_parse::Node;
 //!
-//! #[route]
-//! fn route(context: Context) -> Route {
-//!     let proto = context
-//!         .statement()
-//!         .protobuf();
-//!     let root = proto.stmts.first();
-//!     if let Some(root) = root {
-//!         if let Some(ref stmt) = root.stmt {
-//!             if let Some(ref node) = stmt.node {
-//!                 if let NodeEnum::SelectStmt(_) = node {
-//!                     return Route::new(Shard::Unknown, ReadWrite::Read);
-//!                 }
-//!             }
-//!         }
+//! pgdog_plugin::plugin!(MyPlugin);
+//!
+//! struct MyPlugin;
+//!
+//! impl Plugin for MyPlugin {
+//!     extern "C-unwind" fn version() -> PdStr<'static> {
+//!         env!("CARGO_PKG_VERSION").into()
 //!     }
 //!
-//!     Route::new(Shard::Unknown, ReadWrite::Write)
+//!     fn route(context: Context<'_>) -> Route {
+//!         if let Node::SelectStmt(_) = context.query.stmt() {
+//!             return Route::new(Shard::Unknown, ReadWrite::Read);
+//!         }
+//!
+//!         Route::new(Shard::Unknown, ReadWrite::Write)
+//!     }
 //! }
 //! ```
-//!
-//! The [`macros::route`] macro wraps the function into a safe FFI interface which PgDog calls at runtime.
 //!
 //! ### Parsing parameters
 //!
@@ -90,9 +96,10 @@
 //!
 //! ```
 //! # use pgdog_plugin::prelude::*;
-//! # let context = unsafe { Context::doc_test() };
+//! # let context = Context::doc_test();
 //! let params = context.parameters();
 //! if let Some(param) = params
+//!     .parameters
 //!     .get(0)
 //!     .map(|p| p.decode(params.parameter_format(0)))
 //!     .flatten() {
@@ -116,20 +123,30 @@
 //! ```
 //! use pgdog_plugin::prelude::*;
 //!
-//! #[route]
-//! fn route(context: Context) -> Route {
-//!     let params = context.parameters();
-//!     let password = params
-//!         .get(3)
-//!         .map(|param| param.decode(ParameterFormat::Text))
-//!         .flatten();
-//!     if let Some(ParameterValue::Text(password)) = password {
-//!         if !password.starts_with("$bcrypt") {
-//!             return Route::block();
-//!         }
-//!     }
+//! pgdog_plugin::plugin!(MyPlugin);
 //!
-//!     Route::unknown()
+//! struct MyPlugin;
+//!
+//! impl Plugin for MyPlugin {
+//!     # extern "C-unwind" fn version() -> PdStr<'static> {
+//!     #     env!("CARGO_PKG_VERSION").into()
+//!     # }
+//!
+//!     fn route(context: Context<'_>) -> Route {
+//!         let params = context.parameters();
+//!         let password = params
+//!             .parameters
+//!             .get(3)
+//!             .map(|param| param.decode(ParameterFormat::Text))
+//!             .flatten();
+//!         if let Some(ParameterValue::Text(password)) = password {
+//!             if !password.starts_with("$bcrypt") {
+//!                 return Route::block();
+//!             }
+//!         }
+//!
+//!         Route::unknown()
+//!     }
 //! }
 //! ```
 //!
@@ -158,28 +175,23 @@
 //! ```
 //!
 
-/// Bindgen-generated FFI bindings.
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-pub mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
-
-pub mod ast;
-pub mod comp;
+mod config;
 pub mod context;
 pub mod logging;
+pub mod macros;
 pub mod parameters;
 pub mod plugin;
 pub mod prelude;
 pub mod string;
 
-pub use bindings::*;
+pub use config::Config;
 pub use context::*;
+pub use parameters::*;
+pub use pgdog_postgres_types::Format as ParameterFormat;
 pub use plugin::*;
+pub use string::PdStr;
 
 pub use libloading;
 
-pub use pg_query;
-pub use pgdog_macros as macros;
+pub const RUSTC_VERSION: &str = env!("RUSTC_VERSION");
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

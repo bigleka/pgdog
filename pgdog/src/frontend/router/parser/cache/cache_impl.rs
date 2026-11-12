@@ -1,43 +1,42 @@
 use lru::LruCache;
 use once_cell::sync::Lazy;
-use parking_lot::lock_api::MutexGuard;
-use pg_query::normalize;
-use pgdog_config::QueryParserEngine;
-use std::borrow::Borrow;
+use pg_raw_parse::normalize::normalize;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::time::Duration;
 
-use parking_lot::{Mutex, RawMutex};
+use parking_lot::RwLock;
+use pg_raw_parse::{Error as ParseError, deparse, nodes};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::debug;
 
 use super::super::{Error, Route};
-use super::{super::parse_edge_comment, Ast, AstContext, AstQuery};
+use super::{super::parse_edge_comment, Ast, AstContext, AstQuery, ClientQuery};
 use crate::frontend::{BufferedQuery, PreparedStatements};
 
 static CACHE: Lazy<Cache> = Lazy::new(Cache::new);
 
 /// Cache statistics.
 #[derive(Default, Debug, Clone, Copy)]
-pub struct Stats {
+pub(crate) struct Stats {
     /// Cache hits.
-    pub hits: usize,
+    pub(crate) hits: usize,
     /// Cache misses (new queries).
-    pub misses: usize,
+    pub(crate) misses: usize,
     /// Direct shard queries.
-    pub direct: usize,
+    pub(crate) direct: usize,
     /// Multi-shard queries.
-    pub multi: usize,
+    pub(crate) multi: usize,
     /// Parse time.
-    pub parse_time: Duration,
+    pub(crate) parse_time: Duration,
     /// Fingerprints calculated.
-    pub fingerprints: usize,
+    pub(crate) fingerprints: usize,
+    pub(crate) memory_allocated: usize,
 }
 
 impl Stats {
     /// Create new statistics record for an AST entry.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             hits: 1,
             ..Default::default()
@@ -45,53 +44,75 @@ impl Stats {
     }
 }
 
-/// Newtype wrapper around `Arc<String>` that lets us look up cache entries
-/// with any `&str` (e.g. a `QueryWithoutComment`, which derefs to `str`).
-/// Stdlib only provides `Arc<T>: Borrow<T>`, not `Arc<String>: Borrow<str>`.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(super) struct CacheKey(pub(super) Arc<String>);
-
-impl Borrow<str> for CacheKey {
-    fn borrow(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-/// Mutex-protected query cache.
+/// Query cache, read by all clients at once.
 #[derive(Debug)]
 pub(super) struct Inner {
     /// Least-recently-used cache.
-    queries: LruCache<CacheKey, Ast>,
+    queries: LruCache<Arc<str>, Arc<Ast>>,
     /// Cache global stats.
     pub(super) stats: Stats,
+    /// Cache hits.
+    hits: AtomicUsize,
 }
 
-/// AST cache.
-#[derive(Clone, Debug)]
-pub struct Cache {
-    inner: Arc<Mutex<Inner>>,
+impl Inner {
+    /// Insert a statement, evicting one if the cache is full.
+    /// Eviction follows the CLOCK (second-chance) policy:
+    ///
+    /// - cache hits mark the statement as used (instead of moving the statement to front of list)
+    ///   allowing hits to just need the read lock
+    ///
+    /// - when the cache is full, used statements at the back of the list move to the front with the mark
+    ///   cleared, and when the first **unmarked** statement is found, it's evicted.
+    fn insert(&mut self, query: Arc<str>, ast: Arc<Ast>) {
+        if self.queries.len() == self.queries.cap().get() {
+            while let Some((oldest, entry)) = self.queries.peek_lru()
+                && entry.used.swap(false, Ordering::Relaxed)
+            {
+                let oldest = Arc::clone(oldest);
+                self.queries.promote(&oldest);
+            }
+        }
+        self.queries.put(query, ast);
+    }
+}
+
+/// Statements parsed without being cached.
+#[derive(Debug, Default)]
+struct Uncached {
+    parses: AtomicUsize,
+    parse_time_nanos: AtomicU64,
+}
+
+/// AST cache shared through a static reference.
+#[derive(Debug)]
+pub(crate) struct Cache {
+    inner: RwLock<Inner>,
+    uncached: Uncached,
 }
 
 impl Cache {
     /// Create new cache. Should only be done once at pooler startup.
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: RwLock::new(Inner {
                 queries: LruCache::unbounded(),
                 stats: Stats::default(),
-            })),
+                hits: AtomicUsize::default(),
+            }),
+            uncached: Uncached::default(),
         }
     }
 
     /// Resize cache to capacity, evicting any statements exceeding the capacity.
     ///
     /// Minimum capacity is 1.
-    pub fn resize(capacity: usize) {
+    pub(crate) fn resize(capacity: usize) {
         let capacity = if capacity == 0 { 1 } else { capacity };
 
         CACHE
             .inner
-            .lock()
+            .write()
             .queries
             .resize(capacity.try_into().unwrap());
 
@@ -99,25 +120,20 @@ impl Cache {
     }
 
     /// Handle parsing a query.
-    pub fn query(
+    pub(crate) fn query(
         &self,
         query: &BufferedQuery,
         ctx: &AstContext<'_>,
         prepared_statements: &mut PreparedStatements,
-    ) -> Result<Ast, Error> {
+    ) -> Result<ClientQuery, Error> {
         match query {
             BufferedQuery::Prepared(_) => self.parse(query, ctx, prepared_statements),
             BufferedQuery::Query(_) => self.simple(query, ctx, prepared_statements),
         }
     }
 
-    /// Get the inner struct.
-    pub(super) fn lock<'a>(&'a self) -> MutexGuard<'a, RawMutex, Inner> {
-        self.inner.lock()
-    }
-
     /// Parse a statement by either getting it from cache
-    /// or using pg_query parser.
+    /// or parsing it.
     ///
     /// N.B. There is a race here that allows multiple threads to
     /// parse the same query. That's better imo than locking the data structure
@@ -127,58 +143,49 @@ impl Cache {
         query: &BufferedQuery,
         ctx: &AstContext<'_>,
         prepared_statements: &mut PreparedStatements,
-    ) -> Result<Ast, Error> {
+    ) -> Result<ClientQuery, Error> {
         // Separate query from comment, if one is present.
-        let query_and_comment = parse_edge_comment(query.query(), &ctx.sharding_schema)?;
-        let cache_key = &query_and_comment.query;
+        let query_and_comment = parse_edge_comment(query.query(), ctx.sharding_schema)?;
+        let ast = {
+            let guard = self.inner.read();
 
-        {
-            let mut guard = self.inner.lock();
-            let ast = guard
-                .queries
-                .get_mut(cache_key.deref()) // Use the query without comment as the cache key.
-                .map(|entry| {
-                    entry.stats.lock().hits += 1; // No contention on this.
-                    entry.clone()
-                });
-            if let Some(mut ast) = ast {
-                guard.stats.hits += 1;
-                ast.comment_role = query_and_comment.role;
-                ast.comment_shard = query_and_comment.shard.clone();
+            let ast = guard.queries.peek(query_and_comment.query).map(|entry| {
+                entry.record_hit();
+                Ok::<_, Error>(Arc::clone(entry))
+            });
 
-                return Ok(ast);
+            if ast.is_some() {
+                guard.hits.fetch_add(1, Ordering::Relaxed);
             }
+
+            ast
         }
+        .unwrap_or_else(|| {
+            // Parse query without holding lock.
+            let ast = Arc::new(Ast::parse_and_rewrite(
+                &AstQuery {
+                    original_query: query,
+                    query_without_comment: query_and_comment.query,
+                },
+                ctx,
+                prepared_statements,
+            )?);
 
-        // Parse query without holding lock.
-        let mut entry = Ast::with_context(
-            &AstQuery {
-                original_query: query,
-                query_without_comment: &query_and_comment.query,
-            },
-            ctx,
-            prepared_statements,
-        )?;
-        entry.comment_role = query_and_comment.role;
-        entry.comment_shard = query_and_comment.shard.clone();
-        let parse_time = entry.stats.lock().parse_time;
+            let parse_time = ast.stats.parse_time;
 
-        let mut guard = self.inner.lock();
-        // Don't cache when a shard comment routed the query AND a rewrite
-        // was applied: the cache key is the comment-stripped body, so a
-        // subsequent uncommented lookup would hit this entry and receive an
-        // already-rewritten plan that was built against the commented
-        // (direct-shard) variant.
-        let cacheable = entry.comment_shard.is_none() || entry.rewrite_plan.is_empty();
-        if cacheable {
-            guard
-                .queries
-                .put(CacheKey(entry.query_without_comment.clone()), entry.clone());
-        }
-        guard.stats.misses += 1;
-        guard.stats.parse_time += parse_time;
+            let mut guard = self.inner.write();
+            guard.insert(ast.query_without_comment.clone(), Arc::clone(&ast));
+            guard.stats.misses += 1;
+            guard.stats.parse_time += parse_time;
 
-        Ok(entry)
+            Ok(ast)
+        })?;
+
+        Ok(ClientQuery {
+            cached: true,
+            comment: Arc::new(query_and_comment.comment),
+            ast,
+        })
     }
 
     /// Parse and rewrite a statement but do not store it in the cache,
@@ -188,27 +195,53 @@ impl Cache {
         query: &BufferedQuery,
         ctx: &AstContext<'_>,
         prepared_statements: &mut PreparedStatements,
-    ) -> Result<Ast, Error> {
-        let query_and_comment = parse_edge_comment(query.query(), &ctx.sharding_schema)?;
+    ) -> Result<ClientQuery, Error> {
+        let query_and_comment = parse_edge_comment(query.query(), ctx.sharding_schema)?;
 
-        let mut entry = Ast::with_context(
+        let ast = Arc::new(Ast::parse_and_rewrite(
             &AstQuery {
                 original_query: query,
-                query_without_comment: &query_and_comment.query,
+                query_without_comment: query_and_comment.query,
             },
             ctx,
             prepared_statements,
-        )?;
-        entry.cached = false;
-        entry.comment_role = query_and_comment.role;
-        entry.comment_shard = query_and_comment.shard.clone();
+        )?);
 
-        let parse_time = entry.stats.lock().parse_time;
+        self.uncached.parses.fetch_add(1, Ordering::Relaxed);
+        self.uncached
+            .parse_time_nanos
+            .fetch_add(ast.stats.parse_time.as_nanos() as u64, Ordering::Relaxed);
 
-        let mut guard = self.inner.lock();
-        guard.stats.misses += 1;
-        guard.stats.parse_time += parse_time;
-        Ok(entry)
+        Ok(ClientQuery {
+            cached: false,
+            comment: Arc::new(query_and_comment.comment),
+            ast,
+        })
+    }
+
+    pub(crate) fn record(&self, query: &str) -> Result<ClientQuery, ParseError> {
+        let ast = {
+            let mut guard = self.inner.write();
+            guard.queries.get(query).map(|ast| {
+                ast.record_hit();
+                Ok::<_, ParseError>(Arc::clone(ast))
+            })
+        }
+        .unwrap_or_else(|| {
+            let ast = Arc::new(Ast::parse(query)?);
+
+            let mut guard = self.inner.write();
+            guard.insert(query.into(), Arc::clone(&ast));
+            guard.stats.misses += 1;
+
+            Ok(ast)
+        })?;
+
+        Ok(ClientQuery {
+            cached: true,
+            comment: Default::default(),
+            ast,
+        })
     }
 
     /// Record a query sent over the simple protocol, while removing parameters.
@@ -216,78 +249,114 @@ impl Cache {
     /// Used by dry run mode to keep stats on what queries are routed correctly,
     /// and which are not.
     ///
-    pub fn record_normalized(
+    pub(crate) fn record_normalized(
         &self,
-        query: &str,
+        query: &nodes::RawStmt,
         route: &Route,
-        query_parser_engine: QueryParserEngine,
     ) -> Result<(), Error> {
-        let normalized = normalize(query).map_err(Error::PgQuery)?;
+        let normalized = normalize(query);
+        let normalized = deparse(normalized.stmt())?;
+        let normalized = normalized.as_str();
 
         {
-            let mut guard = self.inner.lock();
-            if let Some(entry) = guard.queries.get(normalized.as_str()) {
+            let mut guard = self.inner.write();
+            if let Some(entry) = guard.queries.get(normalized) {
                 entry.update_stats(route);
-                guard.stats.hits += 1;
+                guard.hits.fetch_add(1, Ordering::Relaxed);
+
                 return Ok(());
             }
         }
 
-        let entry = Ast::new_record(&normalized, query_parser_engine)?;
+        let entry = Ast::parse(normalized)?;
         entry.update_stats(route);
 
-        let mut guard = self.inner.lock();
-        guard.queries.put(CacheKey(Arc::new(normalized)), entry);
+        let mut guard = self.inner.write();
+        guard.insert(normalized.into(), Arc::new(entry));
         guard.stats.misses += 1;
 
         Ok(())
     }
 
     /// Get global cache instance.
-    pub fn get() -> Self {
-        CACHE.clone()
+    pub(crate) fn get() -> &'static Self {
+        &CACHE
     }
 
     /// Get cache stats.
-    pub fn stats() -> (Stats, usize) {
+    pub(crate) fn stats() -> (Stats, usize) {
         let cache = Self::get();
         let (len, query_stats, mut stats) = {
-            let guard = cache.inner.lock();
+            let guard = cache.inner.read();
             (
                 guard.queries.len(),
                 guard
                     .queries
                     .iter()
-                    .map(|c| *c.1.stats.lock())
+                    .map(|c| c.1.stats())
                     .collect::<Vec<_>>(),
-                guard.stats,
+                Stats {
+                    hits: guard.hits.load(Ordering::Relaxed),
+                    ..guard.stats
+                },
             )
         };
+        stats.misses += cache.uncached.parses.load(Ordering::Relaxed);
+        stats.parse_time +=
+            Duration::from_nanos(cache.uncached.parse_time_nanos.load(Ordering::Relaxed));
         for stat in query_stats {
             stats.direct += stat.direct;
             stats.multi += stat.multi;
+            stats.memory_allocated += stat.memory_allocated;
         }
         (stats, len)
     }
 
     /// Get a copy of all queries stored in the cache.
-    pub fn queries() -> HashMap<Arc<String>, Ast> {
+    pub(crate) fn queries() -> HashMap<Arc<str>, Arc<Ast>> {
         Self::get()
             .inner
-            .lock()
+            .read()
             .queries
             .iter()
-            .map(|i| (i.0 .0.clone(), i.1.clone()))
+            .map(|i| (i.0.clone(), i.1.clone()))
             .collect()
     }
 
     /// Reset cache, removing all statements
     /// and setting stats to 0.
-    pub fn reset() {
+    pub(crate) fn reset() {
         let cache = Self::get();
-        let mut guard = cache.inner.lock();
+        let mut guard = cache.inner.write();
         guard.queries.clear();
-        guard.stats.hits = 0;
+        guard.hits.store(0, Ordering::Relaxed);
         guard.stats.misses = 0;
+        cache.uncached.parses.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The cache here has a size of 2. We insert 1, 2, record a hit on 1, then insert 3.
+    /// 2 should be evicted instead of 1, since we used 1 after 2.
+    #[test]
+    fn test_used_statement_survives_eviction() {
+        let mut inner = Inner {
+            queries: LruCache::new(2.try_into().unwrap()),
+            stats: Stats::default(),
+            hits: AtomicUsize::default(),
+        };
+
+        let used = Arc::new(Ast::parse("SELECT 1").unwrap());
+
+        inner.insert("SELECT 1".into(), Arc::clone(&used));
+        inner.insert("SELECT 2".into(), Arc::new(Ast::parse("SELECT 2").unwrap()));
+        used.record_hit();
+        inner.insert("SELECT 3".into(), Arc::new(Ast::parse("SELECT 3").unwrap()));
+
+        assert!(inner.queries.contains("SELECT 1"));
+        assert!(!inner.queries.contains("SELECT 2"));
     }
 }

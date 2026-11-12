@@ -1,7 +1,7 @@
 //! Get all table definitions.
-pub use pgdog_stats::Column as StatsColumn;
-pub use pgdog_stats::ForeignKey;
-pub use pgdog_stats::ForeignKeyAction;
+pub(crate) use pgdog_stats::Column as StatsColumn;
+pub(crate) use pgdog_stats::ForeignKey;
+pub(crate) use pgdog_stats::ForeignKeyAction;
 use serde::{Deserialize, Serialize};
 
 use super::Error;
@@ -42,7 +42,7 @@ impl From<DataRow> for ForeignKeyRow {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Column {
+pub(crate) struct Column {
     inner: StatsColumn,
 }
 
@@ -74,7 +74,7 @@ impl DerefMut for Column {
 
 impl Column {
     /// Load all columns from server, including foreign key information.
-    pub async fn load(
+    pub(crate) async fn load(
         server: &mut Server,
     ) -> Result<HashMap<(String, String), Vec<Column>>, Error> {
         let mut result = HashMap::new();
@@ -91,19 +91,18 @@ impl Column {
         let fk_rows: Vec<ForeignKeyRow> = server.fetch_all(FOREIGN_KEYS).await?;
         for fk_row in fk_rows {
             let key = (fk_row.source_schema.clone(), fk_row.source_table.clone());
-            if let Some(columns) = result.get_mut(&key) {
-                if let Some(column) = columns
+            if let Some(columns) = result.get_mut(&key)
+                && let Some(column) = columns
                     .iter_mut()
                     .find(|c| c.column_name == fk_row.source_column)
-                {
-                    column.foreign_keys.push(ForeignKey {
-                        schema: fk_row.ref_schema,
-                        table: fk_row.ref_table,
-                        column: fk_row.ref_column,
-                        on_delete: fk_row.on_delete,
-                        on_update: fk_row.on_update,
-                    });
-                }
+            {
+                column.foreign_keys.push(ForeignKey {
+                    schema: fk_row.ref_schema,
+                    table: fk_row.ref_table,
+                    column: fk_row.ref_column,
+                    on_delete: fk_row.on_delete,
+                    on_update: fk_row.on_update,
+                });
             }
         }
 
@@ -133,9 +132,52 @@ impl From<DataRow> for Column {
 
 #[cfg(test)]
 mod test {
-    use crate::backend::pool::test::pool;
+    use super::Error;
     use crate::backend::pool::Request;
+    use crate::backend::pool::test::pool;
     use crate::backend::schema::columns::Column;
+
+    #[tokio::test]
+    async fn test_load_partitioned_primary_keys() -> Result<(), Error> {
+        let pool = pool();
+        let mut conn = pool.get(&Request::default()).await?;
+        conn.execute_checked("BEGIN").await?;
+        conn.execute_checked(
+            "CREATE SCHEMA pk_partition_test;
+             CREATE TABLE pk_partition_test.parted (
+                 tenant_id BIGINT,
+                 id BIGINT,
+                 payload TEXT,
+                 PRIMARY KEY (tenant_id, id)
+             ) PARTITION BY HASH (tenant_id);
+             CREATE TABLE pk_partition_test.parted_0
+                 PARTITION OF pk_partition_test.parted
+                 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+             CREATE TABLE pk_partition_test.parted_1
+                 PARTITION OF pk_partition_test.parted
+                 FOR VALUES WITH (MODULUS 2, REMAINDER 1)",
+        )
+        .await?;
+
+        let columns = Column::load(&mut conn).await?;
+        for table in ["parted", "parted_0", "parted_1"] {
+            let table_columns = columns
+                .get(&("pk_partition_test".to_owned(), table.to_owned()))
+                .expect("parent and partition columns should be loaded");
+            let primary_keys: Vec<_> = table_columns
+                .iter()
+                .map(|column| (column.column_name.as_str(), column.is_primary_key))
+                .collect();
+            assert_eq!(
+                primary_keys,
+                [("tenant_id", true), ("id", true), ("payload", false)],
+                "unexpected primary key columns for {table}"
+            );
+        }
+
+        conn.execute_checked("ROLLBACK").await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_load_columns() {

@@ -1,13 +1,13 @@
 use crate::{
     frontend::PreparedStatements,
-    net::{data_row::Data, ToDataRowColumn},
+    net::{ToDataRowColumn, data_row::Data},
     stats::memory::MemoryUsage,
 };
 
 use super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct ShowPreparedStatements;
+pub(crate) struct ShowPreparedStatements;
 
 #[async_trait]
 impl Command for ShowPreparedStatements {
@@ -21,17 +21,19 @@ impl Command for ShowPreparedStatements {
 
     async fn execute(&self) -> Result<Vec<Message>, Error> {
         let statements = PreparedStatements::global().read().clone();
-        let mut messages = vec![RowDescription::new(&[
-            Field::text("name"),
-            Field::text("statement"),
-            Field::text("rewrite"),
-            Field::numeric("used_by"),
-            Field::numeric("memory_used"),
-        ])
-        .message()?];
+        let mut messages = vec![
+            RowDescription::new(&[
+                Field::text("name"),
+                Field::text("statement"),
+                Field::text("rewrite"),
+                Field::numeric("used_by"),
+                Field::numeric("memory_used"),
+            ])
+            .message(),
+        ];
         for (key, stmt) in statements.statements() {
             let name = stmt.name();
-            let rewrite = statements.rewritten_parse(&name).ok_or(Error::Empty)?;
+            let rewrite = statements.rewritten_parse(&name);
             let rewritten = statements.is_rewritten(&name);
             let name_memory = statements
                 .names()
@@ -41,14 +43,18 @@ impl Command for ShowPreparedStatements {
             let mut dr = DataRow::new();
             dr.add(stmt.name())
                 .add(key.query()?)
-                .add(if rewritten {
-                    rewrite.query().to_data_row_column()
+                .add(if let Some(rewrite) = rewrite {
+                    if rewritten {
+                        rewrite.query().to_data_row_column()
+                    } else {
+                        Data::null()
+                    }
                 } else {
                     Data::null()
                 })
                 .add(stmt.used)
                 .add(name_memory);
-            messages.push(dr.message()?);
+            messages.push(dr.message());
         }
         Ok(messages)
     }

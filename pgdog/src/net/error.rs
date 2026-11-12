@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio_rustls::rustls;
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -19,17 +19,11 @@ pub enum Error {
     #[error("unexpected TLS request")]
     UnexpectedTlsRequest,
 
-    #[error("connection is not sending messages")]
-    ConnectionDown,
-
     #[error("unexpected message, expected {0} got {1}")]
     UnexpectedMessage(char, char),
 
     #[error("unexpected payload")]
     UnexpectedPayload,
-
-    #[error("data type not supported for encoding")]
-    UnsupportedDataTypeForEncoding,
 
     #[error("CommandComplete contains no row counts")]
     CommandCompleteNoRows,
@@ -52,9 +46,6 @@ pub enum Error {
     #[error("\"{0}\" parameter is missing")]
     MissingParameter(String),
 
-    #[error("incorrect parameter format code: {0}")]
-    IncorrectParameterFormatCode(i16),
-
     #[error("unknown tuple data identifier: {0}")]
     UnknownTupleDataIdentifier(char),
 
@@ -76,41 +67,55 @@ pub enum Error {
     #[error("not a uuid")]
     NotUuid(#[from] uuid::Error),
 
-    #[error("not a timestamptz")]
-    NotTimestampTz,
-
     #[error("wrong size slice")]
     WrongSizeSlice(#[from] TryFromSliceError),
 
-    #[error("wrong size binary ({0}) for type")]
-    WrongSizeBinary(usize),
-
-    #[error("invalid timestamp components")]
-    InvalidTimestamp,
-
-    #[error("only simple protocols supported for rewrites")]
-    OnlySimpleForRewrites,
-
-    #[error("array has {0} dimensions, only 1 is supported")]
-    ArrayDimensions(usize),
-
-    #[error("not a boolean")]
-    NotBoolean,
-
-    #[error("not a pg_lsn")]
-    NotPgLsn,
-
     #[error("{0}")]
     TypeError(#[from] pgdog_postgres_types::Error),
+
+    /// Internal invariant violated or API misused — not a network error.
+    /// Carry enough context to identify the violation without a debugger.
+    #[error("invariant violation: {0}")]
+    InvariantViolation(String),
+
+    /// Column that is assumed to exist was not present. This indicates a
+    /// bug in PgDog, such as a helper column not being inserted.
+    #[error(
+        "missing column at index {0} that was assumed to be present (this indicates a bug in pgdog, please open an issue with details about your query)"
+    )]
+    RequiredColumnMissing(usize),
+
+    #[error("message size {size} bytes exceeds query_size_limit of {limit} bytes")]
+    MessageTooLarge { size: usize, limit: usize },
+
+    /// The length field counts itself, so it can never be below 4. A message
+    /// declaring less than that can't be framed, and the peer is out of sync.
+    #[error("malformed message: declared length {0} is below the minimum of 4 bytes")]
+    MalformedMessageLength(i32),
 }
 
 impl Error {
+    /// If this error corresponds to a fatal client-facing condition, return the
+    /// `ErrorResponse` to send before disconnecting. Returns `None` for errors
+    /// that are not surfaced to the client.
+    pub(crate) fn as_fatal_error_response(&self) -> Option<super::messages::ErrorResponse> {
+        match self {
+            Self::MessageTooLarge { size, limit } => Some(
+                super::messages::ErrorResponse::query_too_large(*size, *limit),
+            ),
+            Self::MalformedMessageLength(len) => Some(
+                super::messages::ErrorResponse::protocol_violation(&format!(
+                    "declared message length {} is below the minimum of 4 bytes",
+                    len
+                )),
+            ),
+            _ => None,
+        }
+    }
+
     /// Transient network fault worth retrying.
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Io(_) | Self::UnexpectedEof | Self::ConnectionDown
-        )
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::UnexpectedEof)
     }
 }
 
@@ -123,7 +128,6 @@ mod tests {
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
         assert!(Error::Io(io).is_retryable());
         assert!(Error::UnexpectedEof.is_retryable());
-        assert!(Error::ConnectionDown.is_retryable());
     }
 
     #[test]
@@ -132,5 +136,17 @@ mod tests {
         assert!(!Error::UnexpectedMessage('Z', 'Q').is_retryable());
         assert!(!Error::NotTextEncoding.is_retryable());
         assert!(!Error::UnexpectedPayload.is_retryable());
+    }
+
+    #[test]
+    fn malformed_message_length_is_permanent() {
+        // Re-reading a peer that framed a message wrongly just re-reads the
+        // same bytes, so this must not be treated as a transient fault.
+        let err = Error::MalformedMessageLength(-1);
+        assert!(!err.is_retryable());
+
+        // The client gets told why before it is disconnected.
+        let response = err.as_fatal_error_response().unwrap();
+        assert_eq!(response.code, "08P01");
     }
 }

@@ -1,30 +1,30 @@
 //! Rerwrite messages if using prepared statements.
 use crate::net::{
-    messages::{Bind, Describe, Parse},
     Close, ProtocolMessage,
+    messages::{Bind, Describe, Parse},
 };
 
 use super::{Error, PreparedStatements};
 
 /// Rewrite messages.
 #[derive(Debug)]
-pub struct Rewrite<'a> {
+pub(crate) struct Rewrite<'a> {
     statements: &'a mut PreparedStatements,
 }
 
 impl<'a> Rewrite<'a> {
     /// New rewrite module.
-    pub fn new(statements: &'a mut PreparedStatements) -> Self {
+    pub(crate) fn new(statements: &'a mut PreparedStatements) -> Self {
         Self { statements }
     }
 
     /// Rewrite a message if needed.
-    pub fn rewrite(&mut self, message: &mut ProtocolMessage) -> Result<(), Error> {
+    pub(crate) fn rewrite(&mut self, message: &mut ProtocolMessage) -> Result<(), Error> {
         match message {
-            ProtocolMessage::Bind(ref mut bind) => Ok(self.bind(bind)?),
-            ProtocolMessage::Describe(ref mut describe) => Ok(self.describe(describe)?),
-            ProtocolMessage::Parse(ref mut parse) => Ok(self.parse(parse)?),
-            ProtocolMessage::Close(ref close) => Ok(self.close(close)?),
+            ProtocolMessage::Bind(bind) => Ok(self.bind(bind)?),
+            ProtocolMessage::Describe(describe) => Ok(self.describe(describe)?),
+            ProtocolMessage::Parse(parse) => Ok(self.parse(parse)?),
+            ProtocolMessage::Close(close) => Ok(self.close(close)?),
             _ => Ok(()),
         }
     }
@@ -40,6 +40,8 @@ impl<'a> Rewrite<'a> {
         let name = self.statements.name(bind.statement());
         if let Some(name) = name {
             bind.rename(name);
+        } else if !bind.anonymous() {
+            return Err(Error::MissingStatement(bind.statement().to_owned()));
         }
 
         Ok(())
@@ -53,14 +55,21 @@ impl<'a> Rewrite<'a> {
             let name = self.statements.name(describe.statement());
             if let Some(name) = name {
                 describe.rename(name);
+            } else if !describe.anonymous() {
+                return Err(Error::MissingStatement(describe.statement().to_owned()));
             }
             Ok(())
         }
     }
 
     /// Handle Close message.
+    ///
+    /// Portals have their own name space, so a portal Close can carry the
+    /// name of a prepared statement we still need.
     fn close(&mut self, close: &Close) -> Result<(), Error> {
-        self.statements.close(close.name());
+        if close.is_statement() {
+            self.statements.close(close.name());
+        }
         Ok(())
     }
 }
@@ -79,7 +88,7 @@ mod test {
         let parse = Parse::named("__sqlx_1", "SELECT * FROM users");
         let mut parse = ProtocolMessage::from(parse);
         rewrite.rewrite(&mut parse).unwrap();
-        let parse = Parse::from_bytes(parse.to_bytes().unwrap()).unwrap();
+        let parse = Parse::from_bytes(parse.to_bytes()).unwrap();
 
         assert!(!parse.anonymous());
         assert_eq!(parse.name(), "__pgdog_1");
@@ -88,17 +97,17 @@ mod test {
         let bind = Bind::new_statement("__sqlx_1");
         let mut bind_msg = ProtocolMessage::from(bind);
         rewrite.rewrite(&mut bind_msg).unwrap();
-        let bind = Bind::from_bytes(bind_msg.to_bytes().unwrap()).unwrap();
+        let bind = Bind::from_bytes(bind_msg.to_bytes()).unwrap();
         assert_eq!(bind.statement(), "__pgdog_1");
 
         let describe = Describe::new_statement("__sqlx_1");
         let mut describe = ProtocolMessage::from(describe);
         rewrite.rewrite(&mut describe).unwrap();
-        let describe = Describe::from_bytes(describe.to_bytes().unwrap()).unwrap();
+        let describe = Describe::from_bytes(describe.to_bytes()).unwrap();
         assert_eq!(describe.statement(), "__pgdog_1");
         assert_eq!(describe.kind(), 'S');
 
-        assert_eq!(statements.len_local(), 1);
+        assert_eq!(statements.num_statements(), 1);
         assert_eq!(statements.global.read().len(), 1);
     }
 
@@ -110,12 +119,39 @@ mod test {
         let parse = Parse::new_anonymous("SELECT * FROM users");
         let mut parse = ProtocolMessage::from(parse);
         rewrite.rewrite(&mut parse).unwrap();
-        let parse = Parse::from_bytes(parse.to_bytes().unwrap()).unwrap();
+        let parse = Parse::from_bytes(parse.to_bytes()).unwrap();
 
         assert!(!parse.anonymous());
         assert_eq!(parse.query(), "SELECT * FROM users");
 
-        assert_eq!(statements.len_local(), 1);
+        assert_eq!(statements.num_statements(), 1);
         assert_eq!(statements.global.read().len(), 1);
+    }
+
+    /// A portal Close can carry a prepared statement's name. If it releases
+    /// the statement, the next sweep takes it while the client still needs it.
+    #[test]
+    fn test_rewrite_close_portal_keeps_statement() {
+        let mut statements = PreparedStatements::default();
+        let global = statements.global.clone();
+
+        let mut parse = ProtocolMessage::from(Parse::named("foo", "SELECT $1"));
+        statements.maybe_rewrite(&mut parse).unwrap();
+
+        let mut close = ProtocolMessage::from(Close::portal("foo"));
+        statements.maybe_rewrite(&mut close).unwrap();
+
+        assert_eq!(global.write().close_unused(0), 0);
+        assert_eq!(global.read().len(), 1);
+        assert_eq!(
+            statements.name("foo").map(|name| name.as_str()),
+            Some("__pgdog_1")
+        );
+
+        let mut close = ProtocolMessage::from(Close::named("foo"));
+        statements.maybe_rewrite(&mut close).unwrap();
+
+        assert_eq!(global.write().close_unused(0), 1);
+        assert_eq!(global.read().len(), 0);
     }
 }

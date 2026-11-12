@@ -5,7 +5,7 @@ use super::{
     *,
 };
 
-pub struct ShowVersion;
+pub(crate) struct ShowVersion;
 
 #[async_trait]
 impl Command for ShowVersion {
@@ -22,8 +22,8 @@ impl Command for ShowVersion {
         dr.add(format!("PgDog {}", pgdog_version()));
 
         Ok(vec![
-            RowDescription::new(&[Field::text("version")]).message()?,
-            dr.message()?,
+            RowDescription::new(&[Field::text("version")]).message(),
+            dr.message(),
         ])
     }
 }

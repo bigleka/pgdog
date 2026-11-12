@@ -7,7 +7,7 @@ use crate::net::{DataRow, Message};
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, simple, TestTable},
+    result_cache::{TestTable, enable_result_cache, simple},
 };
 
 fn param(value: &str) -> Parameter {

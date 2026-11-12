@@ -1,6 +1,6 @@
 //! PostgreSQL server connection.
 
-use std::time::Duration;
+use std::{ops::Deref, sync::Arc, time::Duration};
 
 use bytes::{BufMut, BytesMut};
 use rustls_pki_types::ServerName;
@@ -13,43 +13,128 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 use super::{
-    pool::Address, prepared_statements::HandleResult, ConnectReason, DisconnectReason, Error,
-    PreparedStatements, ServerOptions, Stats,
+    ConnectReason, DisconnectReason, Error, Oids, PreparedStatements, ServerOptions, Stats,
+    pool::Address,
+    prepared_statements::{HandleResult, Prepare},
 };
+use crate::parameters::{ParameterStore, Parameters};
 use crate::{
     auth::{md5, scram::Client},
     backend::pool::stats::MemoryStats,
     config::AuthType,
     frontend::ClientRequest,
     net::{
+        Close, Liveness, MessageBuffer, Parameter, ProtocolMessage, Sync,
         messages::{
-            hello::SslReply, Authentication, BackendKeyData, ErrorResponse, FromBytes, Message,
-            ParameterStatus, Password, Protocol, Query, ReadyForQuery, Startup, Terminate, ToBytes,
+            Authentication, BackendKeyData, BackendPid, Bind, ErrorResponse, Execute, Format,
+            FromBytes, FrontendPid, Message, ParameterStatus, Password, Protocol, Query,
+            ReadyForQuery, Startup, Terminate, ToBytes, bind::Parameter as BindParameter,
+            hello::SslReply, parse::Parse,
         },
-        Close, MessageBuffer, Parameter, ProtocolMessage, Sync,
     },
     stats::memory::MemoryUsage,
 };
 use crate::{
-    config::{config, PoolerMode, TlsVerifyMode},
+    config::{ConfigAndUsers, ConnectionRecovery, PoolerMode, TlsVerifyMode, config},
     net::{
-        messages::{DataRow, NoticeResponse},
-        parameter::Parameters,
-        tls::connector_with_verify_mode,
         CommandComplete, Stream,
+        messages::{DataRow, NoticeResponse},
+        tls::UpstreamTlsSettings,
     },
 };
 use crate::{net::tweak, state::State};
 
+/// A request executed on a server connection: simple-protocol queries,
+/// or an extended-protocol message batch ending in a Sync.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerRequest {
+    /// Protocol messages to send.
+    messages: Vec<ProtocolMessage>,
+    /// Number of ReadyForQuery (B) messages that complete the request.
+    expected: usize,
+}
+
+impl ServerRequest {
+    /// Anonymous extended-protocol query with text-format parameters.
+    /// Parameters are bound by the server, so values don't need to be
+    /// escaped.
+    pub(crate) fn parameterized(query: &str, params: &[BindParameter]) -> Self {
+        Self {
+            messages: vec![
+                Parse::new_anonymous(query).into(),
+                Bind::new_params_codes("", params, &[Format::Text]).into(),
+                Execute::new().into(),
+                ProtocolMessage::from(Sync::new()),
+            ],
+            expected: 1,
+        }
+    }
+}
+
+impl From<&str> for ServerRequest {
+    fn from(query: &str) -> Self {
+        Query::new(query).into()
+    }
+}
+
+impl From<String> for ServerRequest {
+    fn from(query: String) -> Self {
+        Query::new(query).into()
+    }
+}
+
+impl From<&String> for ServerRequest {
+    fn from(query: &String) -> Self {
+        Query::new(query).into()
+    }
+}
+
+impl From<Query> for ServerRequest {
+    fn from(query: Query) -> Self {
+        Self {
+            messages: vec![ProtocolMessage::Query(query)],
+            expected: 1,
+        }
+    }
+}
+
+impl From<Vec<Query>> for ServerRequest {
+    fn from(queries: Vec<Query>) -> Self {
+        Self {
+            expected: queries.len(),
+            messages: queries.into_iter().map(ProtocolMessage::Query).collect(),
+        }
+    }
+}
+
+impl From<&[Query]> for ServerRequest {
+    fn from(queries: &[Query]) -> Self {
+        queries.to_vec().into()
+    }
+}
+
+impl<const N: usize> From<&[Query; N]> for ServerRequest {
+    fn from(queries: &[Query; N]) -> Self {
+        queries.as_slice().into()
+    }
+}
+
+impl From<&Vec<Query>> for ServerRequest {
+    fn from(queries: &Vec<Query>) -> Self {
+        queries.clone().into()
+    }
+}
+
 /// PostgreSQL server connection.
 #[derive(Debug)]
-pub struct Server {
+pub(crate) struct Server {
     addr: Address,
     stream: Option<Stream>,
-    id: BackendKeyData,
+    key: BackendKeyData,
+    id: BackendPid,
     params: Parameters,
     changed_params: Parameters,
-    client_params: Parameters,
+    client_params: ParameterStore,
     stats: Stats,
     prepared_statements: PreparedStatements,
     dirty: bool,
@@ -64,10 +149,19 @@ pub struct Server {
     pooler_mode: PoolerMode,
     stream_buffer: MessageBuffer,
     disconnect_reason: Option<DisconnectReason>,
+    password_attempts: usize,
+    /// Per-connection lifetime cap. When `Some`, the connection
+    /// retires once its age reaches the stored value. `None` means
+    /// "use the pool's configured `max_age`" (no jitter applied).
+    /// Sampled once at creation by [`Server::apply_lifetime_jitter`].
+    max_age: Option<Duration>,
+    /// Credentials generation at the time this connection was established.
+    /// Compared against the pool's generation on check-in; a mismatch means
+    /// the Vault lease rotated and this connection must be closed.
+    credentials_generation: u64,
 }
 
 impl MemoryUsage for Server {
-    #[inline]
     fn memory_usage(&self) -> usize {
         std::mem::size_of::<BackendKeyData>()
             + self.params.memory_usage()
@@ -78,30 +172,41 @@ impl MemoryUsage for Server {
             + 7 * std::mem::size_of::<bool>()
             + std::mem::size_of::<PoolerMode>()
             + self.stream_buffer.capacity()
+            + self.password_attempts.memory_usage()
     }
 }
 
 impl Server {
     /// Create new PostgreSQL server connection.
-    pub async fn connect(
+    pub(crate) async fn connect(
         addr: &Address,
         options: ServerOptions,
         connect_reason: ConnectReason,
+        oids: Arc<Oids>,
     ) -> Result<Self, Error> {
-        let auth_secrets = addr.auth_secrets().await?;
+        let (user, auth_secrets) = addr.auth_credentials().await?;
         let total = auth_secrets.len();
         for (idx, auth_secret) in auth_secrets.into_iter().enumerate() {
             match Self::connect_with_auth_secret(
                 addr,
+                &user,
                 options.clone(),
                 connect_reason,
                 &auth_secret,
+                Arc::clone(&oids),
             )
             .await
             {
-                Ok(server) => return Ok(server),
+                Ok(mut server) => {
+                    auth_secret.valid(true);
+                    server.password_attempts = idx + 1;
+                    if options.session_replication_role {
+                        server.set_session_replication_role().await?;
+                    }
+                    return Ok(server);
+                }
                 Err(Error::ConnectionError(error)) => {
-                    if error.code == "28P01" {
+                    if error.is_bad_password() {
                         warn!(
                             "{}/{} password is incorrect, {} password candidates remaining [{}]",
                             idx + 1,
@@ -109,6 +214,7 @@ impl Server {
                             total - idx - 1,
                             addr
                         );
+                        auth_secret.valid(false);
                         continue;
                     } else {
                         return Err(Error::ConnectionError(error));
@@ -125,16 +231,13 @@ impl Server {
         ))))
     }
 
-    /// Create new PostgreSQL server connection with the given auth secret (e.g. password).
-    async fn connect_with_auth_secret(
-        addr: &Address,
-        options: ServerOptions,
-        connect_reason: ConnectReason,
-        auth_secret: &str,
-    ) -> Result<Self, Error> {
-        debug!("=> {}", addr);
+    async fn open(addr: &Address, config: &ConfigAndUsers) -> Result<Stream, Error> {
+        #[cfg(test)]
+        if addr.host == super::fake_server::HOST {
+            return Ok(super::fake_server::connect());
+        }
+
         let stream = TcpStream::connect(addr.addr().await?).await?;
-        let config = config();
 
         if let Err(err) = tweak(&stream, &config.config.tcp) {
             warn!(
@@ -143,19 +246,33 @@ impl Server {
             );
         }
 
-        let mut stream = Stream::plain(stream, config.config.memory.net_buffer);
+        Ok(Stream::plain(stream, config.config.memory.net_buffer))
+    }
 
-        let tls_mode = config.config.general.tls_verify;
+    /// Create new PostgreSQL server connection with the given auth secret (e.g. password).
+    async fn connect_with_auth_secret(
+        addr: &Address,
+        user: &str,
+        options: ServerOptions,
+        connect_reason: ConnectReason,
+        auth_secret: &super::pool::Password,
+        oids: Arc<Oids>,
+    ) -> Result<Self, Error> {
+        debug!("=> {}", addr);
+        let config = config();
+        let mut stream = Self::open(addr, &config).await?;
+
+        let tls = UpstreamTlsSettings::resolve(&config.config.general, &addr.tls);
 
         // Only attempt TLS if not in Disabled mode
-        if tls_mode != TlsVerifyMode::Disabled {
+        if tls.verify != TlsVerifyMode::Disabled {
             debug!(
                 "requesting TLS connection with verify mode: {:?} [{}]",
-                tls_mode, addr,
+                tls.verify, addr,
             );
 
             // Request TLS.
-            stream.write_all(&Startup::tls().to_bytes()?).await?;
+            stream.write_all(&Startup::tls().to_bytes()).await?;
             stream.flush().await?;
 
             let mut ssl = BytesMut::new();
@@ -165,10 +282,7 @@ impl Server {
             if ssl == SslReply::Yes {
                 debug!("server supports TLS, initiating TLS handshake [{}]", addr);
 
-                let connector = connector_with_verify_mode(
-                    tls_mode,
-                    config.config.general.tls_server_ca_certificate.as_ref(),
-                )?;
+                let connector = tls.connector()?;
                 let plain = stream.take()?;
 
                 let server_name = ServerName::try_from(addr.host.clone())?;
@@ -178,7 +292,8 @@ impl Server {
                     Ok(tls_stream) => {
                         debug!("TLS handshake successful with {}", addr.host);
                         let cipher = tokio_rustls::TlsStream::Client(tls_stream);
-                        stream = Stream::tls(cipher, config.config.memory.net_buffer);
+                        stream =
+                            Stream::tls(cipher, config.config.memory.net_buffer, None, false, None);
                     }
                     Err(e) => {
                         error!("TLS handshake failed with {:?} [{}]", e, addr);
@@ -188,7 +303,9 @@ impl Server {
                         )));
                     }
                 }
-            } else if tls_mode == TlsVerifyMode::VerifyFull || tls_mode == TlsVerifyMode::VerifyCa {
+            } else if tls.verify == TlsVerifyMode::VerifyFull
+                || tls.verify == TlsVerifyMode::VerifyCa
+            {
                 // If we require TLS but server doesn't support it, fail
                 error!("server does not support TLS but it is required [{}]", addr,);
                 return Err(Error::TlsRequired);
@@ -206,16 +323,17 @@ impl Server {
         }
 
         stream
-            .write_all(
-                &Startup::new(&addr.user, &addr.database_name, options.params.clone())
-                    .to_bytes()?,
-            )
+            .write_all(&Startup::new(user, &addr.database_name, options.params.clone()).to_bytes())
             .await?;
         stream.flush().await?;
 
         // Perform authentication.
-        let mut scram = Client::new(&addr.user, auth_secret);
-        let mut auth_type = AuthType::Trust;
+        let mut scram = Client::new(user, auth_secret);
+        let mut auth_type = if addr.server_auth.is_external_identity() {
+            AuthType::ExternalToken
+        } else {
+            AuthType::Trust
+        };
         loop {
             let message = stream.read().await?;
 
@@ -230,7 +348,8 @@ impl Server {
                     match auth {
                         Authentication::Ok => break,
                         Authentication::ClearTextPassword => {
-                            let password = Password::new_password(auth_secret);
+                            auth_type = AuthType::Plain;
+                            let password = Password::new_password(auth_secret.deref());
                             stream.send_flush(&password).await?;
                         }
                         Authentication::Sasl(_) => {
@@ -250,11 +369,8 @@ impl Server {
                         }
                         Authentication::Md5(salt) => {
                             auth_type = AuthType::Md5;
-                            let client = md5::Client::new_salt(
-                                &addr.user,
-                                &[auth_secret.to_string()],
-                                &salt,
-                            )?;
+                            let client =
+                                md5::Client::new_salt(user, &[auth_secret.to_string()], &salt)?;
                             stream.send_flush(&client.response()?).await?;
                         }
                     }
@@ -285,7 +401,7 @@ impl Server {
                 // ErrorResponse (B)
                 'E' => {
                     return Err(Error::ConnectionError(Box::new(ErrorResponse::from_bytes(
-                        message.to_bytes()?,
+                        message.to_bytes(),
                     )?)));
                 }
                 // NoticeResponse (B)
@@ -302,27 +418,30 @@ impl Server {
         // so they don't send BackendKeyData.
         // Generating a random one is fine, it just won't work when we try to
         // cancel a query with this secret.
-        let id = key_data.unwrap_or(BackendKeyData::new());
+        let key = key_data.unwrap_or_else(BackendKeyData::random_legacy);
         let params: Parameters = params.into();
 
         info!(
-            "new server connection [{}, auth: {}, reason: {}] {}",
-            addr,
+            "new server connection: auth={}, source={}, reason={} [{}] {}",
             auth_type,
+            auth_secret.source,
             connect_reason,
+            addr,
             if stream.is_tls() { "🔒" } else { "" },
         );
 
+        let id = BackendPid::from(&key);
         let mut server = Server {
             addr: addr.clone(),
             stream: Some(stream),
+            key,
             id,
-            stats: Stats::connect(id, addr, &params, &options, &config.config.memory),
+            stats: Stats::connect(id, addr, &params, &config.config.memory),
             replication_mode: options.replication_mode(),
             params,
             changed_params: Parameters::default(),
-            client_params: Parameters::default(),
-            prepared_statements: PreparedStatements::new(),
+            client_params: ParameterStore::default(),
+            prepared_statements: PreparedStatements::new(oids),
             dirty: false,
             streaming: false,
             schema_changed: false,
@@ -332,8 +451,11 @@ impl Server {
             re_synced: false,
             sending_request: false,
             pooler_mode: PoolerMode::Transaction,
-            stream_buffer: MessageBuffer::new(config.config.memory.message_buffer),
+            stream_buffer: MessageBuffer::new(config.config.memory.message_buffer, None),
             disconnect_reason: None,
+            password_attempts: 1, // This is going to be changed by parent caller.
+            max_age: None,
+            credentials_generation: 0,
         };
 
         server.stats.memory_used(server.memory_stats()); // Stream capacity.
@@ -342,23 +464,30 @@ impl Server {
     }
 
     /// Request query cancellation for the given backend server identifier.
-    pub async fn cancel(addr: &Address, id: &BackendKeyData) -> Result<(), Error> {
+    pub(crate) async fn cancel(addr: &Address, id: BackendKeyData) -> Result<(), Error> {
         let mut stream = TcpStream::connect(addr.addr().await?).await?;
-        stream
-            .write_all(&Startup::Cancel { id: *id }.to_bytes()?)
-            .await?;
+        stream.write_all(&Startup::Cancel { id }.to_bytes()).await?;
         stream.flush().await?;
 
         Ok(())
     }
 
     /// Send messages to the server and flush the buffer.
-    pub async fn send(&mut self, client_request: &ClientRequest) -> Result<(), Error> {
+    pub(crate) async fn send(&mut self, client_request: &ClientRequest) -> Result<(), Error> {
         // Request is being sent to the server, so the
         // server connection is in a partial state.
         self.sending_request = true;
 
         self.stats.state(State::Active);
+
+        // A portal lives until Sync, and so does the implicit transaction
+        // Postgres opened to hold it. No ReadyForQuery will tell us about it.
+        if client_request.opens_portal() {
+            self.in_transaction = true;
+        }
+
+        self.prepared_statements
+            .set_anonymous_client_params(client_request.anonymous_client_params);
 
         for message in client_request.messages.iter() {
             self.send_one(message).await?;
@@ -376,28 +505,63 @@ impl Server {
 
     /// Send one message to the server but don't flush the buffer,
     /// accelerating bulk transfers.
-    pub async fn send_one(&mut self, message: &ProtocolMessage) -> Result<(), Error> {
+    pub(crate) async fn send_one(&mut self, message: &ProtocolMessage) -> Result<(), Error> {
         self.stats.state(State::Active);
 
         let result = self.prepared_statements.handle(message)?;
 
-        let queue = match result {
-            HandleResult::Drop => [None, None],
-            HandleResult::Prepend(ref prepare) => [Some(prepare), Some(message)],
-            HandleResult::Forward => [Some(message), None],
-        };
-
-        for message in queue.iter().flatten() {
-            trace!("{:#?} >>> [{}]", message, self.addr());
+        match &result {
+            HandleResult::Drop => {}
+            HandleResult::Forward => self.send_stream(message).await?,
+            HandleResult::Rewrite(rewrite) => self.send_stream(rewrite).await?,
+            HandleResult::Prepend(prepare) => {
+                self.send_prepare(prepare).await?;
+                self.send_stream(message).await?;
+            }
+            HandleResult::PrependProtocolMessage(protocol_message) => {
+                self.send_stream(protocol_message).await?;
+                self.send_stream(message).await?;
+            }
+            HandleResult::PrependRewrite { prepend, rewrite } => {
+                self.send_prepare(prepend).await?;
+                self.send_stream(rewrite).await?;
+            }
         }
 
-        for message in queue.into_iter().flatten() {
-            match self.stream().send(message).await {
-                Ok(sent) => self.stats.send(sent, message.code() as u8),
-                Err(err) => {
-                    self.stats.state(State::Error);
-                    return Err(err.into());
-                }
+        Ok(())
+    }
+
+    /// Close a stale prepared statement, if any, then prepare the new one.
+    async fn send_prepare(&mut self, prepare: &Prepare) -> Result<(), Error> {
+        if let Some(close) = prepare.close() {
+            self.send_stream(close).await?;
+        }
+
+        self.send_stream(prepare.parse()).await
+    }
+
+    /// Send a message to Postgres and force us to ignore its respose in [`Self::read`].
+    ///
+    /// This is useful for injecting messages into the extended protocol flow
+    /// without waiting on I/O.
+    ///
+    pub(crate) async fn send_ignore(&mut self, message: &ProtocolMessage) -> Result<(), Error> {
+        self.prepared_statements.handle_ignore(message)?;
+        self.send_stream(message).await?;
+
+        Ok(())
+    }
+
+    /// Send message to Postgres, checking for any errors
+    /// and setting the server state accordingly.
+    async fn send_stream(&mut self, message: &ProtocolMessage) -> Result<(), Error> {
+        trace!("{:#?} >>> [{}]", message, self.addr());
+
+        match self.stream().send(message).await {
+            Ok(sent) => self.stats.send(sent, message.code() as u8),
+            Err(err) => {
+                self.stats.state(State::Error);
+                return Err(err.into());
             }
         }
 
@@ -405,7 +569,7 @@ impl Server {
     }
 
     /// Flush all pending messages making sure they are sent to the server immediately.
-    pub async fn flush(&mut self) -> Result<(), Error> {
+    pub(crate) async fn flush(&mut self) -> Result<(), Error> {
         if let Err(err) = self.stream().flush().await {
             trace!("😳");
             self.stats.state(State::Error);
@@ -421,15 +585,19 @@ impl Server {
     ///
     /// This method is cancel-safe.
     ///
-    pub async fn read(&mut self) -> Result<Message, Error> {
+    pub(crate) async fn read(&mut self) -> Result<Message, Error> {
         let message = loop {
             if let Some(message) = self.prepared_statements.state_mut().get_simulated() {
-                return Ok(message.backend(self.id));
+                // INVARIANT: omni dedup in multi_shard relies on this being process-unique;
+                // never substitute a non-unique value here.
+                break message.backend(self.id);
             }
             match self.stream_buffer.read(self.stream.as_mut().unwrap()).await {
                 Ok(message) => {
-                    let message = message.stream(self.streaming).backend(self.id);
-                    match self.prepared_statements.forward(&message) {
+                    // INVARIANT: omni dedup in multi_shard relies on this being process-unique;
+                    // never substitute a non-unique value here.
+                    let mut message = message.stream(self.streaming).backend(self.id);
+                    match self.prepared_statements.forward(&mut message) {
                         Ok(forward) => {
                             if forward {
                                 break message;
@@ -489,9 +657,12 @@ impl Server {
                 self.statement_executed = false;
             }
             'E' => {
-                let error = ErrorResponse::from_bytes(message.to_bytes()?)?;
+                let error = ErrorResponse::from_bytes(message.to_bytes())?;
                 self.schema_changed = error.code == "0A000";
                 self.stats.error();
+                if error.code == "25P03" {
+                    self.stats.idle_xact_timeout();
+                }
 
                 // Non-recoverable, Postgres is about to close the connection,
                 // by no fault of ours or theirs.
@@ -508,21 +679,22 @@ impl Server {
                 self.streaming = true;
             }
             'S' => {
-                let ps = ParameterStatus::from_bytes(message.to_bytes()?)?;
+                let ps = ParameterStatus::from_bytes(message.to_bytes())?;
                 self.changed_params.insert(ps.name, ps.value);
             }
             'C' => {
-                let cmd = CommandComplete::from_bytes(message.to_bytes()?)?;
+                let cmd = CommandComplete::from_bytes(message.to_bytes())?;
                 match cmd.command() {
                     "PREPARE" | "DEALLOCATE" => self.sync_prepared = true,
                     "DEALLOCATE ALL" => self.prepared_statements.clear(),
                     "DISCARD ALL" => {
                         self.prepared_statements.clear();
-                        self.client_params.clear();
+                        self.client_params.server_reset();
                     }
-                    "RESET" => self.client_params.clear(), // Someone reset params, we're gonna need to re-sync.
+                    "RESET" => self.client_params.server_reset(), // Someone reset params, we're gonna need to re-sync.
                     _ => (),
                 }
+                self.stats.rows_affected(&cmd);
                 self.statement_executed = true;
             }
             's' => self.statement_executed = true,
@@ -532,87 +704,70 @@ impl Server {
             _ => (),
         }
 
+        self.prepared_statements
+            .set_server_state(self.stats.get_state());
+
         trace!("{:#?} <<< [{}]", message, self.addr());
 
         Ok(message)
     }
 
     /// Synchronize parameters between client and server.
-    pub async fn link_client(
+    pub(crate) async fn link_client(
         &mut self,
-        id: &BackendKeyData,
-        params: &Parameters,
+        id: FrontendPid,
+        params: &ParameterStore,
         start_transaction: Option<&str>,
     ) -> Result<usize, Error> {
-        // Sync application_name parameter
-        // and update it in the stats.
+        let mut executed = 0;
+
+        // Sync application_name parameter and update it in the stats.
         let server_name = self.client_params.get_default("application_name", "PgDog");
         let client_name = params.get_default("application_name", "PgDog");
 
         self.stats.link_client(client_name, server_name, id);
 
-        // Clear any params previously tracked by SET.
-        self.changed_params.clear();
-        let mut clear_params = false;
+        let sync = self.client_params.sync(params);
 
-        // Compare client and server params.
-        let mut executed = if !params.identical(&self.client_params) {
-            // Construct client parameter SET queries.
-            let tracked = params.tracked();
-            // Construct RESET queries to reset any current params
-            // to their default values.
-            let mut queries = self.client_params.reset_queries();
+        if !sync.is_empty() {
+            // If sync fails, the client will drop this server, and the
+            // Guard cleanup routine will reset parameters back to their original state.
+            self.mark_dirty(true);
 
-            // Combine both to create a new, fresh session state
-            // on this connection.
-            queries.extend(tracked.set_queries(false));
+            debug!("syncing {} params", sync.len());
+            self.execute_batch(sync.deref()).await?;
 
-            // Set state on the connection only if
-            // there are any params to change.
-            if !queries.is_empty() {
-                debug!("syncing {} params", queries.len());
+            executed += sync.len();
+        }
 
-                self.execute_batch(&queries).await?;
-                clear_params = true;
-            }
-
-            // Update params on this connection.
-            self.client_params = tracked;
-
-            queries.len()
-        } else {
-            0
-        };
-
-        // Sync any parameters set inside the transaction. These will
-        // need to be revered on rollback or commited on commit.
+        // Sync any parameters set inside the transaction. These will be
+        // automatically reverted on rollback or committed on commit.
         if let Some(start_transaction) = start_transaction {
             self.execute(start_transaction).await?;
-            let transaction_sets = params.set_queries(true);
+            let queries = sync.transaction_sync();
 
-            if !transaction_sets.is_empty() {
-                debug!("syncing {} in-transaction params", transaction_sets.len());
-
-                self.execute_batch(&transaction_sets).await?;
-                clear_params = true;
-
-                self.client_params.copy_in_transaction(params);
+            if !queries.is_empty() {
+                debug!("syncing {} in-transaction params", queries.len());
+                self.execute_batch(&queries).await?;
+                executed += queries.len();
             }
-
-            executed += transaction_sets.len();
         }
 
-        if clear_params {
-            // We can receive ParameterStatus messages here,
-            // but we should ignore them since we are managing the session state.
-            self.changed_params.clear();
-        }
+        // Sync completed successfully.
+        self.client_params.sync_complete(sync);
+
+        // Executing `SET` will trigger the server to send `ParameterStatus` for some of them,
+        // which will not be relevant for clients syncing params.
+        self.changed_params.clear();
+
+        // The server synced successfully, so we disarm the Guard cleanup routine.
+        self.mark_dirty(false);
 
         Ok(executed)
     }
 
     // Handle COMMIT/ROLLBACK for in-transaction params tracking.
-    pub fn transaction_params_hook(&mut self, rollback: bool) {
+    pub(crate) fn transaction_complete(&mut self, rollback: bool) {
         if rollback {
             self.client_params.rollback();
         } else {
@@ -620,11 +775,11 @@ impl Server {
         }
     }
 
-    pub fn changed_params(&self) -> &Parameters {
+    pub(crate) fn changed_params(&self) -> &Parameters {
         &self.changed_params
     }
 
-    pub fn reset_changed_params(&mut self) {
+    pub(crate) fn reset_changed_params(&mut self) {
         self.changed_params.clear();
     }
 
@@ -632,20 +787,27 @@ impl Server {
     ///
     /// There are no more expected messages from the server connection
     /// and we haven't started an explicit transaction.
-    pub fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.prepared_statements.done() && !self.in_transaction() && !self.statement_executed
     }
 
     /// Server hasn't finished sending or receiving a complete message.
-    pub fn io_in_progress(&self) -> bool {
+    pub(crate) fn io_in_progress(&self) -> bool {
         self.stream
             .as_ref()
             .map(|stream| stream.io_in_progress())
             .unwrap_or(false)
     }
 
+    pub(crate) fn liveness(&mut self) -> Liveness {
+        self.stream
+            .as_mut()
+            .map(|stream| stream.liveness())
+            .unwrap_or(Liveness::Closed)
+    }
+
     /// Server can execute a query.
-    pub fn in_sync(&self) -> bool {
+    pub(crate) fn in_sync(&self) -> bool {
         matches!(
             self.stats().get_state(),
             State::Idle | State::IdleInTransaction | State::TransactionError
@@ -654,94 +816,113 @@ impl Server {
 
     /// Server is done executing all queries and is
     /// not inside a transaction.
-    pub fn can_check_in(&self) -> bool {
+    pub(crate) fn can_check_in(&self) -> bool {
         self.stats().get_state() == State::Idle
     }
 
     /// Server hasn't sent all messages yet.
-    pub fn has_more_messages(&self) -> bool {
+    pub(crate) fn has_more_messages(&self) -> bool {
         self.prepared_statements.has_more_messages() || self.streaming
     }
 
-    pub fn in_copy_mode(&self) -> bool {
+    pub(crate) fn in_copy_mode(&self) -> bool {
         self.prepared_statements.in_copy_mode()
     }
 
     /// Protocol is out of sync due to an error in extended protocol.
-    pub fn out_of_sync(&self) -> bool {
+    pub(crate) fn out_of_sync(&self) -> bool {
         self.prepared_statements.out_of_sync()
     }
 
     /// Server is still inside a transaction.
-    #[inline]
-    pub fn in_transaction(&self) -> bool {
+    pub(crate) fn in_transaction(&self) -> bool {
         self.in_transaction
     }
 
+    /// A statement completed since the last ReadyForQuery.
+    pub(crate) fn statement_executed(&self) -> bool {
+        self.statement_executed
+    }
+
     /// The server connection permanently failed.
-    #[inline]
-    pub fn error(&self) -> bool {
+    pub(crate) fn error(&self) -> bool {
         self.stats().get_state() == State::Error
     }
 
     /// Did the schema change and prepared statements are broken.
-    pub fn schema_changed(&self) -> bool {
+    pub(crate) fn schema_changed(&self) -> bool {
         self.schema_changed
     }
 
     /// Prepared statements changed outside of our pipeline,
     /// need to resync from `pg_prepared_statements` view.
-    pub fn sync_prepared(&self) -> bool {
+    pub(crate) fn sync_prepared(&self) -> bool {
         self.sync_prepared
     }
 
     /// Connection was left with an unfinished query.
-    pub fn needs_drain(&self) -> bool {
+    pub(crate) fn needs_drain(&self) -> bool {
         !self.in_sync()
     }
 
     /// A request is being sent by a client.
-    pub fn sending_request(&self) -> bool {
+    pub(crate) fn is_sending_request(&self) -> bool {
         self.sending_request
     }
 
     /// Close the connection, don't do any recovery.
-    pub fn force_close(&self) -> bool {
+    pub(crate) fn is_force_close(&self) -> bool {
         self.stats().get_state() == State::ForceClose || self.io_in_progress()
     }
 
+    /// Indicate that this connection should be closed
+    /// when it's returned to the connection pool.
+    pub(crate) fn force_close(&mut self) {
+        self.stats_mut().state(State::ForceClose);
+    }
+
     /// Server parameters.
-    #[inline]
-    pub fn params(&self) -> &Parameters {
+    pub(crate) fn params(&self) -> &Parameters {
         &self.params
     }
 
+    /// Manually set the session_replication_role setting via SET
+    /// since apparently we can't do this via startup parameters.
+    async fn set_session_replication_role(&mut self) -> Result<(), Error> {
+        self.execute_checked("SET session_replication_role TO replica")
+            .await?;
+        self.params.insert("session_replication_role", "replica");
+
+        Ok(())
+    }
+
     /// Execute a batch of queries and return all results.
-    pub async fn execute_batch(&mut self, queries: &[Query]) -> Result<Vec<Message>, Error> {
+    pub(crate) async fn execute_batch(
+        &mut self,
+        request: impl Into<ServerRequest>,
+    ) -> Result<Vec<Message>, Error> {
+        let request = request.into();
         let mut err = None;
         if !self.in_sync() {
             return Err(Error::NotInSync);
         }
 
-        // Empty queries will throw the server out of sync.
-        if queries.is_empty() {
+        // Empty requests will throw the server out of sync.
+        if request.messages.is_empty() {
             return Ok(vec![]);
         }
 
         #[cfg(debug_assertions)]
-        for query in queries {
-            debug!("{} [{}]", query.query(), self.addr());
+        for message in &request.messages {
+            if let ProtocolMessage::Query(query) = message {
+                debug!("{} [{}]", query.query(), self.addr());
+            }
         }
 
         let mut messages = vec![];
-        let queries = queries
-            .iter()
-            .map(Clone::clone)
-            .map(ProtocolMessage::Query)
-            .collect::<Vec<ProtocolMessage>>();
-        let expected = queries.len();
+        let expected = request.expected;
 
-        self.send(&queries.into()).await?;
+        self.send(&request.messages.into()).await?;
 
         let mut zs = 0;
         while zs < expected {
@@ -751,7 +932,7 @@ impl Server {
             }
 
             if message.code() == 'E' {
-                err = Some(ErrorResponse::from_bytes(message.to_bytes()?)?);
+                err = Some(ErrorResponse::from_bytes(message.to_bytes())?);
             }
             messages.push(message);
         }
@@ -764,27 +945,29 @@ impl Server {
     }
 
     /// Execute a query on the server and return the result.
-    pub async fn execute(&mut self, query: impl Into<Query>) -> Result<Vec<Message>, Error> {
-        let query = query.into();
-        self.execute_batch(&[query]).await
+    pub(crate) async fn execute(
+        &mut self,
+        request: impl Into<ServerRequest>,
+    ) -> Result<Vec<Message>, Error> {
+        self.execute_batch(request).await
     }
 
     /// Execute query and raise an error if one is returned by PostgreSQL.
-    pub async fn execute_checked(
+    pub(crate) async fn execute_checked(
         &mut self,
-        query: impl Into<Query>,
+        request: impl Into<ServerRequest>,
     ) -> Result<Vec<Message>, Error> {
-        let messages = self.execute(query).await?;
+        let messages = self.execute(request).await?;
         let notices = messages.iter().filter(|m| m.code() == 'N');
 
         for notice in notices {
-            let notice = NoticeResponse::from_bytes(notice.to_bytes()?)?;
+            let notice = NoticeResponse::from_bytes(notice.to_bytes())?;
             warn!("{} [{}]", notice.message.message, self.addr());
         }
 
         let error = messages.iter().find(|m| m.code() == 'E');
         if let Some(error) = error {
-            let error = ErrorResponse::from_bytes(error.to_bytes()?)?;
+            let error = ErrorResponse::from_bytes(error.to_bytes())?;
             Err(Error::ExecutionError(Box::new(error)))
         } else {
             Ok(messages)
@@ -792,24 +975,22 @@ impl Server {
     }
 
     /// Execute a query and return all rows.
-    pub async fn fetch_all<T: From<DataRow>>(
+    pub(crate) async fn fetch_all<T: From<DataRow>>(
         &mut self,
-        query: impl Into<Query>,
+        request: impl Into<ServerRequest>,
     ) -> Result<Vec<T>, Error> {
-        let messages = self.execute_checked(query).await?;
+        let messages = self.execute_checked(request).await?;
         Ok(messages
             .into_iter()
             .filter(|message| message.code() == 'D')
-            .map(|message| message.to_bytes().unwrap())
+            .map(|message| message.to_bytes())
             .map(DataRow::from_bytes)
-            .collect::<Result<Vec<DataRow>, crate::net::Error>>()?
-            .into_iter()
-            .map(|row| T::from(row))
-            .collect())
+            .map(|maybe_row| maybe_row.map(T::from))
+            .collect::<Result<Vec<T>, _>>()?)
     }
 
     /// Perform a healthcheck on this connection using the provided query.
-    pub async fn healthcheck(&mut self, query: &str) -> Result<(), Error> {
+    pub(crate) async fn healthcheck(&mut self, query: &str) -> Result<(), Error> {
         debug!("running healthcheck \"{}\" [{}]", query, self.addr);
 
         self.execute(query).await?;
@@ -827,7 +1008,7 @@ impl Server {
         }
 
         // Reset any params left over.
-        self.transaction_params_hook(true);
+        self.transaction_complete(true);
 
         if !self.done() {
             Err(Error::RollbackFailed)
@@ -836,23 +1017,99 @@ impl Server {
         }
     }
 
-    /// Drain any remaining messages on the server connection,
-    /// attempting to return the connection into a synchronized state.
-    pub(super) async fn drain(&mut self) -> Result<(), Error> {
-        while self.has_more_messages() {
-            self.read().await?;
-        }
-
+    /// Return connection to synchronized extended protocol state.
+    ///
+    /// Sends [`Sync`] to the server and receives all messages it returns, up to
+    /// [`ReadyForQuery`].
+    pub(super) async fn synchronize(&mut self) -> Result<(), Error> {
         if !self.in_sync() {
             self.send(&vec![ProtocolMessage::Sync(Sync)].into()).await?;
 
             while !self.in_sync() {
                 self.read().await?;
             }
+
+            self.re_synced = true;
         }
 
-        self.re_synced = true;
         Ok(())
+    }
+
+    /// Abort a successful extended-protocol execution before synchronizing.
+    ///
+    /// A Sync by itself would commit PostgreSQL's implicit transaction.
+    /// Pending replies must be drained before calling this method.
+    pub(super) async fn rollback_and_synchronize(&mut self) -> Result<(), Error> {
+        let request = ServerRequest::parameterized("ROLLBACK", &[]);
+        self.send(&request.messages.into()).await?;
+
+        while !self.in_sync() {
+            self.read().await?;
+        }
+
+        if !self.done() {
+            return Err(Error::RollbackFailed);
+        }
+
+        self.stats.rollback();
+        self.transaction_complete(true);
+        self.re_synced = true;
+
+        Ok(())
+    }
+
+    /// Drain replies already owed by the server without changing transaction state.
+    pub(super) async fn drain_pending(&mut self) -> Result<(), Error> {
+        while self.has_more_messages() {
+            self.read().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Return an unfinished extended-protocol exchange to a reusable state.
+    ///
+    /// Returns false when the configured recovery policy cannot safely recover
+    /// the connection.
+    pub(super) async fn recover_protocol(
+        &mut self,
+        recovery: ConnectionRecovery,
+    ) -> Result<bool, Error> {
+        if self.has_more_messages() {
+            if !recovery.can_recover() || self.is_sending_request() {
+                return Ok(false);
+            }
+
+            debug!(
+                "[cleanup] draining data from \"{}\" server [{}]",
+                self.stats().get_state(),
+                self.addr()
+            );
+            self.drain_pending().await?;
+        }
+
+        if self.out_of_sync() || !self.statement_executed() {
+            self.synchronize().await?;
+        } else if recovery.can_rollback() {
+            debug!(
+                "[cleanup] rolling back extended transaction, in \"{}\" state [{}]",
+                self.stats().get_state(),
+                self.addr(),
+            );
+            self.rollback_and_synchronize().await?;
+        } else {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Drain any remaining messages on the server connection,
+    /// attempting to return the connection into a synchronized state.
+    #[cfg(test)]
+    pub(super) async fn drain(&mut self) -> Result<(), Error> {
+        self.drain_pending().await?;
+        self.synchronize().await
     }
 
     /// Synchronize prepared statements from Postgres.
@@ -875,6 +1132,9 @@ impl Server {
     }
 
     /// Close any prepared statements that exceed cache capacity.
+    ///
+    /// N.B.: Caller is responsible for actually sending these to the server
+    /// to synchronize state, see [`Self::close_many`].
     pub(super) fn ensure_prepared_capacity(&mut self) -> Vec<Close> {
         let close = self.prepared_statements.ensure_capacity();
         self.stats
@@ -890,10 +1150,10 @@ impl Server {
 
         let mut buf = vec![];
         for close in close {
-            buf.push(close.message()?);
+            buf.push(close.message());
         }
 
-        buf.push(Sync.message()?);
+        buf.push(Sync.message());
 
         debug!(
             "closing {} prepared statements [{}]",
@@ -909,7 +1169,7 @@ impl Server {
                 '3' => self.prepared_statements.remove(close.name()),
                 'E' => {
                     return Err(Error::PreparedStatementError(Box::new(
-                        ErrorResponse::from_bytes(response.to_bytes()?)?,
+                        ErrorResponse::from_bytes(response.to_bytes())?,
                     )));
                 }
                 c => {
@@ -927,55 +1187,95 @@ impl Server {
     }
 
     /// Reset error state caused by schema change.
-    #[inline]
-    pub fn reset_schema_changed(&mut self) {
+    pub(super) fn reset_schema_changed(&mut self) {
         self.schema_changed = false;
         self.prepared_statements.clear();
     }
 
-    #[inline]
-    pub fn reset_params(&mut self) {
-        self.client_params.clear();
+    /// Reset server params to their original startup state.
+    pub(super) fn reset_params(&mut self) {
+        self.client_params.server_reset();
     }
 
-    #[inline]
-    pub fn reset_re_synced(&mut self) {
+    /// Reset the connection re_synced state to default.
+    pub(super) fn reset_re_synced(&mut self) {
         self.re_synced = false;
     }
 
-    #[inline]
-    pub fn re_synced(&self) -> bool {
+    /// Get server connection re_synced state.
+    pub(super) fn re_synced(&self) -> bool {
         self.re_synced
     }
 
-    #[inline]
-    pub fn disconnect_reason(&mut self, reason: DisconnectReason) {
+    pub(super) fn disconnect_reason(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_none() {
             self.disconnect_reason = Some(reason);
         }
     }
 
     /// Server connection unique identifier.
-    #[inline]
-    pub fn id(&self) -> &BackendKeyData {
-        &self.id
+    pub(crate) fn id(&self) -> BackendPid {
+        self.id
+    }
+
+    /// Backend key data for query cancellation.
+    pub(crate) fn key(&self) -> &BackendKeyData {
+        &self.key
+    }
+
+    /// Number of password attempts it took to authenticate this connection.
+    pub(crate) fn password_attempts(&self) -> usize {
+        self.password_attempts
     }
 
     /// How old this connection is.
-    #[inline]
-    pub fn age(&self, instant: Instant) -> Duration {
+    pub(crate) fn age(&self, instant: Instant) -> Duration {
         instant.duration_since(self.stats().created_at())
     }
 
+    /// Sample and apply a per-connection `max_age` uniformly from
+    /// `[base - jitter, base + jitter]`, breaking up synchronized
+    /// retirement of connection cohorts. Saturates at zero on
+    /// negative overflow. No-op when `jitter` is zero. Called once
+    /// by the pool after a successful connect.
+    pub(crate) fn apply_lifetime_jitter(&mut self, base: Duration, jitter: Duration) {
+        if jitter.is_zero() {
+            return;
+        }
+        use rand::Rng;
+        // Sampling is signed, so drop into ms locally; result goes back
+        // out as a Duration immediately, no leak across the API.
+        let jitter_ms = jitter.as_millis() as i64;
+        let offset_ms = rand::rng().random_range(-jitter_ms..=jitter_ms);
+        let offset = Duration::from_millis(offset_ms.unsigned_abs());
+        self.max_age = Some(if offset_ms >= 0 {
+            base.saturating_add(offset)
+        } else {
+            base.saturating_sub(offset)
+        });
+    }
+
+    /// Effective max_age for this connection: the per-connection
+    /// jittered value if one was sampled, otherwise `base`.
+    pub(crate) fn effective_max_age(&self, base: Duration) -> Duration {
+        self.max_age.unwrap_or(base)
+    }
+
+    pub(crate) fn credentials_generation(&self) -> u64 {
+        self.credentials_generation
+    }
+
+    pub(crate) fn set_credentials_generation(&mut self, generation: u64) {
+        self.credentials_generation = generation;
+    }
+
     /// How long this connection has been idle.
-    #[inline]
-    pub fn idle_for(&self, instant: Instant) -> Duration {
+    pub(crate) fn idle_for(&self, instant: Instant) -> Duration {
         instant.duration_since(self.stats().last_used())
     }
 
     /// How long has it been since the last connection healthcheck.
-    #[inline]
-    pub fn healthcheck_age(&self, instant: Instant) -> Duration {
+    pub(crate) fn healthcheck_age(&self, instant: Instant) -> Duration {
         if let Some(last_healthcheck) = self.stats().last_healthcheck() {
             instant.duration_since(last_healthcheck)
         } else {
@@ -984,78 +1284,60 @@ impl Server {
     }
 
     /// Get server address.
-    #[inline]
-    pub fn addr(&self) -> &Address {
+    pub(crate) fn addr(&self) -> &Address {
         &self.addr
     }
 
-    #[inline]
     fn stream(&mut self) -> &mut Stream {
         self.stream.as_mut().unwrap()
     }
 
-    /// Server needs a cleanup because client changed a session variable
-    /// of parameter.
-    #[inline]
-    pub fn dirty(&self) -> bool {
+    /// Server needs a cleanup because client changed a session variable,
+    /// parameter, or advisory lock state
+    pub(crate) fn dirty(&self) -> bool {
         self.dirty
     }
 
-    #[inline]
-    pub fn mark_dirty(&mut self, dirty: bool) {
+    pub(crate) fn mark_dirty(&mut self, dirty: bool) {
         self.dirty = dirty;
     }
 
     /// Server has been cleaned.
-    #[inline]
     pub(super) fn cleaned(&mut self) {
         self.dirty = false;
         self.stats.cleaned();
     }
 
-    /// Server is streaming data.
-    #[inline]
-    pub fn streaming(&self) -> bool {
-        self.streaming
-    }
-
-    #[inline]
-    pub fn stats(&self) -> &Stats {
+    pub(crate) fn stats(&self) -> &Stats {
         &self.stats
     }
 
-    #[inline]
-    pub fn stats_mut(&mut self) -> &mut Stats {
+    pub(crate) fn stats_mut(&mut self) -> &mut Stats {
         &mut self.stats
     }
 
-    #[inline]
-    pub fn set_pooler_mode(&mut self, pooler_mode: PoolerMode) {
+    pub(crate) fn set_pooler_mode(&mut self, pooler_mode: PoolerMode) {
         self.pooler_mode = pooler_mode;
     }
 
-    #[inline]
-    pub fn pooler_mode(&self) -> &PoolerMode {
+    pub(crate) fn pooler_mode(&self) -> &PoolerMode {
         &self.pooler_mode
     }
 
-    #[inline]
-    pub fn replication_mode(&self) -> bool {
+    pub(crate) fn replication_mode(&self) -> bool {
         self.replication_mode
     }
 
-    #[inline]
-    pub fn prepared_statements_mut(&mut self) -> &mut PreparedStatements {
+    pub(crate) fn prepared_statements_mut(&mut self) -> &mut PreparedStatements {
         &mut self.prepared_statements
     }
 
-    #[inline]
-    pub fn prepared_statements(&self) -> &PreparedStatements {
+    #[cfg(test)]
+    pub(crate) fn prepared_statements(&self) -> &PreparedStatements {
         &self.prepared_statements
     }
 
-    #[inline]
-    pub fn memory_stats(&self) -> MemoryStats {
+    pub(crate) fn memory_stats(&self) -> MemoryStats {
         MemoryStats {
             inner: pgdog_stats::MemoryStats {
                 buffer: *self.stream_buffer.stats(),
@@ -1068,21 +1350,22 @@ impl Server {
             },
         }
     }
-}
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stats().disconnect();
+    pub(crate) fn replace_oids(&mut self, oids: &Arc<Oids>) {
+        self.prepared_statements.replace_oids(oids);
+    }
+
+    pub(crate) fn terminate(&mut self) {
         if let Some(mut stream) = self.stream.take() {
             info!(
-                "closing server connection [{}, state: {}, reason: {}]",
-                self.addr,
+                "closing server connection: state={}, reason={} [{}]",
                 self.stats.get_state(),
                 self.disconnect_reason.take().unwrap_or_default(),
+                self.addr,
             );
 
             spawn(async move {
-                stream.write_all(&Terminate.to_bytes()?).await?;
+                stream.write_all(&Terminate.to_bytes()).await?;
                 stream.flush().await?;
                 Ok::<(), Error>(())
             });
@@ -1090,16 +1373,31 @@ impl Drop for Server {
     }
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stats().disconnect();
+        self.terminate();
+    }
+}
+
 // Used for testing.
 #[cfg(test)]
-pub mod test {
-    use bytes::{BufMut, BytesMut};
+pub(crate) mod test {
+    use std::time::{Duration, SystemTime};
+
+    use bytes::{BufMut, Bytes, BytesMut};
+    use pgdog_config::prepared_statements::PreparedStatementsConfig;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    use crate::{config::Memory, frontend::PreparedStatements, net::*};
+    use crate::{
+        backend::pool::token_cache::TokenCache,
+        config::Memory,
+        frontend::PreparedStatements,
+        net::{Prepare, *},
+    };
 
     use super::{Error, *};
 
@@ -1119,22 +1417,18 @@ pub mod test {
 
     impl Default for Server {
         fn default() -> Self {
-            let id = BackendKeyData::new();
+            let key = BackendKeyData::random_legacy();
+            let id = BackendPid::from(&key);
             let addr = Address::default();
             Self {
                 stream: None,
+                key,
                 id,
                 params: Parameters::default(),
                 changed_params: Parameters::default(),
-                client_params: Parameters::default(),
-                stats: Stats::connect(
-                    id,
-                    &addr,
-                    &Parameters::default(),
-                    &ServerOptions::default(),
-                    &Memory::default(),
-                ),
-                prepared_statements: super::PreparedStatements::new(),
+                client_params: ParameterStore::default(),
+                stats: Stats::connect(id, &addr, &Parameters::default(), &Memory::default()),
+                prepared_statements: super::PreparedStatements::default(),
                 addr,
                 dirty: false,
                 streaming: false,
@@ -1144,16 +1438,19 @@ pub mod test {
                 re_synced: false,
                 replication_mode: false,
                 pooler_mode: PoolerMode::Transaction,
-                stream_buffer: MessageBuffer::new(4096),
+                stream_buffer: MessageBuffer::new(4096, None),
                 disconnect_reason: None,
                 statement_executed: false,
                 sending_request: false,
+                password_attempts: 1,
+                max_age: None,
+                credentials_generation: 0,
             }
         }
     }
 
     impl Server {
-        pub fn new_error() -> Server {
+        pub(crate) fn new_error() -> Server {
             let mut server = Server::default();
             server.stats.state(State::Error);
 
@@ -1161,24 +1458,76 @@ pub mod test {
         }
     }
 
-    pub async fn test_server() -> Server {
+    pub(crate) async fn test_server() -> Server {
         Server::connect(
             &Address::new_test(),
             ServerOptions::default(),
             ConnectReason::Other,
+            Default::default(),
         )
         .await
         .unwrap()
     }
 
-    pub async fn test_replication_server() -> Server {
+    pub(crate) async fn test_replication_server() -> Server {
         Server::connect(
             &Address::new_test(),
             ServerOptions::new_replication(),
-            ConnectReason::Replication,
+            ConnectReason::Resharding,
+            Default::default(),
         )
         .await
         .unwrap()
+    }
+
+    async fn server_with_peer() -> (Server, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (ours, _) = listener.accept().await.unwrap();
+
+        let mut server = Server::default();
+        server.stream = Some(Stream::plain(ours, 4096));
+
+        (server, peer.await.unwrap())
+    }
+
+    async fn wait_for_liveness(server: &mut Server, expected: Liveness) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.liveness() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server socket did not reach expected liveness state");
+    }
+
+    #[test]
+    fn test_liveness_without_stream_is_closed() {
+        let mut server = Server::default();
+
+        assert_eq!(server.liveness(), Liveness::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_liveness_tracks_the_underlying_socket() {
+        let (mut server, peer) = server_with_peer().await;
+
+        assert_eq!(server.liveness(), Liveness::Clean);
+
+        drop(peer);
+
+        wait_for_liveness(&mut server, Liveness::Closed).await;
+    }
+
+    #[tokio::test]
+    async fn test_liveness_reports_unsolicited_server_data() {
+        let (mut server, mut peer) = server_with_peer().await;
+
+        peer.write_all(b"E").await.unwrap();
+        peer.flush().await.unwrap();
+
+        wait_for_liveness(&mut server, Liveness::DataPending).await;
     }
 
     #[tokio::test]
@@ -1201,7 +1550,7 @@ pub mod test {
                 assert!(matches!(startup, Startup::Startup { .. }));
 
                 socket
-                    .write_all(&Authentication::ClearTextPassword.to_bytes().unwrap())
+                    .write_all(&Authentication::ClearTextPassword.to_bytes())
                     .await
                     .unwrap();
 
@@ -1209,15 +1558,15 @@ pub mod test {
                 assert_eq!(password.password(), Some(expected_secret.as_str()));
 
                 socket
-                    .write_all(&Authentication::Ok.to_bytes().unwrap())
+                    .write_all(&Authentication::Ok.to_bytes())
                     .await
                     .unwrap();
                 socket
-                    .write_all(&BackendKeyData::new().to_bytes().unwrap())
+                    .write_all(&BackendKeyData::random_legacy().to_bytes())
                     .await
                     .unwrap();
                 socket
-                    .write_all(&ReadyForQuery::idle().to_bytes().unwrap())
+                    .write_all(&ReadyForQuery::idle().to_bytes())
                     .await
                     .unwrap();
             }
@@ -1229,9 +1578,19 @@ pub mod test {
         addr.server_iam_region = Some("us-east-1".into());
         addr.passwords = vec!["wrong-password".into()];
 
-        crate::backend::auth::rds_iam::set_test_token_override(Some(expected_secret));
-        let result = Server::connect(&addr, ServerOptions::default(), ConnectReason::Other).await;
-        crate::backend::auth::rds_iam::set_test_token_override(None);
+        TokenCache::global().set(
+            &addr,
+            expected_secret,
+            SystemTime::now() + Duration::from_secs(3600),
+        );
+        let result = Server::connect(
+            &addr,
+            ServerOptions::default(),
+            ConnectReason::Other,
+            Default::default(),
+        )
+        .await;
+        TokenCache::global().evict(&addr);
 
         let server = result.unwrap();
         drop(server);
@@ -1258,7 +1617,7 @@ pub mod test {
                 assert!(matches!(startup, Startup::Startup { .. }));
 
                 socket
-                    .write_all(&Authentication::ClearTextPassword.to_bytes().unwrap())
+                    .write_all(&Authentication::ClearTextPassword.to_bytes())
                     .await
                     .unwrap();
 
@@ -1266,15 +1625,15 @@ pub mod test {
                 assert_eq!(password.password(), Some(expected_secret.as_str()));
 
                 socket
-                    .write_all(&Authentication::Ok.to_bytes().unwrap())
+                    .write_all(&Authentication::Ok.to_bytes())
                     .await
                     .unwrap();
                 socket
-                    .write_all(&BackendKeyData::new().to_bytes().unwrap())
+                    .write_all(&BackendKeyData::random_legacy().to_bytes())
                     .await
                     .unwrap();
                 socket
-                    .write_all(&ReadyForQuery::idle().to_bytes().unwrap())
+                    .write_all(&ReadyForQuery::idle().to_bytes())
                     .await
                     .unwrap();
             }
@@ -1285,11 +1644,19 @@ pub mod test {
         addr.server_auth = crate::config::ServerAuth::AzureWorkloadIdentity;
         addr.passwords = vec!["wrong-password".into()];
 
-        crate::backend::auth::azure_workload_identity::set_test_token_override(Some(
+        TokenCache::global().set(
+            &addr,
             expected_secret,
-        ));
-        let result = Server::connect(&addr, ServerOptions::default(), ConnectReason::Other).await;
-        crate::backend::auth::azure_workload_identity::set_test_token_override(None);
+            SystemTime::now() + Duration::from_secs(3600),
+        );
+        let result = Server::connect(
+            &addr,
+            ServerOptions::default(),
+            ConnectReason::Other,
+            Default::default(),
+        )
+        .await;
+        TokenCache::global().evict(&addr);
 
         let server = result.unwrap();
         drop(server);
@@ -1433,7 +1800,7 @@ pub mod test {
             let parse = Parse::named(&name, format!("SELECT $1, 'test_{}'", name));
             let (new, new_name) = PreparedStatements::global().write().insert(&parse);
             let name = new_name;
-            let parse = parse.rename(&name);
+            let parse = parse.renamed(&name);
             assert!(new);
 
             let describe = Describe::new_statement(&name);
@@ -1461,13 +1828,6 @@ pub mod test {
                 let msg = server.read().await.unwrap();
                 assert_eq!(c, msg.code());
             }
-
-            // RowDescription saved.
-            let global = server.prepared_statements.parse(&name).unwrap();
-            server
-                .prepared_statements
-                .row_description(global.name())
-                .unwrap();
 
             server
                 .send(
@@ -1514,7 +1874,7 @@ pub mod test {
         let parse = Parse::named("random_name", "SELECT $1");
         let (new, name) = global.write().insert(&parse);
         assert!(new);
-        let parse = parse.rename(&name);
+        let parse = parse.renamed(&name);
         assert_eq!(parse.name(), "__pgdog_1");
 
         let mut server = test_server().await;
@@ -1657,7 +2017,7 @@ pub mod test {
             let msg = server.read().await.unwrap();
             assert_eq!(msg.code(), c);
         }
-        assert!(server.prepared_statements.is_empty());
+        assert_eq!(server.prepared_statements.len(), 0);
 
         server
             .send(
@@ -1954,20 +2314,20 @@ pub mod test {
 
     #[tokio::test]
     async fn test_manual_prepared() {
+        crate::logger();
         let mut server = test_server().await;
 
         let mut prep = PreparedStatements::new();
-        let mut parse = Parse::named("test", "SELECT 1::bigint");
-        prep.insert_anyway(&mut parse);
-        assert_eq!(parse.name(), "__pgdog_1");
+        let name = "test";
+        let query = Bytes::from("SELECT 1::bigint".to_owned());
+        let prepare = prep.insert_test(name, query.clone());
+        assert_eq!(prepare.name(), "__pgdog_1");
 
         server
             .send(
-                &vec![ProtocolMessage::from(Query::new(format!(
-                    "PREPARE {} AS {}",
-                    parse.name(),
-                    parse.query()
-                )))]
+                &vec![ProtocolMessage::Query(Query::new(
+                    "PREPARE __pgdog_1 AS SELECT 1::bigint",
+                ))]
                 .into(),
             )
             .await
@@ -2022,7 +2382,7 @@ pub mod test {
             let msg = server.read().await.unwrap();
             assert_eq!(c, msg.code());
             if c == 'D' {
-                let data_row = DataRow::from_bytes(msg.to_bytes().unwrap()).unwrap();
+                let data_row = DataRow::from_bytes(msg.to_bytes()).unwrap();
                 let result: i64 = data_row.get(0, Format::Text).unwrap();
                 assert_eq!(result, 1); // We prepared SELECT 1, SELECT 2 is ignored.
             }
@@ -2046,11 +2406,11 @@ pub mod test {
             "on"
         };
 
-        let mut params = Parameters::default();
-        params.insert("application_name", "test_sync_params");
-        params.insert("is_superuser", opposite);
+        let mut params = ParameterStore::default();
+        params.set("application_name", "test_sync_params");
+        params.set("is_superuser", opposite);
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -2072,7 +2432,7 @@ pub mod test {
         );
 
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await
             .unwrap();
         assert_eq!(changed, 0);
@@ -2155,32 +2515,32 @@ pub mod test {
 
     #[tokio::test]
     async fn test_params_sync() -> Result<(), Box<dyn std::error::Error>> {
-        let mut params = Parameters::default();
-        params.insert("application_name", "test");
+        let mut params = ParameterStore::default();
+        params.set("application_name", "test");
 
         let mut server = test_server().await;
 
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await?;
         assert_eq!(changed, 1);
 
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await?;
         assert_eq!(changed, 0);
 
         for i in 0..25 {
             let value = format!("apples_{}", i);
-            params.insert("application_name", value);
+            params.set("application_name", value);
 
             let changed = server
-                .link_client(&BackendKeyData::new(), &params, None)
+                .link_client(FrontendPid::new(), &params, None)
                 .await?;
-            assert_eq!(changed, 2); // RESET, SET.
+            assert_eq!(changed, 1); // SET only; the parameter already exists.
 
             let changed = server
-                .link_client(&BackendKeyData::new(), &params, None)
+                .link_client(FrontendPid::new(), &params, None)
                 .await?;
             assert_eq!(changed, 0);
         }
@@ -2413,8 +2773,12 @@ pub mod test {
             let in_sync = server.fetch_all::<i64>("SELECT 1::bigint").await.unwrap();
             assert_eq!(in_sync[0], 1);
 
-            server.prepared_statements.set_capacity(3);
-            assert_eq!(server.prepared_statements.capacity(), 3);
+            server
+                .prepared_statements
+                .configure(PreparedStatementsConfig {
+                    limit: 3,
+                    ..Default::default()
+                });
 
             server
                 .send(
@@ -2455,6 +2819,87 @@ pub mod test {
                 assert_eq!(msg.code(), c);
             }
         }
+    }
+
+    /// What Postgres itself thinks is prepared on this connection.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct PreparedInPostgres {
+        pub(crate) name: String,
+        pub(crate) prepared_at: String,
+    }
+
+    impl From<DataRow> for PreparedInPostgres {
+        fn from(value: DataRow) -> Self {
+            Self {
+                name: value.get_text(0).unwrap_or_default(),
+                prepared_at: value.get_text(1).unwrap_or_default(),
+            }
+        }
+    }
+
+    pub(crate) async fn prepared_in_postgres(server: &mut Server) -> Vec<PreparedInPostgres> {
+        server
+            .fetch_all::<PreparedInPostgres>(
+                "SELECT name, prepare_time::text FROM pg_prepared_statements ORDER BY name",
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Run a named statement the way a client would, leaving it to the
+    /// connection to prepare it first if it isn't already.
+    pub(crate) async fn execute_prepared(
+        server: &mut Server,
+        name: &str,
+        param: &[u8],
+    ) -> Vec<i64> {
+        use crate::net::bind::Parameter;
+
+        let request = ServerRequest {
+            messages: vec![
+                Bind::new_params(name, &[Parameter::new(param)]).into(),
+                Execute::new().into(),
+                Sync::new().into(),
+            ],
+            expected: 1,
+        };
+
+        server.fetch_all::<i64>(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_prepared_statement_is_re_prepared_once_its_ttl_runs_out() {
+        use crate::backend::prepared_statements::test::prepare_expired;
+
+        let parse = Parse::named("ttl_client", "SELECT $1::bigint");
+        let (_, name) = crate::frontend::PreparedStatements::global()
+            .write()
+            .insert(&parse);
+
+        let mut server = test_server().await;
+        let statements = server.prepared_statements_mut();
+        statements.configure(PreparedStatementsConfig {
+            ttl: Some(Duration::from_secs(300)),
+            ..statements.config()
+        });
+
+        assert_eq!(execute_prepared(&mut server, &name, b"1").await, [1]);
+        let prepared = prepared_in_postgres(&mut server).await;
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].name, name);
+
+        assert_eq!(execute_prepared(&mut server, &name, b"1").await, [1]);
+        assert_eq!(prepared_in_postgres(&mut server).await, prepared);
+
+        prepare_expired(server.prepared_statements_mut(), &name);
+
+        assert_eq!(execute_prepared(&mut server, &name, b"1").await, [1]);
+        let re_prepared = prepared_in_postgres(&mut server).await;
+        assert_eq!(re_prepared.len(), 1);
+        assert_eq!(re_prepared[0].name, name);
+        assert_ne!(re_prepared, prepared);
+
+        assert!(server.done());
     }
 
     #[tokio::test]
@@ -2683,6 +3128,23 @@ pub mod test {
     }
 
     #[tokio::test]
+    async fn test_idle_in_transaction_timeout_count() {
+        let mut server = test_server().await;
+
+        server
+            .execute("SET idle_in_transaction_session_timeout TO 50")
+            .await
+            .unwrap();
+        server.execute("BEGIN").await.unwrap();
+        server.execute("SELECT 1").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(server.read().await.is_err());
+        assert_eq!(server.stats().total().idle_xact_timeouts, 1);
+        assert_eq!(server.stats().last_checkout().idle_xact_timeouts, 1);
+    }
+
+    #[tokio::test]
     async fn test_prepare_forces_sync_prepared_flag() {
         let mut server = test_server().await;
 
@@ -2753,19 +3215,19 @@ pub mod test {
     #[tokio::test]
     async fn test_reset_clears_client_params() {
         let mut server = test_server().await;
-        let mut params = Parameters::default();
-        params.insert("application_name", "test_reset");
+        let mut params = ParameterStore::default();
+        params.set("application_name", "test_reset");
 
         // Sync params to server
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await
             .unwrap();
         assert_eq!(changed, 1);
 
         // Same params should not need re-sync
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await
             .unwrap();
         assert_eq!(changed, 0);
@@ -2775,7 +3237,7 @@ pub mod test {
 
         // Now link_client should need to re-sync because client_params was cleared
         let changed = server
-            .link_client(&BackendKeyData::new(), &params, None)
+            .link_client(FrontendPid::new(), &params, None)
             .await
             .unwrap();
         assert!(
@@ -3215,7 +3677,7 @@ pub mod test {
             .iter()
             .find(|m| m.code() == 'D')
             .expect("expected DataRow");
-        let data_row = DataRow::from_bytes(data_row.to_bytes().unwrap()).unwrap();
+        let data_row = DataRow::from_bytes(data_row.to_bytes()).unwrap();
         let value: i32 = data_row.get(0, Format::Text).unwrap();
         assert_eq!(value, expected);
         assert!(server.done());
@@ -3583,7 +4045,530 @@ pub mod test {
             }
         };
         assert!(matches!(err, Error::ExecutionError(_)));
-        assert!(server.force_close());
+        assert!(server.is_force_close());
         assert_eq!(server.stats().get_state(), State::ForceClose);
+    }
+
+    // -------------------------------------------------------
+    // Extended anonymous mode integration tests
+    // -------------------------------------------------------
+
+    /// Set a server's prepared_statements level to ExtendedAnonymous.
+    fn set_extended_anonymous(server: &mut Server) {
+        use pgdog_config::PreparedStatementsLevel as PSLevel;
+        let statements = server.prepared_statements_mut();
+        let config = statements.config();
+        statements.configure(PreparedStatementsConfig {
+            level: PSLevel::ExtendedAnonymous,
+            ..config
+        });
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_parse_bind_execute() {
+        use crate::net::bind::Parameter;
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        for _ in 0..10 {
+            let parse = Parse::named("stmt1", "SELECT $1::int");
+            let bind = Bind::new_params(
+                "stmt1",
+                &[Parameter {
+                    len: 1,
+                    data: "5".as_bytes().into(),
+                }],
+            );
+
+            server
+                .send(
+                    &vec![
+                        ProtocolMessage::from(parse),
+                        ProtocolMessage::from(bind),
+                        Execute::new().into(),
+                        Sync.into(),
+                    ]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            for c in ['1', '2', 'D', 'C', 'Z'] {
+                let msg = server.read().await.unwrap();
+                assert_eq!(msg.code(), c);
+            }
+
+            assert!(server.done());
+            // In extended_anonymous mode, local cache is cleared after each transaction.
+            assert_eq!(
+                server.prepared_statements.len(),
+                0,
+                "cache should be cleared after RFQ in extended_anonymous mode"
+            );
+            // Verify Postgres has no named prepared statements stored.
+            server.sync_prepared_statements().await.unwrap();
+            assert_eq!(
+                server.prepared_statements.len(),
+                0,
+                "Postgres should have no prepared statements in extended_anonymous mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_describe() {
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        let parse = Parse::named("desc_stmt", "SELECT 1::int AS num, 'hello'::text AS msg");
+        let describe = Describe::new_statement("desc_stmt");
+        let bind = Bind::new_statement("desc_stmt");
+        let execute = Execute::new();
+
+        server
+            .send(
+                &vec![
+                    ProtocolMessage::from(parse),
+                    describe.into(),
+                    bind.into(),
+                    execute.into(),
+                    Sync.into(),
+                ]
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        for c in ['1', 't', 'T', '2', 'D', 'C', 'Z'] {
+            let msg = server.read().await.unwrap();
+            assert_eq!(msg.code(), c);
+        }
+
+        assert!(server.done());
+        assert_eq!(server.prepared_statements.len(), 0);
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(server.prepared_statements.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_repeated_same_statement() {
+        use crate::net::bind::Parameter;
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        // Using the same statement name repeatedly should work because
+        // in extended_anonymous mode, Parse is always anonymized, so Postgres
+        // never stores a named statement. No "already exists" errors.
+        for i in 0..20 {
+            let parse = Parse::named("repeat_stmt", "SELECT $1::int");
+            let bind = Bind::new_params(
+                "repeat_stmt",
+                &[Parameter {
+                    len: 1,
+                    data: "1".as_bytes().into(),
+                }],
+            );
+
+            server
+                .send(
+                    &vec![
+                        ProtocolMessage::from(parse),
+                        ProtocolMessage::from(bind),
+                        Execute::new().into(),
+                        Sync.into(),
+                    ]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            for c in ['1', '2', 'D', 'C', 'Z'] {
+                let msg = server.read().await.unwrap();
+                assert_eq!(
+                    msg.code(),
+                    c,
+                    "iteration {}: expected '{}' got '{}'",
+                    i,
+                    c,
+                    msg.code()
+                );
+            }
+
+            assert!(server.done());
+        }
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(
+            server.prepared_statements.len(),
+            0,
+            "Postgres should have no prepared statements after repeated anonymous usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_close_is_dropped() {
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        // Parse + Sync first.
+        server
+            .send(&vec![Parse::named("to_close", "SELECT 1").into(), Sync.into()].into())
+            .await
+            .unwrap();
+
+        for c in ['1', 'Z'] {
+            let msg = server.read().await.unwrap();
+            assert_eq!(msg.code(), c);
+        }
+
+        // Close should be dropped (simulated CloseComplete).
+        server
+            .send(&vec![Close::named("to_close").into(), Sync.into()].into())
+            .await
+            .unwrap();
+
+        for c in ['3', 'Z'] {
+            let msg = server.read().await.unwrap();
+            assert_eq!(msg.code(), c);
+        }
+
+        assert!(server.done());
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(server.prepared_statements.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_error_recovery() {
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        // Send a bad query via extended protocol.
+        server
+            .send(
+                &vec![
+                    Parse::named("bad_stmt", "SELECT * FROM nonexistent_table_xyz").into(),
+                    Bind::new_statement("bad_stmt").into(),
+                    Execute::new().into(),
+                    Sync.into(),
+                ]
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        // Should get error then RFQ.
+        let msg = server.read().await.unwrap();
+        assert_eq!(msg.code(), 'E');
+        let msg = server.read().await.unwrap();
+        assert_eq!(msg.code(), 'Z');
+
+        assert!(server.done());
+
+        // Server should still be usable.
+        verify_server_usable(&mut server).await;
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(server.prepared_statements.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_mixed_with_simple_query() {
+        use crate::net::bind::Parameter;
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+
+        // Extended protocol.
+        server
+            .send(
+                &vec![
+                    Parse::named("mix_stmt", "SELECT $1::int").into(),
+                    Bind::new_params(
+                        "mix_stmt",
+                        &[Parameter {
+                            len: 1,
+                            data: "7".as_bytes().into(),
+                        }],
+                    )
+                    .into(),
+                    Execute::new().into(),
+                    Sync.into(),
+                ]
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        for c in ['1', '2', 'D', 'C', 'Z'] {
+            let msg = server.read().await.unwrap();
+            assert_eq!(msg.code(), c);
+        }
+
+        assert!(server.done());
+
+        // Simple query right after.
+        server
+            .send(&vec![Query::new("SELECT 42").into()].into())
+            .await
+            .unwrap();
+
+        for c in ['T', 'D', 'C', 'Z'] {
+            let msg = server.read().await.unwrap();
+            assert_eq!(msg.code(), c);
+        }
+
+        assert!(server.done());
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(server.prepared_statements.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extended_anonymous_no_evictions() {
+        use crate::net::bind::Parameter;
+        let mut server = test_server().await;
+        set_extended_anonymous(&mut server);
+        let statements = server.prepared_statements_mut();
+        let config = statements.config();
+        statements.configure(PreparedStatementsConfig { limit: 3, ..config });
+
+        // Send many different "named" statements.
+        // Because they're all anonymized, no named statements are stored in Postgres,
+        // so there should be no evictions.
+        for i in 0..20 {
+            let name = format!("evict_test_{}", i);
+            let parse = Parse::named(&name, "SELECT $1::int");
+            let bind = Bind::new_params(
+                &name,
+                &[Parameter {
+                    len: 1,
+                    data: "1".as_bytes().into(),
+                }],
+            );
+
+            server
+                .send(
+                    &vec![
+                        ProtocolMessage::from(parse),
+                        ProtocolMessage::from(bind),
+                        Execute::new().into(),
+                        Sync.into(),
+                    ]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            for c in ['1', '2', 'D', 'C', 'Z'] {
+                let msg = server.read().await.unwrap();
+                assert_eq!(msg.code(), c);
+            }
+
+            assert!(server.done());
+            // Cache should always be empty after RFQ in extended_anonymous mode.
+            assert!(server.prepared_statements.ensure_capacity().is_empty());
+        }
+        // Verify Postgres has no named prepared statements stored.
+        server.sync_prepared_statements().await.unwrap();
+        assert_eq!(
+            server.prepared_statements.len(),
+            0,
+            "Postgres should have no prepared statements despite many named parses"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_from_client() {
+        let mut server = test_server().await;
+
+        // The last 2 will be simulated
+        // and we won't receive a "prepared statement already exists" error.
+        for _ in 0..3 {
+            server
+                .send(
+                    &vec![ProtocolMessage::PrepareFromClient(Prepare::new(
+                        "__stmt_1",
+                        "PREPARE __pgdog_template_name AS SELECT $1",
+                    ))]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            for c in ['C', 'Z'] {
+                let msg = server.read().await.unwrap();
+                assert_eq!(msg.code(), c);
+            }
+        }
+
+        assert!(server.prepared_statements_mut().contains("__stmt_1"));
+    }
+
+    #[tokio::test]
+    async fn test_prepared_execute() {
+        let mut server = test_server().await;
+
+        for _ in 0..3 {
+            let req = vec![
+                ProtocolMessage::EnsurePrepared(Prepare::new(
+                    "__stmt_1",
+                    "PREPARE __pgdog_template_name (int) AS SELECT $1",
+                )),
+                ProtocolMessage::Query(Query::new("EXECUTE __stmt_1 (1)")),
+            ];
+
+            server.send(&req.into()).await.unwrap();
+
+            for c in ['T', 'D', 'C', 'Z'] {
+                let msg = server.read().await.unwrap();
+                assert_eq!(msg.code(), c);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_in_transaction() {
+        let mut server = test_server().await;
+
+        server.execute("BEGIN").await.unwrap();
+
+        for _ in 0..3 {
+            server
+                .send(
+                    &vec![ProtocolMessage::PrepareFromClient(Prepare::new(
+                        "__stmt_1",
+                        "PREPARE __pgdog_template_name AS SELECT $1",
+                    ))]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            let cmd = server.read().await.unwrap();
+            assert_eq!(cmd.code(), 'C');
+            let rfq = server.read().await.unwrap();
+            assert!(rfq.in_transaction());
+        }
+
+        server.execute("ROLLBACK").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prepare_in_transaction_error() {
+        let mut server = test_server().await;
+
+        server
+            .send(
+                &vec![ProtocolMessage::PrepareFromClient(Prepare::new(
+                    "__stmt_1",
+                    "PREPARE __pgdog_template_name AS SELECT $1",
+                ))]
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let cmd = server.read().await.unwrap();
+        assert_eq!(cmd.code(), 'C');
+        let rfq = server.read().await.unwrap();
+        assert!(!rfq.in_transaction());
+
+        server.execute("BEGIN").await.unwrap();
+
+        let _ = server.execute("SELECT asd").await;
+
+        for _ in 0..3 {
+            server
+                .send(
+                    &vec![ProtocolMessage::PrepareFromClient(Prepare::new(
+                        "__stmt_1",
+                        "PREPARE __pgdog_template_name AS SELECT $1",
+                    ))]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            let err = ErrorResponse::try_from(server.read().await.unwrap()).unwrap();
+            assert_eq!(err.code, "25P02");
+
+            let rfq = ReadyForQuery::try_from(server.read().await.unwrap()).unwrap();
+            assert!(rfq.is_transaction_aborted());
+        }
+    }
+
+    #[test]
+    fn test_effective_max_age_default_is_base() {
+        let server = Server::default();
+        let base = Duration::from_secs(60);
+        assert_eq!(base, server.effective_max_age(base));
+    }
+
+    #[test]
+    fn test_effective_max_age_uses_stored_value() {
+        let mut server = Server::default();
+        server.max_age = Some(Duration::from_millis(1500));
+        let base = Duration::from_secs(60);
+        // Stored value wins regardless of the supplied base.
+        assert_eq!(Duration::from_millis(1500), server.effective_max_age(base));
+    }
+
+    #[test]
+    fn test_apply_lifetime_jitter_zero_is_noop() {
+        let mut server = Server::default();
+        server.apply_lifetime_jitter(Duration::from_secs(60), Duration::ZERO);
+        assert_eq!(None, server.max_age);
+    }
+
+    #[test]
+    fn test_apply_lifetime_jitter_stays_within_bounds() {
+        let base = Duration::from_secs(60);
+        let jitter = Duration::from_secs(10);
+        let lower = base - jitter;
+        let upper = base + jitter;
+        let mut saw_below_base = false;
+        let mut saw_above_base = false;
+        // Many trials so we exercise both signs and the full range.
+        for _ in 0..1_000 {
+            let mut server = Server::default();
+            server.apply_lifetime_jitter(base, jitter);
+            let sampled = server
+                .max_age
+                .expect("apply_lifetime_jitter with non-zero jitter sets max_age");
+            assert!(
+                sampled >= lower && sampled <= upper,
+                "sampled {sampled:?} outside [{lower:?}, {upper:?}]",
+            );
+            if sampled < base {
+                saw_below_base = true;
+            }
+            if sampled > base {
+                saw_above_base = true;
+            }
+        }
+        // 1000 uniform samples should cover both sides.
+        assert!(saw_below_base, "never sampled below base");
+        assert!(saw_above_base, "never sampled above base");
+    }
+
+    #[test]
+    fn test_apply_lifetime_jitter_saturates_at_zero() {
+        // base < jitter forces the lower bound to clamp at zero
+        // rather than wrap. Run enough trials that we very likely
+        // hit the negative half of the range at least once.
+        let base = Duration::from_millis(10);
+        let jitter = Duration::from_millis(100);
+        for _ in 0..1_000 {
+            let mut server = Server::default();
+            server.apply_lifetime_jitter(base, jitter);
+            let sampled = server.max_age.expect("max_age set");
+            assert!(
+                sampled <= base + jitter,
+                "sampled {sampled:?} above upper bound",
+            );
+            // Must never go below zero (Duration is unsigned anyway,
+            // but saturation must not panic).
+        }
     }
 }

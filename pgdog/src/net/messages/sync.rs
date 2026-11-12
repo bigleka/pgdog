@@ -2,7 +2,7 @@ use super::code;
 use super::prelude::*;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Sync;
+pub(crate) struct Sync;
 
 impl Default for Sync {
     fn default() -> Self {
@@ -11,11 +11,11 @@ impl Default for Sync {
 }
 
 impl Sync {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         5
     }
 
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 }
@@ -28,8 +28,8 @@ impl FromBytes for Sync {
 }
 
 impl ToBytes for Sync {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(Payload::named('S').freeze())
+    fn to_bytes(&self) -> Bytes {
+        Payload::named('S').freeze()
     }
 }
 
@@ -45,6 +45,6 @@ mod test {
 
     #[test]
     fn test_sync() {
-        assert_eq!(Sync.len(), Sync.to_bytes().unwrap().len());
+        assert_eq!(Sync.len(), Sync.to_bytes().len());
     }
 }

@@ -11,7 +11,7 @@ plus:
 - a check that refuses settings this fork's PgDog doesn't support yet.
 
 ```bash
-helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.1.0 -f values.yaml
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 2.0.0 -f values.yaml
 ```
 
 ### Result cache
@@ -55,12 +55,12 @@ have no TTL and must not be evicted.
 
 ### Settings this fork doesn't support yet
 
-The fork started from PgDog 0.1.38; upstream's chart follows newer PgDog
-releases. Settings that only those support (`qos`, `vault`, `otel`,
-`control`, `queryStats`, `autodiscovery`, client TLS, two-phase commit WAL,
-some user options...) make `helm install` fail with
+This fork's PgDog is based on upstream 0.1.64; upstream's chart follows
+newer releases. Settings this fork's PgDog doesn't have (`qos`,
+`queryStats`, `control`, `autodiscovery`, `rewriteShardKeyUpdates`) make
+`helm install` fail with
 `not supported by this PgDog fork (bigleka/pgdog) yet: <values>`, instead of
-deploying a PgDog that refuses its configuration. The full list is in
+deploying a PgDog that refuses its configuration. The list is in
 [templates/_fork.tpl](templates/_fork.tpl).
 
 The rest of this README is upstream's. Where it says

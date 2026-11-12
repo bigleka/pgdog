@@ -1,63 +1,116 @@
-use rand::{rng, Rng};
-
 use crate::{
+    backend::pool::connection::binding::Binding,
     expect_message,
     frontend::{
+        ClientRequest,
         client::{
-            query_engine::{multi_step::UpdateMulti, QueryEngineContext},
+            query_engine::{QueryEngineContext, multi_step::UpdateMulti},
             test::TestClient,
         },
-        ClientRequest,
     },
     net::{
-        bind::Parameter, Bind, CommandComplete, DataRow, Describe, ErrorResponse, Execute, Flush,
-        Format, Parameters, Parse, Protocol, Query, ReadyForQuery, RowDescription, Sync,
-        TransactionState,
+        Bind, CommandComplete, DataRow, Describe, ErrorResponse, Execute, Flush, Format,
+        Parameters, Parse, Protocol, Query, ReadyForQuery, RowDescription, Sync, TransactionState,
+        bind::Parameter,
     },
 };
 
 use super::super::super::Error;
 
+const FK_CHILD_TABLE: &str = "shard_key_update_fk_child";
+
+const SHARDED_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS sharded (
+    id BIGINT PRIMARY KEY,
+    value TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    enabled BOOLEAN DEFAULT false,
+    user_id BIGINT,
+    region_id INTEGER DEFAULT 10,
+    country_id SMALLINT DEFAULT 5,
+    options JSONB DEFAULT '{}'::jsonb
+)";
+
+async fn ensure_sharded_table(client: &mut TestClient) {
+    client.send(Query::new(SHARDED_TABLE_DDL)).await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+}
+
+async fn setup_fk_child(client: &mut TestClient, on_delete: &str) {
+    ensure_sharded_table(client).await;
+
+    client
+        .send(Query::new(format!("DROP TABLE IF EXISTS {FK_CHILD_TABLE}")))
+        .await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+
+    client
+        .send(Query::new(format!(
+            "CREATE TABLE {FK_CHILD_TABLE} (
+                id BIGINT PRIMARY KEY,
+                parent_id BIGINT NOT NULL REFERENCES sharded(id) ON DELETE {on_delete}
+            )"
+        )))
+        .await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+}
+
+async fn cleanup_fk_child(client: &mut TestClient) {
+    client
+        .send(Query::new(format!("DROP TABLE IF EXISTS {FK_CHILD_TABLE}")))
+        .await;
+    client.try_process().await.unwrap();
+    client.read_until('Z').await.unwrap();
+}
+
 async fn same_shard_check(request: ClientRequest) -> Result<(), Error> {
     let mut client = TestClient::new_rewrites(Parameters::default()).await;
-    client.client().client_request.extend(request.messages);
+    client
+        .client()
+        .client_request
+        .messages
+        .extend(request.messages);
 
-    let mut context = QueryEngineContext::new(&mut client.client);
-    client.engine.parse_and_rewrite(&mut context).await?;
-    client.engine.route_query(&mut context).await?;
+    let (mut context, client_request) = QueryEngineContext::new(&mut client.client);
+    let rewrite_result = client
+        .engine
+        .parse_and_rewrite(&mut context, client_request)
+        .await?;
+    client
+        .engine
+        .route_query(&mut context, client_request, rewrite_result.as_ref())
+        .await?;
 
     assert!(
-        context.client_request.route().shard().is_direct(),
+        client_request.route().shard().is_direct(),
         "UPDATE stmt should be using direct-to-shard routing"
     );
 
-    client.engine.connect(&mut context, None).await?;
+    client
+        .engine
+        .connect(&mut context, client_request.route())
+        .await?;
 
-    assert!(
-        client.engine.backend.is_direct(),
-        "backend should be connected with Binding::Direct"
-    );
+    std::assert_matches!(&*client.engine.backend, Binding::Direct(..));
 
-    let rewrite = context
-        .client_request
-        .ast
-        .as_ref()
-        .expect("ast to exist")
+    let ast = client_request.ast.clone().expect("ast was set");
+    let rewrite = ast
         .rewrite_plan
-        .clone()
         .sharding_key_update
-        .clone()
+        .as_ref()
         .expect("sharding key update to exist");
 
     let mut update = UpdateMulti::new(&mut client.engine, rewrite);
     assert!(
-        update.is_same_shard(&context).unwrap(),
+        update.is_same_shard(&context, client_request).unwrap(),
         "query should not trigger multi-shard update"
     );
 
     // Won't error out because the query goes to the same shard
     // as the old shard.
-    update.execute(&mut context).await?;
+    update.execute(&mut context, client_request).await?;
 
     Ok(())
 }
@@ -133,19 +186,24 @@ async fn test_row_same_shard_no_transaction() {
         .await;
     client.read_until('Z').await.unwrap();
 
-    client.client.client_request = ClientRequest::from(vec![Query::new(format!(
-        "UPDATE sharded SET id = {} WHERE value = 'test value' AND id = {}",
-        shard_0_1, shard_0
-    ))
-    .into()]);
+    client.client.client_request = ClientRequest::from(vec![
+        Query::new(format!(
+            "UPDATE sharded SET id = {} WHERE value = 'test value' AND id = {}",
+            shard_0_1, shard_0
+        ))
+        .into(),
+    ]);
 
-    let mut context = QueryEngineContext::new(&mut client.client);
+    let (mut context, client_request) = QueryEngineContext::new(&mut client.client);
 
-    client.engine.parse_and_rewrite(&mut context).await.unwrap();
+    let rewrite_result = client
+        .engine
+        .parse_and_rewrite(&mut context, client_request)
+        .await
+        .unwrap();
 
     assert!(
-        context
-            .client_request
+        client_request
             .ast
             .as_ref()
             .expect("ast to exist")
@@ -155,8 +213,16 @@ async fn test_row_same_shard_no_transaction() {
         "sharding key update should exist on the request"
     );
 
-    client.engine.route_query(&mut context).await.unwrap();
-    client.engine.execute(&mut context).await.unwrap();
+    client
+        .engine
+        .route_query(&mut context, client_request, rewrite_result.as_ref())
+        .await
+        .unwrap();
+    client
+        .engine
+        .execute(&mut context, client_request, rewrite_result)
+        .await
+        .unwrap();
 
     let cmd = client.read().await;
 
@@ -171,15 +237,17 @@ async fn test_row_same_shard_no_transaction() {
 #[tokio::test]
 async fn test_no_rows_updated() {
     let mut client = TestClient::new_rewrites(Parameters::default()).await;
-    let id = rng().random::<i64>();
+
+    // Ensure that we generate 2 random IDs consistent with the same shard.
+    let shard_0_id_1 = client.random_id_for_shard(0);
+    let shard_0_id_2 = client.random_id_for_shard(0);
 
     // Transaction not required because
     // it'll check for existing row first (on the same shard).
     client
         .send_simple(Query::new(format!(
             "UPDATE sharded SET id = {} WHERE id = {}",
-            id,
-            id + 1
+            shard_0_id_1, shard_0_id_2
         )))
         .await;
     let cc = client.read().await;
@@ -260,7 +328,7 @@ async fn test_move_rows_simple() {
                 ),
                 'Z' => assert!(
                     ReadyForQuery::try_from(message).unwrap().state().unwrap()
-                        == TransactionState::InTrasaction
+                        == TransactionState::InTransaction
                 ),
                 'T' => assert_eq!(
                     RowDescription::try_from(message)
@@ -330,7 +398,7 @@ async fn test_move_rows_extended() {
                 ),
                 'Z' => assert!(
                     ReadyForQuery::try_from(message).unwrap().state().unwrap()
-                        == TransactionState::InTrasaction
+                        == TransactionState::InTransaction
                 ),
                 'D' => assert_eq!(
                     DataRow::try_from(message).unwrap().column(0).unwrap(),
@@ -422,7 +490,7 @@ async fn test_move_rows_prepared() {
                 ),
                 'Z' => assert!(
                     ReadyForQuery::try_from(message).unwrap().state().unwrap()
-                        == TransactionState::InTrasaction
+                        == TransactionState::InTransaction
                 ),
                 'D' => assert_eq!(
                     DataRow::try_from(message).unwrap().column(0).unwrap(),
@@ -532,7 +600,7 @@ async fn test_update_with_expr() {
                 ),
                 'Z' => assert!(
                     ReadyForQuery::try_from(message).unwrap().state().unwrap()
-                        == TransactionState::InTrasaction
+                        == TransactionState::InTransaction
                 ),
                 'T' => {
                     let rd = RowDescription::try_from(message).unwrap();
@@ -568,4 +636,109 @@ async fn test_update_with_expr() {
     let dr = DataRow::try_from(data_row.clone()).unwrap();
     assert_eq!(dr.column(0).unwrap(), shard_1_id_str.as_bytes());
     assert_eq!(dr.column(1).unwrap(), "prefix_suffix".as_bytes());
+}
+
+#[tokio::test]
+async fn test_foreign_key_on_delete_sharding_key_update() {
+    let mut client = TestClient::new_rewrites(Parameters::default()).await;
+
+    setup_fk_child(&mut client, "CASCADE").await;
+
+    let shard_0_id = client.random_id_for_shard(0);
+    let shard_0_other_id = client.random_id_for_shard(0);
+    let shard_1_id = client.random_id_for_shard(1);
+
+    client
+        .send_simple(Query::new(format!(
+            "INSERT INTO sharded (id) VALUES ({}) ON CONFLICT(id) DO NOTHING",
+            shard_0_id
+        )))
+        .await;
+    client.read_until('Z').await.unwrap();
+
+    // Same-shard sharding key updates are still allowed with destructive FKs.
+    client
+        .try_send_simple(Query::new(format!(
+            "UPDATE sharded SET id = {} WHERE id = {}",
+            shard_0_other_id, shard_0_id
+        )))
+        .await
+        .unwrap();
+    let cmd = client.read().await;
+    assert_eq!(
+        CommandComplete::try_from(cmd).unwrap().command(),
+        "UPDATE 1"
+    );
+    expect_message!(client.read().await, ReadyForQuery);
+
+    // Cross-shard move with ON DELETE CASCADE is blocked before delete/insert.
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+
+    client
+        .send_simple(Query::new(format!(
+            "UPDATE sharded SET id = {} WHERE id = {}",
+            shard_1_id, shard_0_other_id
+        )))
+        .await;
+    let err = ErrorResponse::try_from(client.read().await).expect("expected error");
+    assert!(
+        err.message.contains(
+            "sharding key update would move a row referenced by an ON DELETE foreign key"
+        ),
+        "unexpected error message: {}",
+        err.message
+    );
+    client.read_until('Z').await.unwrap();
+    client.send_simple(Query::new("ROLLBACK")).await;
+    client.read_until('Z').await.unwrap();
+
+    client.send_simple(Query::new("SELECT 1")).await;
+    client.read_until('Z').await.unwrap();
+
+    // ON DELETE RESTRICT does not trigger the PgDog block.
+    setup_fk_child(&mut client, "RESTRICT").await;
+
+    client
+        .send_simple(Query::new(format!(
+            "INSERT INTO sharded (id) VALUES ({}) ON CONFLICT(id) DO NOTHING",
+            shard_0_other_id
+        )))
+        .await;
+    client.read_until('Z').await.unwrap();
+
+    client.send_simple(Query::new("BEGIN")).await;
+    client.read_until('Z').await.unwrap();
+
+    client
+        .try_send_simple(Query::new(format!(
+            "UPDATE sharded SET id = {} WHERE id = {}",
+            shard_1_id, shard_0_other_id
+        )))
+        .await
+        .unwrap();
+
+    let reply = client.read_until('Z').await.unwrap();
+    reply
+        .into_iter()
+        .zip(['C', 'Z'])
+        .for_each(|(message, code)| {
+            assert_eq!(message.code(), code);
+            match code {
+                'C' => assert_eq!(
+                    CommandComplete::try_from(message).unwrap().command(),
+                    "UPDATE 1"
+                ),
+                'Z' => assert_eq!(
+                    ReadyForQuery::try_from(message).unwrap().state().unwrap(),
+                    TransactionState::InTransaction
+                ),
+                _ => unreachable!(),
+            }
+        });
+
+    client.send_simple(Query::new("COMMIT")).await;
+    client.read_until('Z').await.unwrap();
+
+    cleanup_fk_child(&mut client).await;
 }

@@ -1,17 +1,18 @@
 use std::str::from_utf8;
 
 use bytes::BytesMut;
+use tracing::warn;
 
-use crate::net::bind::Parameter;
 use crate::net::Bind;
+use crate::net::bind::Parameter;
 
 use super::super::super::bind::Format;
 use super::super::super::prelude::*;
 use super::string::unescape;
 
 #[derive(Clone, Default)]
-pub struct TupleData {
-    pub columns: Vec<Column>,
+pub(crate) struct TupleData {
+    pub(crate) columns: Vec<Column>,
 }
 
 impl std::fmt::Debug for TupleData {
@@ -30,7 +31,7 @@ impl std::fmt::Debug for TupleData {
 }
 
 impl TupleData {
-    pub fn from_buffer(bytes: &mut Bytes) -> Result<Self, Error> {
+    pub(crate) fn from_buffer(bytes: &mut Bytes) -> Result<Self, Error> {
         if bytes.remaining() < 2 {
             return Err(Error::UnexpectedPayload);
         }
@@ -82,7 +83,7 @@ impl TupleData {
         Ok(Self { columns })
     }
 
-    pub fn to_sql(&self) -> Result<String, Error> {
+    pub(crate) fn to_sql(&self) -> Result<String, Error> {
         let columns = self
             .columns
             .iter()
@@ -92,58 +93,126 @@ impl TupleData {
         Ok(format!("({})", columns))
     }
 
-    /// Create Bind message from this Tuple.
-    pub fn to_bind(&self, name: &str) -> Bind {
-        let params = self
+    /// Create a [`Bind`] message from this tuple. Column index N maps to parameter `$N+1`.
+    /// Used by [`Table`](crate::backend::replication::logical::publisher::Table) DML methods
+    /// — the `$N` they emit must agree with the column ordering of the tuple passed here.
+    pub(crate) fn to_bind(&self, name: &str) -> Bind {
+        let (params, codes): (Vec<_>, Vec<_>) = self
             .columns
             .iter()
-            .map(|c| {
-                if c.identifier == Identifier::Null {
-                    Parameter::new_null()
+            .map(|c| match &c.identifier {
+                Identifier::Null => (Parameter::new_null(), Format::Text),
+                Identifier::Toasted => {
+                    warn!(
+                        "to_bind: toasted column reached Bind construction; \
+                         caller should strip or fill toasted columns first — sending NULL"
+                    );
+                    (Parameter::new_null(), Format::Text)
+                }
+                Identifier::Format(fmt) => (Parameter::new(&c.data), *fmt),
+            })
+            .unzip();
+        Bind::new_params_codes(name, &params, &codes)
+    }
+
+    /// Does this tuple contain any unchanged-TOAST (`'u'`) column?
+    pub(crate) fn has_toasted(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.identifier == Identifier::Toasted)
+    }
+
+    /// Are every column in this tuple unchanged-TOAST (`'u'`)?
+    ///
+    /// True when nothing changed — used to detect no-op UPDATEs before routing.
+    pub(crate) fn all_toasted(&self) -> bool {
+        self.columns
+            .iter()
+            .all(|c| c.identifier == Identifier::Toasted)
+    }
+
+    /// Return a copy with unchanged-TOAST (`'u'`) columns removed.
+    pub(crate) fn without_toasted(&self) -> TupleData {
+        TupleData {
+            columns: self
+                .columns
+                .iter()
+                .filter(|c| c.identifier != Identifier::Toasted)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Return a copy of `self` with every `Toasted` (`'u'`) column replaced by the
+    /// corresponding column from `source`.
+    ///
+    /// Used when a REPLICA IDENTITY FULL cross-shard UPDATE needs to reconstruct the
+    /// complete new row. With FULL identity, `source` (the old tuple) is always fully
+    /// materialised — Postgres flattens every TOAST reference before writing the WAL
+    /// record. `'u'` columns in the new tuple are unchanged, so their values are
+    /// available in the old tuple at the same position.
+    ///
+    /// Both tuples must have the same column count; mismatches are a schema-change
+    /// race that is not recoverable here and should surface as an upstream error.
+    pub(crate) fn fill_toasted_from(&self, source: &TupleData) -> Result<TupleData, Error> {
+        if self.columns.len() != source.columns.len() {
+            return Err(Error::InvariantViolation(format!(
+                "fill_toasted_from: column count mismatch ({} vs {}); schema-change race?",
+                self.columns.len(),
+                source.columns.len(),
+            )));
+        }
+        let columns = self
+            .columns
+            .iter()
+            .zip(source.columns.iter())
+            .map(|(new_col, old_col)| {
+                if new_col.identifier == Identifier::Toasted {
+                    if old_col.identifier == Identifier::Toasted {
+                        return Err(Error::InvariantViolation(
+                            "fill_toasted_from: source column is Toasted; \
+                             FULL identity guarantees old tuple is always materialised"
+                                .into(),
+                        ));
+                    }
+                    Ok(old_col.clone())
                 } else {
-                    Parameter::new(&c.data)
+                    Ok(new_col.clone())
                 }
             })
-            .collect::<Vec<_>>();
-
-        Bind::new_params(name, &params)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TupleData { columns })
     }
 }
 
 /// Explains what's inside the column.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Identifier {
+pub(crate) enum Identifier {
     Format(Format),
     Null,
     Toasted,
 }
 
 #[derive(Debug, Clone)]
-pub struct Column {
-    pub identifier: Identifier,
-    pub len: i32,
-    pub data: Bytes,
+pub(crate) struct Column {
+    pub(crate) identifier: Identifier,
+    pub(crate) len: i32,
+    pub(crate) data: Bytes,
 }
 
 impl Column {
     /// Convert column to SQL representation,
     /// if it's encoded with UTF-8 compatible encoding.
-    pub fn to_sql(&self) -> Result<String, Error> {
+    pub(crate) fn to_sql(&self) -> Result<String, Error> {
         match self.identifier {
             Identifier::Null => Ok("NULL".into()),
             Identifier::Format(Format::Binary) => Err(Error::NotTextEncoding),
-            Identifier::Toasted => Ok("NULL".into()),
+            Identifier::Toasted => Ok("<unchanged toast>".into()),
             Identifier::Format(Format::Text) => match from_utf8(&self.data[..]) {
                 Ok(text) => Ok(unescape(text)),
                 Err(_) => Err(Error::NotTextEncoding),
             },
         }
-    }
-
-    /// Get UTF-8 representation of the data,
-    /// if data is encoded with UTF-8.
-    pub fn as_str(&self) -> Option<&str> {
-        from_utf8(&self.data[..]).ok()
     }
 }
 
@@ -154,7 +223,7 @@ impl FromBytes for TupleData {
 }
 
 impl ToBytes for TupleData {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_i16(self.columns.len() as i16);
         for col in &self.columns {
@@ -173,7 +242,34 @@ impl ToBytes for TupleData {
                 }
             }
         }
-        Ok(buf.freeze())
+        buf.freeze()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn text_col(s: &str) -> Column {
+    Column {
+        identifier: Identifier::Format(Format::Text),
+        len: s.len() as i32,
+        data: bytes::Bytes::copy_from_slice(s.as_bytes()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn toasted_col() -> Column {
+    Column {
+        identifier: Identifier::Toasted,
+        len: 0,
+        data: bytes::Bytes::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn binary_col(data: &[u8]) -> Column {
+    Column {
+        identifier: Identifier::Format(Format::Binary),
+        len: data.len() as i32,
+        data: bytes::Bytes::copy_from_slice(data),
     }
 }
 
@@ -219,5 +315,151 @@ mod test {
         assert!(TupleData::from_bytes(Bytes::from_static(&[0, 1, b't'])).is_err());
         // Has identifier + length but data is truncated
         assert!(TupleData::from_bytes(Bytes::from_static(&[0, 1, b't', 0, 0, 0, 4, 1])).is_err());
+    }
+
+    #[test]
+    fn has_toasted_detects_u() {
+        let t = TupleData {
+            columns: vec![text_col("1"), toasted_col(), text_col("x")],
+        };
+        assert!(t.has_toasted());
+        let t2 = TupleData {
+            columns: vec![text_col("1"), text_col("x")],
+        };
+        assert!(!t2.has_toasted());
+    }
+
+    #[test]
+    fn to_sql_renders_toasted_marker() {
+        let c = toasted_col();
+        assert_eq!(c.to_sql().unwrap(), "<unchanged toast>");
+    }
+
+    #[test]
+    fn fill_toasted_from_replaces_u_columns() {
+        // new tuple: col0 present, col1 toasted, col2 present.
+        let new = TupleData {
+            columns: vec![text_col("a"), toasted_col(), text_col("c")],
+        };
+        // old tuple: all columns materialised (REPLICA IDENTITY FULL guarantee).
+        let old = TupleData {
+            columns: vec![text_col("a_old"), text_col("b_old"), text_col("c_old")],
+        };
+        let filled = new.fill_toasted_from(&old).unwrap();
+        // col0: from new (unchanged — was present)
+        assert_eq!(&*filled.columns[0].data, b"a");
+        // col1: from old (was toasted in new)
+        assert_eq!(&*filled.columns[1].data, b"b_old");
+        // col2: from new
+        assert_eq!(&*filled.columns[2].data, b"c");
+        assert!(
+            !filled.has_toasted(),
+            "filled tuple must contain no toasted markers"
+        );
+    }
+
+    #[test]
+    fn fill_toasted_from_all_present_is_identity() {
+        // When no columns are toasted, the result equals the original.
+        let new = TupleData {
+            columns: vec![text_col("x"), text_col("y")],
+        };
+        let old = TupleData {
+            columns: vec![text_col("x_old"), text_col("y_old")],
+        };
+        let filled = new.fill_toasted_from(&old).unwrap();
+        assert_eq!(&*filled.columns[0].data, b"x");
+        assert_eq!(&*filled.columns[1].data, b"y");
+    }
+
+    #[test]
+    fn fill_toasted_from_all_toasted_uses_old() {
+        // When every column is toasted, the result equals the old tuple.
+        let new = TupleData {
+            columns: vec![toasted_col(), toasted_col()],
+        };
+        let old = TupleData {
+            columns: vec![text_col("p"), text_col("q")],
+        };
+        let filled = new.fill_toasted_from(&old).unwrap();
+        assert_eq!(&*filled.columns[0].data, b"p");
+        assert_eq!(&*filled.columns[1].data, b"q");
+        assert!(!filled.has_toasted());
+    }
+
+    #[test]
+    fn fill_toasted_from_column_count_mismatch_is_err() {
+        // self has 2 columns, source has 1 — schema-change race; must not panic.
+        let new = TupleData {
+            columns: vec![text_col("a"), toasted_col()],
+        };
+        let old = TupleData {
+            columns: vec![text_col("x")],
+        };
+        assert!(
+            new.fill_toasted_from(&old).is_err(),
+            "column count mismatch must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn to_bind_all_text_columns_produce_text_format_codes() {
+        let tuple = TupleData {
+            columns: vec![text_col("hello"), text_col("world")],
+        };
+        let bind = tuple.to_bind("__pgdog_1");
+        assert_eq!(bind.parameter_format(0).unwrap(), Format::Text);
+        assert_eq!(bind.parameter_format(1).unwrap(), Format::Text);
+    }
+
+    #[test]
+    fn to_bind_binary_columns_produce_binary_format_codes() {
+        // Simulate a bigint (8 bytes, big-endian) arriving as a binary column.
+        let val: i64 = 42;
+        let tuple = TupleData {
+            columns: vec![binary_col(&val.to_be_bytes())],
+        };
+        let bind = tuple.to_bind("__pgdog_1");
+        assert_eq!(bind.parameter_format(0).unwrap(), Format::Binary);
+        // Data must be forwarded verbatim — the destination decodes it as binary.
+        assert_eq!(
+            bind.parameter(0).unwrap().unwrap().data(),
+            &val.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn to_bind_null_and_toasted_use_text_format_code() {
+        let tuple = TupleData {
+            columns: vec![
+                Column {
+                    identifier: Identifier::Null,
+                    len: -1,
+                    data: Bytes::new(),
+                },
+                toasted_col(),
+            ],
+        };
+        let bind = tuple.to_bind("__pgdog_1");
+        // Format code is irrelevant for absent values, but must not be Binary
+        // to avoid confusing the destination server.
+        assert_eq!(bind.parameter_format(0).unwrap(), Format::Text);
+        assert_eq!(bind.parameter_format(1).unwrap(), Format::Text);
+    }
+
+    #[test]
+    fn to_bind_mixed_columns_produce_per_column_format_codes() {
+        let val: i32 = 99;
+        let tuple = TupleData {
+            columns: vec![
+                text_col("label"),
+                binary_col(&val.to_be_bytes()),
+                text_col("suffix"),
+            ],
+        };
+        let bind = tuple.to_bind("__pgdog_1");
+        assert_eq!(bind.parameter_format(0).unwrap(), Format::Text);
+        assert_eq!(bind.parameter_format(1).unwrap(), Format::Binary);
+        assert_eq!(bind.parameter_format(2).unwrap(), Format::Text);
     }
 }

@@ -1,33 +1,20 @@
 use std::fmt::Display;
 
-use pg_query::{
-    protobuf::{List, RangeVar},
-    Node, NodeEnum,
-};
+use pg_raw_parse::list::{CastNodeList, NodeList};
+use pg_raw_parse::{Node, nodes};
 
 use super::{Error, Schema};
 use crate::util::escape_identifier;
 
 /// Table name in a query.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Hash, Eq)]
-pub struct Table<'a> {
+pub(crate) struct Table<'a> {
     /// Table name.
-    pub name: &'a str,
+    pub(crate) name: &'a str,
     /// Schema name, if specified.
-    pub schema: Option<&'a str>,
+    pub(crate) schema: Option<&'a str>,
     /// Alias.
-    pub alias: Option<&'a str>,
-}
-
-/// Owned version of Table that owns its string data.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct OwnedTable {
-    /// Table name.
-    pub name: String,
-    /// Schema name, if specified.
-    pub schema: Option<String>,
-    /// Alias.
-    pub alias: Option<String>,
+    pub(crate) alias: Option<&'a str>,
 }
 
 impl Display for Table<'_> {
@@ -46,165 +33,98 @@ impl Display for Table<'_> {
 }
 
 impl<'a> Table<'a> {
-    /// Convert this borrowed Table to an owned OwnedTable
-    pub fn to_owned(&self) -> OwnedTable {
-        OwnedTable::from(*self)
-    }
-
-    pub fn name_match(&self, name: &str) -> bool {
+    pub(crate) fn name_match(&self, name: &str) -> bool {
         Some(name) == self.alias || name == self.name
     }
 
-    pub fn schema(&self) -> Option<Schema<'a>> {
+    pub(crate) fn schema(&self) -> Option<Schema<'a>> {
         self.schema.map(|s| s.into())
     }
-}
 
-impl Display for OwnedTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let borrowed = Table::from(self);
-        borrowed.fmt(f)
-    }
-}
-
-impl<'a> From<Table<'a>> for OwnedTable {
-    fn from(table: Table<'a>) -> Self {
-        Self {
-            name: table.name.to_owned(),
-            schema: table.schema.map(|s| s.to_owned()),
-            alias: table.alias.map(|s| s.to_owned()),
+    /// Attempt to figure out if the table is a part of `pg_catalog`.
+    /// WARN: that may give false positives
+    pub(crate) fn is_pg_catalog(&self) -> bool {
+        match self.schema {
+            Some(schema) => schema == "pg_catalog",
+            None => self.name.starts_with("pg_"),
         }
     }
 }
 
-impl<'a> From<&'a OwnedTable> for Table<'a> {
-    fn from(owned: &'a OwnedTable) -> Self {
-        Self {
-            name: &owned.name,
-            schema: owned.schema.as_deref(),
-            alias: owned.alias.as_deref(),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a Node> for Table<'a> {
+impl<'a> TryFrom<pg_raw_parse::Node<'a>> for Table<'a> {
     type Error = ();
 
-    fn try_from(value: &'a Node) -> Result<Self, Self::Error> {
-        if let Some(NodeEnum::RangeVar(range_var)) = &value.node {
-            return Ok(range_var.into());
+    fn try_from(value: pg_raw_parse::Node<'a>) -> Result<Self, Self::Error> {
+        match value {
+            pg_raw_parse::Node::RangeVar(rv) => Ok(rv.into()),
+            _ => Err(()),
         }
-
-        Err(())
     }
 }
 
-impl<'a> TryFrom<&'a Vec<Node>> for Table<'a> {
-    type Error = Error;
-
-    fn try_from(value: &'a Vec<Node>) -> Result<Self, Self::Error> {
-        match value.len() {
-            1 => {
-                let table = value
-                    .first()
-                    .and_then(|node| {
-                        node.node.as_ref().map(|node| match node {
-                            NodeEnum::RangeVar(var) => Some(Ok(Table::from(var))),
-                            NodeEnum::List(list) => Some(Table::try_from(list)),
-                            NodeEnum::String(str) => Some(Ok(Table::from(str.sval.as_str()))),
-                            _ => None,
-                        })
-                    })
-                    .flatten()
-                    .ok_or(Error::TableDecode)?;
-                return table;
-            }
-
-            2 => {
-                let schema = value.iter().next().unwrap().node.as_ref().and_then(|node| {
-                    if let NodeEnum::String(sval) = node {
-                        Some(sval.sval.as_str())
-                    } else {
-                        None
-                    }
-                });
-                let table = value.iter().last().unwrap().node.as_ref().and_then(|node| {
-                    if let NodeEnum::String(sval) = node {
-                        Some(sval.sval.as_str())
-                    } else {
-                        None
-                    }
-                });
-                if let Some(schema) = schema {
-                    if let Some(table) = table {
-                        return Ok(Table {
-                            name: table,
-                            schema: Some(schema),
-                            alias: None,
-                        });
-                    }
-                }
-            }
-
-            _ => (),
-        }
-
-        Err(Error::TableDecode)
-    }
-}
-
-impl<'a> From<&'a RangeVar> for Table<'a> {
-    fn from(range_var: &'a RangeVar) -> Self {
-        let (name, alias) = if let Some(ref alias) = range_var.alias {
-            (range_var.relname.as_str(), Some(alias.aliasname.as_str()))
-        } else {
-            (range_var.relname.as_str(), None)
-        };
+impl<'a> From<&'a pg_raw_parse::nodes::RangeVar> for Table<'a> {
+    fn from(range_var: &'a pg_raw_parse::nodes::RangeVar) -> Self {
+        let name = range_var.relname().unwrap_or_default();
+        let alias = range_var.alias().and_then(|a| a.aliasname());
+        let schema = range_var.schemaname();
         Self {
             name,
-            schema: if !range_var.schemaname.is_empty() {
-                Some(range_var.schemaname.as_str())
-            } else {
-                None
-            },
             alias,
+            schema,
         }
     }
 }
 
-impl<'a> TryFrom<&'a List> for Table<'a> {
+impl<'a> TryFrom<&'a CastNodeList<nodes::String>> for Table<'a> {
     type Error = Error;
 
-    fn try_from(value: &'a List) -> Result<Self, Self::Error> {
-        fn str_value(list: &List, pos: usize) -> Option<&str> {
-            if let Some(NodeEnum::String(ref schema)) = list.items.get(pos).unwrap().node {
-                Some(schema.sval.as_str())
-            } else {
-                None
-            }
-        }
-
-        match value.items.len() {
-            2 => {
-                let schema = str_value(value, 0);
-                let name = str_value(value, 1).ok_or(Error::TableDecode)?;
-                Ok(Table {
+    fn try_from(value: &'a CastNodeList<nodes::String>) -> Result<Self, Self::Error> {
+        let mut list = value.into_iter().rev();
+        let name = list
+            .next()
+            .and_then(nodes::String::sval)
+            .ok_or(Error::TableDecode)?;
+        match (list.next(), list.next()) {
+            (schema, None) => {
+                let schema = schema
+                    .map(|s| s.sval().ok_or(Error::TableDecode))
+                    .transpose()?;
+                Ok(Self {
                     schema,
                     name,
                     alias: None,
                 })
             }
+            (_, Some(_)) => Err(Error::TableDecode),
+        }
+    }
+}
 
-            1 => {
-                let name = str_value(value, 0).ok_or(Error::TableDecode)?;
-                Ok(Table {
-                    schema: None,
+impl<'a> TryFrom<&'a NodeList> for Table<'a> {
+    type Error = Error;
+
+    fn try_from(value: &'a NodeList) -> Result<Self, Self::Error> {
+        let mut list = value.into_iter().rev();
+        let name = match list.next() {
+            Some(Node::String(s)) => s.sval(),
+            Some(Node::NodeList(l)) if value.len() == 1 => return Self::try_from(l),
+            Some(Node::RangeVar(rv)) if value.len() == 1 => return Ok(Self::from(rv)),
+            _ => None,
+        }
+        .ok_or(Error::TableDecode)?;
+
+        match (list.next(), list.next()) {
+            (schema, None) => {
+                let schema = schema
+                    .map(|s| s.as_str().ok_or(Error::TableDecode))
+                    .transpose()?;
+                Ok(Self {
+                    schema,
                     name,
                     alias: None,
                 })
             }
-
-            _ => Err(Error::TableDecode),
+            (_, Some(_)) => Err(Error::TableDecode),
         }
     }
 }

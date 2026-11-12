@@ -1,0 +1,129 @@
+//! Two-phase commit WAL segment.
+//!
+//! It's fully written to disk and will not receive
+//! any more updates from the 2pc manager.
+//!
+
+use std::path::{Path, PathBuf};
+
+use crate::net::Error;
+use bytes::Bytes;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, BufReader},
+};
+use tracing::debug;
+
+use super::{super::Manager, Record, Records};
+
+/// A WAL segment, fully committed to disk.
+#[derive(Debug, Clone)]
+pub(crate) struct Segment {
+    /// Unique segment ID, monotonically increasing.
+    pub(super) segment_id: u64,
+    /// Valid records in this segment.
+    pub(super) records: Vec<Record>,
+}
+
+impl Segment {
+    /// Replay segment against the 2pc manager to
+    /// restore in-memory state.
+    pub(super) fn replay(&self, manager: &Manager) -> Result<(), Error> {
+        for record in &self.records {
+            let record = Records::try_from(record.clone()).expect("invalid record"); // file corruption, panic
+            record.replay(manager);
+        }
+
+        Ok(())
+    }
+
+    /// Load segment from file.
+    ///
+    /// This gracefully handles partially written records, i.e.,
+    /// those that were in the process of being flushed when PgDog crashed.
+    ///
+    /// However, this will return an error if the segment doesn't have a valid header.
+    /// The recovery process will handle that gracefully, but other callers should definitely
+    /// treat such errors as suspicious.
+    ///
+    pub(super) async fn load(segment_path: &Path) -> Result<Self, Error> {
+        use std::io::ErrorKind;
+        debug!(r#"[2pc] opening segment "{}""#, segment_path.display());
+
+        let segment = File::open(segment_path).await?;
+        let file_len = segment.metadata().await?.len() as usize;
+        let mut buffer = BufReader::new(segment);
+
+        let counter = buffer.read_u64().await?;
+        // This should always be zero, until we need to make breaking changes
+        // in the future
+        let _version = buffer.read_u32().await?;
+        debug_assert_eq!(_version, 0);
+        let mut records = vec![];
+        let mut consumed = size_of::<u64>() + size_of::<u32>();
+
+        // This can safely read incomplete segments,
+        // which is expected if PgDog crashed during a 2pc write.
+        loop {
+            let code = match buffer.read_u8().await {
+                Ok(code) => code,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            };
+            consumed += size_of::<u8>();
+
+            let len = match buffer.read_i32().await {
+                Ok(len) => len,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            };
+            consumed += size_of::<i32>();
+
+            if len < 4 {
+                return Err(Error::MalformedMessageLength(len));
+            }
+
+            let data_len = len as usize - size_of::<i32>();
+            if data_len > file_len.saturating_sub(consumed) {
+                break;
+            }
+
+            let mut data = vec![0u8; data_len];
+            match buffer.read_exact(&mut data).await {
+                Ok(_) => (),
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
+
+            consumed += data_len;
+
+            records.push(Record {
+                code: code as char,
+                data: Bytes::from(data),
+            });
+        }
+
+        Ok(Self {
+            segment_id: counter,
+            records,
+        })
+    }
+
+    /// Get the segment size in bytes.
+    pub(crate) fn size(&self) -> usize {
+        self.records.iter().map(|record| record.len()).sum()
+    }
+
+    /// Construct a canonical path to a segment given the WAL directory
+    /// and the segment number.
+    pub(super) fn path(wal_directory: &Path, number: u64) -> PathBuf {
+        use super::EXTENSION;
+
+        wal_directory.join(format!("{}.{}", number, EXTENSION))
+    }
+
+    #[cfg(test)]
+    pub(super) fn records(&self) -> &[Record] {
+        &self.records
+    }
+}

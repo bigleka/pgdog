@@ -1,70 +1,64 @@
-use pg_query::{
-    protobuf::{a_const::Val, AConst, Integer, ParamRef, SelectStmt},
-    Node, NodeEnum,
+use pg_raw_parse::{
+    Node,
+    nodes::{self, SelectStmt},
 };
 
-use super::Error;
-use crate::net::Bind;
+use super::{Error, StatementParameters};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Limit {
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Limit {
+    pub(crate) limit: Option<usize>,
+    pub(crate) offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
-pub struct LimitClause<'a> {
+pub(crate) struct LimitClause<'a> {
     stmt: &'a SelectStmt,
-    bind: Option<&'a Bind>,
+    bind: Option<StatementParameters<'a>>,
 }
 
 impl<'a> LimitClause<'a> {
-    pub(crate) fn new(stmt: &'a SelectStmt, bind: Option<&'a Bind>) -> Self {
+    pub(crate) fn new(stmt: &'a SelectStmt, bind: Option<StatementParameters<'a>>) -> Self {
         Self { stmt, bind }
     }
 
     pub(crate) fn limit_offset(&self) -> Result<Limit, Error> {
-        let mut limit = Limit::default();
-        if let Some(ref limit_count) = self.stmt.limit_count {
-            limit.limit = self.decode(limit_count)?;
-        }
-
-        if let Some(ref limit_offset) = self.stmt.limit_offset {
-            limit.offset = self.decode(limit_offset)?;
-        }
-
-        Ok(limit)
+        Ok(Limit {
+            limit: self.decode(self.stmt.limit_count())?,
+            offset: self.decode(self.stmt.limit_offset())?,
+        })
     }
 
-    fn decode(&self, node: &Node) -> Result<Option<usize>, Error> {
-        match &node.node {
-            Some(NodeEnum::AConst(AConst {
-                val: Some(Val::Ival(Integer { ival })),
-                ..
-            })) => Ok(Some(*ival as usize)),
+    fn decode(&self, node: Node<'_>) -> Result<Option<usize>, Error> {
+        use pg_raw_parse::ConstValue;
 
-            Some(NodeEnum::ParamRef(ParamRef { number, .. })) => {
-                if let Some(bind) = &self.bind {
-                    let param = bind
-                        .parameter(*number as usize - 1)?
-                        .ok_or(Error::MissingParameter(*number as usize))?;
+        match node {
+            Node::A_Const(c) if let Some(ConstValue::Integer(i)) = c.val() => Ok(Some(i as usize)),
+            Node::A_Const(c) if c.val().is_none() => Ok(None),
+            Node::ParamRef(nodes::ParamRef { number, .. }) => {
+                let Some(bind) = self.bind else {
+                    // FIXME: This is a Parse with no Bind. We don't need to
+                    // be rewriting the query at all if we have no Bind, and
+                    // should be able to treat this as an error condition
+                    return Ok(None);
+                };
+                let param = bind
+                    .parameter(*number as usize - 1)?
+                    .ok_or(Error::MissingParameter(*number as usize))?;
 
-                    if param.is_null() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(
-                            param
-                                .bigint()
-                                .ok_or(Error::MissingParameter(*number as usize))?
-                                as usize,
-                        ))
-                    }
-                } else {
+                if param.is_null() {
                     Ok(None)
+                } else {
+                    match param.bigint() {
+                        Some(param) => Ok(Some(param as usize)),
+                        None => Err(Error::ParameterNotInteger(
+                            *number as usize,
+                            param.text_debug(),
+                        )),
+                    }
                 }
             }
-
-            _ => Ok(None),
+            _ => Ok(None), // FIXME: We should error and not silently treat as NULL
         }
     }
 }

@@ -1,43 +1,104 @@
 //! Load balanced connection pool.
 
 use std::{
+    cmp::Reverse,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
 
 use rand::seq::SliceRandom;
-use tokio::{sync::Notify, time::timeout};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::net::messages::BackendKeyData;
+use crate::{config::config, net::messages::FrontendPid};
 use crate::{
     config::{LoadBalancingStrategy, ReadWriteSplit, Role},
     net::Parameters,
 };
 
-use super::{Error, Guard, Pool, PoolConfig, Request};
+use super::{Error, Guard, Oids, Pool, PoolConfig, PoolRole, Request};
+use crate::util::safe_timeout;
 
-pub mod ban;
-pub mod monitor;
-pub mod target_health;
+pub(crate) mod ban;
+pub(crate) mod monitor;
+pub(crate) mod target_health;
 
 use ban::Ban;
+pub(crate) use ban::UnbanReason;
 use monitor::*;
-pub use target_health::*;
+pub(crate) use target_health::*;
 
 #[cfg(test)]
 mod test;
 
+/// Read target state that decides if the primary can serve a read.
+trait Candidate {
+    fn role(&self) -> Role;
+    fn banned(&self) -> bool;
+}
+
+impl Candidate for &Target {
+    fn role(&self) -> Role {
+        Target::role(self)
+    }
+
+    fn banned(&self) -> bool {
+        self.ban.banned()
+    }
+}
+
+/// Decide if the primary stays in `candidates` for a read.
+///
+/// `candidates` must already exclude resharding-only targets and replicas
+/// behind the requested LSN.
+///
+#[doc = include_str!("primary_reads.md")]
+fn primary_reads(rw_split: ReadWriteSplit, read_only: bool, candidates: &[impl Candidate]) -> bool {
+    use ReadWriteSplit::*;
+
+    let has_unbanned_replica = || {
+        candidates
+            .iter()
+            .any(|target| target.role() == Role::Replica && !target.banned())
+    };
+
+    match rw_split {
+        // If `read_only` is true, only allow if there's no replicas.
+        IncludePrimary => !(read_only && has_unbanned_replica()),
+        // Include primary only if all replicas have been eliminated by the replica
+        // lag filter or are banned.
+        IncludePrimaryIfReplicaLag => !has_unbanned_replica(),
+        IncludePrimaryIfReplicaBanned => {
+            !(read_only && has_unbanned_replica())
+                && (candidates
+                    .iter()
+                    .any(|target| target.role() == Role::Replica && target.banned())
+                    || candidates.len() == 1) // The second condition is for when there is only the primary (just one target, doesn't matter what role it is).
+        }
+        // Read from primary only if there is no replicas at all.
+        // If replicas are banned that will lead to [`Error::AllReplicasDown`]
+        ExcludePrimary => !candidates
+            .iter()
+            .any(|target| target.role() == Role::Replica),
+        // We read from the primary anyway if we have no available replicas.
+        // PreferPrimary makes all queries writes. If a query lands here,
+        // it's because of pgdog.role=replica.
+        PreferPrimary => !has_unbanned_replica(),
+    }
+}
+
 /// Read query load balancer target.
 #[derive(Clone, Debug)]
-pub struct Target {
-    pub pool: Pool,
-    pub ban: Ban,
-    replica: Arc<AtomicBool>,
-    pub health: TargetHealth,
+pub(crate) struct Target {
+    pub(crate) pool: Pool,
+    pub(crate) ban: Ban,
+    role: PoolRole,
+    /// Auto targets start as replicas before their roles are actually known.
+    role_detected: Arc<AtomicBool>,
     /// Smooth weighted round-robin current weight tracker.
     current_weight: Arc<AtomicI64>,
 }
@@ -45,10 +106,15 @@ pub struct Target {
 impl Target {
     pub(super) fn new(pool: Pool, role: Role) -> Self {
         let ban = Ban::new(&pool);
+        let role_detected = !pool.config().role_detection;
+
+        // Set pool to last known role.
+        pool.set_role(role);
+
         Self {
             ban,
-            replica: Arc::new(AtomicBool::new(role == Role::Replica)),
-            health: pool.inner().health.clone(),
+            role: PoolRole::new(role),
+            role_detected: Arc::new(AtomicBool::new(role_detected)),
             pool,
             current_weight: Arc::new(AtomicI64::new(0)),
         }
@@ -56,58 +122,77 @@ impl Target {
 
     /// Get role.
     pub(super) fn role(&self) -> Role {
-        if self.replica.load(Ordering::Relaxed) {
-            Role::Replica
-        } else {
-            Role::Primary
-        }
+        self.role.role()
     }
 
-    /// Set role.
+    /// Set a known role, including when detection confirms the initial replica role.
     pub(super) fn set_role(&self, role: Role) -> bool {
-        let value = role == Role::Replica;
-        let old = self.replica.swap(value, Ordering::Relaxed);
-        value != old
+        let lb = self.role.set_role(role);
+        let pool = self.pool.set_role(role);
+        self.role_detected.store(true, Ordering::Release);
+
+        debug_assert_eq!(
+            lb, pool,
+            "pool and lb role must agree: lb={lb}, pool={pool}"
+        );
+
+        lb && pool
+    }
+
+    pub(super) fn health(&self) -> &TargetHealth {
+        &self.pool.inner().health
     }
 }
 
 /// Load balancer.
 #[derive(Clone, Default, Debug)]
-pub struct LoadBalancer {
+pub(crate) struct LoadBalancer {
     /// Read/write targets.
     pub(super) targets: Vec<Target>,
-    /// Checkout timeout.
-    pub(super) checkout_timeout: Duration,
+    /// Connection checkout timeout.
+    checkout_timeout: Duration,
     /// Round robin atomic counter.
     pub(super) round_robin: Arc<AtomicUsize>,
     /// Chosen load balancing strategy.
     pub(super) lb_strategy: LoadBalancingStrategy,
-    /// Maintenance. notification.
-    pub(super) maintenance: Arc<Notify>,
+    /// Shutdown signal for the replicas monitor.
+    pub(super) maintenance: CancellationToken,
+    /// Pool elected as primary by automatic role detection.
+    pub(super) elected_primary: Arc<watch::Sender<Option<Pool>>>,
     /// Read/write split.
     pub(super) rw_split: ReadWriteSplit,
 }
 
 impl LoadBalancer {
     /// Create new replicas pools.
-    pub fn new(
+    pub(crate) fn new(
         primary: &Option<Pool>,
         addrs: &[PoolConfig],
         lb_strategy: LoadBalancingStrategy,
         rw_split: ReadWriteSplit,
+        oids: Arc<Oids>,
     ) -> LoadBalancer {
         let checkout_timeout = primary
             .as_ref()
-            .map(|primary| primary.config().checkout_timeout)
-            .unwrap_or(Duration::ZERO)
-            + addrs
-                .iter()
-                .map(|c| c.config.checkout_timeout)
-                .sum::<Duration>();
+            .map(|pool| pool.config().checkout_timeout)
+            .unwrap_or(
+                addrs
+                    .first()
+                    .map(|addr| addr.config.checkout_timeout)
+                    .unwrap_or(Duration::from_millis(
+                        config().config.general.checkout_timeout,
+                    )),
+            );
 
         let mut targets: Vec<_> = addrs
             .iter()
-            .map(|config| Target::new(Pool::new(config), Role::Replica))
+            .map(|config| {
+                let role = match config.address.configured_role {
+                    Role::Auto => Role::Replica,
+                    role => role,
+                };
+                Target::new(Pool::with_oid_mapping(config, Arc::clone(&oids)), role)
+            })
             .collect();
 
         let primary_target = primary
@@ -123,13 +208,14 @@ impl LoadBalancer {
             checkout_timeout,
             round_robin: Arc::new(AtomicUsize::new(0)),
             lb_strategy,
-            maintenance: Arc::new(Notify::new()),
+            maintenance: CancellationToken::new(),
+            elected_primary: Arc::new(watch::Sender::new(None)),
             rw_split,
         }
     }
 
     /// Get the primary pool, if configured.
-    pub fn primary(&self) -> Option<&Pool> {
+    pub(crate) fn primary(&self) -> Option<&Pool> {
         self.primary_target().map(|target| &target.pool)
     }
 
@@ -137,7 +223,7 @@ impl LoadBalancer {
     ///
     /// Unlike [`primary()`], this returns the full target struct which allows
     /// access to ban and health state for monitoring and testing purposes.
-    pub fn primary_target(&self) -> Option<&Target> {
+    pub(crate) fn primary_target(&self) -> Option<&Target> {
         self.targets
             .iter()
             .rev() // If there is a primary, it's likely to be last.
@@ -146,7 +232,7 @@ impl LoadBalancer {
 
     /// Detect database roles from pg_is_in_recovery() and
     /// return new primary (if any), and replicas.
-    pub fn redetect_roles(&self) -> bool {
+    pub(crate) fn redetect_roles(&self) -> bool {
         let mut promoted = false;
 
         let mut targets = self
@@ -156,62 +242,66 @@ impl LoadBalancer {
             .map(|target| (target.pool.lsn_stats(), target))
             .collect::<Vec<_>>();
 
-        // Pick primary by latest data. The one with the most
-        // up-to-date lsn number and pg_is_in_recovery() = false
-        // is the new primary.
+        // Pick the primary with the greatest timeline, then the freshest
+        // LSN stats, among targets with pg_is_in_recovery() = false.
         //
         // The old primary is still part of the config and will be demoted
         // to replica. If it's down, it will be banned from serving traffic.
         //
         let now = SystemTime::now();
-        targets.sort_by_cached_key(|target| target.0.lsn_age(now));
+        targets.sort_by_cached_key(|target| (Reverse(target.0.timeline), target.0.lsn_age(now)));
 
         let primary = targets
             .iter()
             .position(|target| !target.0.replica && target.0.valid());
+
+        self.elected_primary.send_replace(None);
 
         if let Some(primary) = primary {
             promoted = targets[primary].1.set_role(Role::Primary);
 
             if promoted {
                 warn!("new primary chosen: {}", targets[primary].1.pool.addr());
-
-                // Demote everyone else to replicas.
-                targets
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != primary)
-                    .for_each(|(_, target)| {
-                        target.1.set_role(Role::Replica);
-                    });
             }
+
+            // Demote everyone else to replicas.
+            targets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != primary)
+                .for_each(|(_, target)| {
+                    target.1.set_role(Role::Replica);
+                });
+        } else if targets.iter().all(|target| target.0.valid()) {
+            // All targets are replicas until we get a primary.
+            targets.iter().for_each(|target| {
+                target.1.set_role(Role::Replica);
+            });
         }
+
+        self.elected_primary.send_replace(self.primary().cloned());
 
         promoted
     }
 
     /// Launch replica pools and start the monitor.
-    pub fn launch(&self) {
+    pub(crate) fn launch(&self) {
         self.targets.iter().for_each(|target| target.pool.launch());
         Monitor::spawn(self);
     }
 
     /// Check that the load balancer targets are all launched.
-    pub fn online(&self) -> bool {
+    pub(crate) fn online(&self) -> bool {
         self.targets.iter().all(|target| target.pool.lock().online)
     }
 
     /// Get a live connection from the pool.
-    pub async fn get(&self, request: &Request) -> Result<Guard, Error> {
-        match timeout(self.checkout_timeout, self.get_internal(request)).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(Error::ReplicaCheckoutTimeout),
-        }
+    pub(crate) async fn get(&self, request: &Request) -> Result<Guard, Error> {
+        self.get_internal(request).await
     }
 
     /// Get parameters from first non-banned connection pool.
-    pub async fn params(&self, request: &Request) -> Result<&Parameters, Error> {
+    pub(crate) async fn params(&self, request: &Request) -> Result<&Parameters, Error> {
         if let Some(target) = self.targets.iter().find(|target| !target.ban.banned()) {
             return target.pool.params(request).await;
         }
@@ -220,35 +310,66 @@ impl LoadBalancer {
     }
 
     /// Move connections from this replica set to another.
-    pub fn move_conns_to(&self, destination: &LoadBalancer) -> Result<(), Error> {
-        assert_eq!(self.targets.len(), destination.targets.len());
+    ///
+    /// Uses address-based matching so existing pools survive replica additions or
+    /// removals: each old target is paired with the new target that shares its
+    /// address. New targets with no matching old target start empty; old targets
+    /// with no match in the new config have their connections dropped.
+    ///
+    /// Returns the amount of `Pools` that moved from one replica to the other.
+    pub(crate) fn move_conns_to(&self, destination: &LoadBalancer) -> Result<usize, Error> {
+        let mut moved: usize = 0;
 
-        for (from, to) in self.targets.iter().zip(destination.targets.iter()) {
-            from.pool.move_conns_to(&to.pool)?;
-        }
-
-        Ok(())
-    }
-
-    /// The two replica sets are referring to the same databases.
-    pub fn can_move_conns_to(&self, destination: &LoadBalancer) -> bool {
-        self.targets.len() == destination.targets.len()
-            && self
+        for from in &self.targets {
+            if let Some(to) = destination
                 .targets
                 .iter()
-                .zip(destination.targets.iter())
-                .all(|(a, b)| a.pool.can_move_conns_to(&b.pool))
+                .find(|to| from.pool.has_compatible_address_with(&to.pool))
+            {
+                from.pool.move_conns_to(&to.pool)?;
+                moved += 1;
+
+                // Carry over detected roles and LSN stats so the new load balancer
+                // doesn't briefly appear read-only before the role detector runs.
+                to.set_role(from.role());
+                to.role_detected.store(
+                    from.role_detected.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                *to.pool.inner().lsn_stats.write() = from.pool.lsn_stats();
+                to.ban.carry_manual_ban(&from.ban);
+            }
+        }
+        destination.require_healthcheck_for_new_targets(&self.targets);
+
+        Ok(moved)
     }
 
-    /// There are no replicas.
-    pub fn has_replicas(&self) -> bool {
+    /// True if the LB has any target that can serve replica reads.
+    pub(crate) fn has_replicas(&self) -> bool {
         self.targets
             .iter()
             .any(|target| target.role() == Role::Replica)
     }
 
+    /// True if target roles are detected automatically.
+    pub(crate) fn role_detection_enabled(&self) -> bool {
+        !self.targets.is_empty()
+            && self
+                .targets
+                .iter()
+                .all(|target| target.pool.config().role_detection)
+    }
+
+    /// True once every target has a configured or detected role.
+    pub(crate) fn roles_detected(&self) -> bool {
+        self.targets
+            .iter()
+            .all(|target| target.role_detected.load(Ordering::Acquire))
+    }
+
     /// Cancel a query if one is running.
-    pub async fn cancel(&self, id: &BackendKeyData) -> Result<(), super::super::Error> {
+    pub(crate) async fn cancel(&self, id: FrontendPid) -> Result<(), super::super::Error> {
         for target in &self.targets {
             target.pool.cancel(id).await?;
         }
@@ -256,13 +377,8 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Replica pools handle.
-    pub fn pools(&self) -> Vec<&Pool> {
-        self.targets.iter().map(|target| &target.pool).collect()
-    }
-
     /// Collect all connection pools used for read queries.
-    pub fn pools_with_roles_and_bans(&self) -> Vec<(Role, Ban, Pool)> {
+    pub(crate) fn pools_with_roles_and_bans(&self) -> Vec<(Role, Ban, Pool)> {
         let result: Vec<_> = self
             .targets
             .iter()
@@ -272,24 +388,55 @@ impl LoadBalancer {
         result
     }
 
+    /// Wait until automatic role detection elects a primary.
+    ///
+    /// Fails with [`Error::CheckoutTimeout`] if no election happens in time.
+    async fn wait_primary(&self) -> Result<Pool, Error> {
+        let mut receiver = self.elected_primary.subscribe();
+
+        safe_timeout(self.checkout_timeout, receiver.wait_for(|p| p.is_some()))
+            .await
+            .map_err(|_| Error::CheckoutTimeout)?
+            .ok()
+            .and_then(|elected| elected.as_ref().cloned())
+            .ok_or(Error::NoPrimary)
+    }
+
+    /// Check out a connection from the primary.
+    ///
+    /// In automatic mode, the caller waits for an election. Static
+    /// replica-only configurations fail immediately with [`Error::NoPrimary`].
+    pub(super) async fn get_primary(&self, request: &Request) -> Result<Guard, Error> {
+        if let Some(pool) = self.primary() {
+            return pool.get(request).await;
+        }
+
+        if !self.role_detection_enabled() {
+            return Err(Error::NoPrimary);
+        }
+
+        self.wait_primary().await?.get(request).await
+    }
+
+    /// Check out a read connection using the configured load balancing strategy.
     async fn get_internal(&self, request: &Request) -> Result<Guard, Error> {
         use LoadBalancingStrategy::*;
-        use ReadWriteSplit::*;
+        use smallvec::SmallVec;
 
-        let mut candidates: Vec<&Target> = self
+        let mut candidates: SmallVec<[&Target; 32]> = self
             .targets
             .iter()
             .filter(|target| !target.pool.config().resharding_only) // Don't let reads on resharding-only replicas.
             .collect();
 
-        let primary_reads = match self.rw_split {
-            IncludePrimary => true,
-            IncludePrimaryIfReplicaBanned => candidates.iter().any(|target| target.ban.banned()),
-            // we read from the primary if we have no replicas
-            ExcludePrimary => !candidates
-                .iter()
-                .any(|target| target.role() == Role::Replica),
-        };
+        // Remove any replicas that are behind the requested LSN.
+        if let Some(lsn) = request.lsn {
+            candidates.retain(|target| {
+                target.role() == Role::Primary || target.pool.lsn_stats().lsn.lsn >= lsn
+            });
+        }
+
+        let primary_reads = primary_reads(self.rw_split, request.read_only, &candidates);
 
         if !primary_reads {
             candidates.retain(|target| target.role() == Role::Replica);
@@ -303,7 +450,7 @@ impl LoadBalancer {
             Random => candidates.shuffle(&mut rand::rng()),
             RoundRobin => {
                 let first = self.round_robin.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                let mut reshuffled = vec![];
+                let mut reshuffled = SmallVec::with_capacity(candidates.len());
                 reshuffled.extend_from_slice(&candidates[first..]);
                 reshuffled.extend_from_slice(&candidates[..first]);
                 candidates = reshuffled;
@@ -351,7 +498,9 @@ impl LoadBalancer {
             match target.pool.get(request).await {
                 Ok(conn) => return Ok(conn),
                 Err(Error::Offline) => {
-                    continue;
+                    // We never mark one pool as offline and leave it in the load balancer.
+                    // All pools are replaced at the same time.
+                    return Err(Error::Offline);
                 }
                 Err(err) => {
                     if bannable {
@@ -361,7 +510,16 @@ impl LoadBalancer {
             }
         }
 
-        candidates.iter().for_each(|target| target.ban.unban(true));
+        candidates
+            .iter()
+            .for_each(|target| target.ban.unban(true, UnbanReason::AllTargetsBanned));
+
+        // If all targets are banned (manually), this should still
+        // check that all pools are indeed offline and return the correct
+        // error the cluster connection manager can re-load its cluster reference.
+        if candidates.iter().all(|target| target.pool.offline()) {
+            return Err(Error::Offline);
+        }
 
         Err(Error::AllReplicasDown)
     }
@@ -369,11 +527,38 @@ impl LoadBalancer {
     /// Shutdown replica pools.
     ///
     /// N.B. The primary pool is managed by `super::Shard`.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         for target in &self.targets {
             target.pool.shutdown();
         }
 
-        self.maintenance.notify_waiters();
+        self.maintenance.cancel();
+    }
+
+    fn require_healthcheck_for_new_targets(&self, old_targets: &[Target]) {
+        for target in &self.targets {
+            let old_target = old_targets
+                .iter()
+                .find(|t| t.pool.has_compatible_address_with(&target.pool));
+
+            match old_target {
+                // Still waiting for its first health check, keep it banned.
+                Some(old) if old.ban.error() == Some(Error::InitialHealthCheck) => {
+                    target.ban.ban(Error::InitialHealthCheck, Duration::ZERO);
+                    target.health().toggle(old.health().healthy());
+                }
+
+                // Existing target that is already serving traffic. Banning it
+                // would dump the idle connections we just moved over.
+                Some(_) => (),
+
+                None if target.pool.config().require_healthcheck_on_discovery => {
+                    target.ban.ban(Error::InitialHealthCheck, Duration::ZERO);
+                    target.health().toggle(false);
+                }
+
+                None => (),
+            }
+        }
     }
 }

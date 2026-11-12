@@ -1,60 +1,66 @@
+use indexmap::Equivalent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::fmt::Display;
-use std::hash::{Hash, Hasher as StdHasher};
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use super::error::Error;
 use pgdog_vector::Vector;
 
 /// Configuration for sharding databases. Each entry tells PgDog which column to use as the sharding key for a given table.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/>
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct ShardedTable {
+pub struct ShardedTableConfig {
     /// The name of the database in `[[databases]]` section in which the table is located.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#database
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#database>
     pub database: String,
 
     /// The name of the PostgreSQL table. Only columns explicitly referencing that table will be sharded. If not specified, all tables with the specified column are considered sharded.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#name
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#name>
     #[serde(default)]
     pub name: Option<String>,
 
+    /// Treat `name` as a prefix, e.g. `name = "users"` also matches `users_1` and `users_archive`.
+    ///
+    /// _Default:_ `false`
+    #[serde(default)]
+    pub prefix: bool,
+
     /// The name of the PostgreSQL schema where the sharded table is located. This is optional.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#schema
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#schema>
     #[serde(default)]
     pub schema: Option<String>,
 
     /// The name of the sharded column.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#column
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#column>
     #[serde(default)]
     pub column: String,
 
     /// Marks this table as the primary sharding anchor (e.g. `users`). PgDog uses the primary table to resolve foreign-key relationships when routing queries.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#primary
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#primary>
     #[serde(default)]
     pub primary: bool,
 
     /// For vector sharding, specify the centroid vectors directly in the configuration.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids>
     #[serde(default)]
     pub centroids: Vec<Vector>,
 
     /// Path to a JSON file containing centroid vectors. This is useful when centroids are large (1000+ dimensions).
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids_path
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids_path>
     #[serde(default)]
     pub centroids_path: Option<PathBuf>,
 
@@ -62,13 +68,13 @@ pub struct ShardedTable {
     ///
     /// _Default:_ `bigint`
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#data_type
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#data_type>
     #[serde(default)]
     pub data_type: DataType,
 
     /// Number of centroids to probe during vector similarity search. If not specified, defaults to the square root of the number of centroids.
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroid_probes
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroid_probes>
     #[serde(default)]
     pub centroid_probes: usize,
 
@@ -76,16 +82,53 @@ pub struct ShardedTable {
     ///
     /// _Default:_ `postgres`
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#hasher
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#hasher>
     #[serde(default)]
     pub hasher: Hasher,
 
-    /// Resolved explicit routing rules derived from `[[sharded_mappings]]`. Not configurable directly in TOML.
-    #[serde(skip, default)]
-    pub mapping: Option<Mapping>,
+    /// Explicit value-to-shard routing rules for the column. When omitted (the
+    /// default), PgDog shards by hashing the column value instead. Each entry is
+    /// a [`ShardedMappingConfig`]; see it for the list/range/default forms.
+    ///
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#shard-by-list-and-range>
+    pub mapping: Option<Vec<ShardedMappingConfig>>,
+
+    /// Query used to translate a sharding key value into the value that's hashed
+    /// to pick a shard, e.g. `SELECT COALESCE(parent_org_id, id) FROM orgs
+    /// WHERE id = $1`. Must contain exactly one `$1` placeholder and return at
+    /// most one row. Results are cached in memory, keyed by the value; the
+    /// cache is emptied on config reload.
+    ///
+    /// **Note:** The query should return a row for every valid sharding key
+    /// value, including values that translate to themselves. A value with no
+    /// row fails the statement with an error: routing it by its original value
+    /// could place data on the wrong shard, e.g. when the row just hasn't been
+    /// inserted yet. Absence isn't cached, so rows added later are picked up
+    /// on the next statement.
+    ///
+    /// **Note:** The table the query reads must contain the same data on all
+    /// shards (omnisharded): the query runs on a single shard picked
+    /// round-robin.
+    #[serde(default)]
+    pub lookup_query: Option<String>,
+
+    /// How the `lookup_query` result is interpreted. `value` (default) hashes
+    /// the returned value to pick a shard. `shard` uses the returned value as
+    /// the 0-based shard number directly, bypassing hashing entirely: the
+    /// application controls placement, e.g. by storing a permanent shard id
+    /// per tenant, and new shards can be added without resharding.
+    ///
+    /// **Note:** With `shard`, the query must return a number between 0 and
+    /// the shard count minus one; anything else fails the statement. Shard
+    /// numbers are interpreted against the destination topology during
+    /// resharding data sync, so existing assignments stay valid when shards
+    /// are added. `mapping`, `centroids` and a non-default `hasher` can't be
+    /// combined with `shard`: this mode never hashes.
+    #[serde(default)]
+    pub lookup_result: LookupResult,
 }
 
-impl ShardedTable {
+impl ShardedTableConfig {
     /// Load centroids from file, if provided.
     ///
     /// Centroids can be very large vectors (1000+ columns).
@@ -115,9 +158,30 @@ impl ShardedTable {
     }
 }
 
+/// A single value-to-shard routing rule within a table's `mapping`.
+///
+/// When routing a value, PgDog matches list rules first, then range rules, then
+/// falls back to the default rule. A value matched by nothing, with no default
+/// rule present, is sent to all shards.
+///
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#shard-by-list-and-range>
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case", untagged, deny_unknown_fields)]
+pub enum ShardedMappingConfig {
+    /// Catch-all fallback for any value not matched by a list or range rule.
+    Default {
+        /// Target shard number for matched queries.
+        shard: usize,
+    },
+    /// Match an explicit set of values (`PARTITION BY LIST`).
+    List(ShardedMappingList),
+    /// Match a contiguous range, `start` inclusive and `end` exclusive (`PARTITION BY RANGE`).
+    Range(ShardedMappingRange),
+}
+
 /// Hash function used to map a sharding key value to a shard number.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#hasher
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#hasher>
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Hasher {
@@ -130,9 +194,22 @@ pub enum Hasher {
 
 /// Data type of the sharding column.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#data_type
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Copy, Eq, Hash, JsonSchema)]
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#data_type>
+#[derive(
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Default,
+    Copy,
+    Eq,
+    Hash,
+    JsonSchema,
+    derive_more::Display,
+)]
 #[serde(rename_all = "snake_case")]
+#[display(rename_all = "snake_case")]
 pub enum DataType {
     /// 64-bit integer (default).
     #[default]
@@ -147,10 +224,11 @@ pub enum DataType {
 
 /// Explicit routing rule mapping specific column values or ranges to a shard.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#mapping-fields
+/// **Deprecated**: use a `[[sharded_tables.mapping]]` rule on the corresponding `[[sharded_tables]]` entry instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct ShardedMapping {
+// TODO: try to remove this in the near future
+pub struct ShardedMappingDeprecated {
     /// Database name from the `[[databases]]` section.
     pub database: String,
     /// Must match a column defined in `[[sharded_tables]]`.
@@ -160,51 +238,54 @@ pub struct ShardedMapping {
     /// Optional; must match a `schema` in `[[sharded_tables]]` if specified.
     pub schema: Option<String>,
     /// Mapping strategy: `list`, `range`, or `default`.
-    pub kind: ShardedMappingKind,
+    pub kind: ShardedMappingKindDeprecated,
     /// Inclusive lower bound for range mappings.
     pub start: Option<FlexibleType>,
     /// Exclusive upper bound for range mappings.
     pub end: Option<FlexibleType>,
     /// Set of values for list mappings.
     #[serde(default)]
-    pub values: HashSet<FlexibleType>,
+    pub values: Vec<FlexibleType>,
     /// Target shard number for matched queries.
     pub shard: usize,
 }
 
-impl Hash for ShardedMapping {
-    fn hash<H: StdHasher>(&self, state: &mut H) {
-        self.database.hash(state);
-        self.column.hash(state);
-        self.table.hash(state);
-        self.kind.hash(state);
-        self.start.hash(state);
-        self.end.hash(state);
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Eq, Hash, JsonSchema)]
+pub struct ShardedMappingKey {
+    pub database: String,
+    pub column: String,
+    pub table: Option<String>,
+}
 
-        // Hash the values in a deterministic way by XORing their individual hashes
-        let mut values_hash = 0u64;
-        for value in &self.values {
-            let mut hasher = DefaultHasher::new();
-            value.hash(&mut hasher);
-            values_hash ^= hasher.finish();
+#[derive(PartialEq, Eq, Hash)]
+pub struct ShardedMappingKeyRef<'a> {
+    pub database: &'a String,
+    pub column: &'a String,
+    pub table: Option<&'a String>,
+}
+
+impl<'a> From<&'a ShardedMappingKey> for ShardedMappingKeyRef<'a> {
+    fn from(key: &'a ShardedMappingKey) -> Self {
+        Self {
+            database: &key.database,
+            column: &key.column,
+            table: key.table.as_ref(),
         }
-        values_hash.hash(state);
-
-        self.shard.hash(state);
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Eq, Hash, JsonSchema)]
-pub struct ShardedMappingKey {
-    database: String,
-    column: String,
-    table: Option<String>,
+impl<'a> Equivalent<ShardedMappingKey> for ShardedMappingKeyRef<'a> {
+    fn equivalent(&self, key: &ShardedMappingKey) -> bool {
+        self == &ShardedMappingKeyRef::from(key)
+    }
 }
 
 /// Strategy used to match column values to a shard.
+///
+/// **Deprecated**: use a `[[sharded_tables.mapping]]` rule instead.
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Hash, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ShardedMappingKind {
+pub enum ShardedMappingKindDeprecated {
     /// Match an explicit set of values (default).
     #[default]
     List,
@@ -214,16 +295,57 @@ pub enum ShardedMappingKind {
     Default,
 }
 
+/// A list rule: routes an explicit set of `values` to `shard` (`PARTITION BY LIST`).
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Hash, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ShardedMappingList {
+    /// Target shard number for matched queries.
+    pub shard: usize,
+    /// Set of values for list mappings.
+    pub values: Vec<FlexibleType>,
+}
+
+/// A range rule: routes values in `[start, end)` to `shard` (`PARTITION BY RANGE`).
+#[derive(
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Default,
+    Hash,
+    Eq,
+    JsonSchema,
+    derive_more::Display,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[display(
+    "[{}, {}) -> shard={shard}",
+    match start { Some(v) => v.to_string(), None => "-inf".to_string() },
+    match end { Some(v) => v.to_string(), None => "+inf".to_string() }
+)]
+pub struct ShardedMappingRange {
+    /// Target shard number for matched queries.
+    pub shard: usize,
+    /// Inclusive lower bound. Omit for a range that is unbounded below.
+    pub start: Option<FlexibleType>,
+    /// Exclusive upper bound. Omit for a range that is unbounded above.
+    pub end: Option<FlexibleType>,
+}
+
 /// A sharding key value that can be an integer, UUID, or string.
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Eq, Hash, JsonSchema)]
+#[derive(
+    Serialize, Deserialize, PartialEq, Debug, Clone, Eq, Hash, JsonSchema, derive_more::Display,
+)]
 #[serde(untagged)]
 pub enum FlexibleType {
     /// 64-bit signed integer.
     Integer(i64),
     /// UUID.
     #[schemars(with = "String")]
-    Uuid(uuid::Uuid),
+    Uuid(Uuid),
     /// Text string.
+    #[display("'{_0}'")]
     String(String),
 }
 
@@ -247,7 +369,7 @@ impl From<String> for FlexibleType {
 
 /// A group of tables that are replicated across all shards (omnisharded) for a given database.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#omnisharded_sticky
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#omnisharded_sticky>
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Default, Eq, Hash, JsonSchema)]
 pub struct OmnishardedTables {
     /// Database name from the `[[databases]]` section.
@@ -263,12 +385,6 @@ pub struct OmnishardedTables {
 pub struct OmnishardedTable {
     pub name: String,
     pub sticky_routing: bool,
-}
-
-/// Queries with manual routing rules.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
-pub struct ManualQuery {
-    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default, JsonSchema)]
@@ -295,105 +411,55 @@ impl ShardedSchema {
     }
 
     pub fn shard(&self) -> Option<usize> {
-        if self.all {
-            None
-        } else {
-            Some(self.shard)
+        if self.all { None } else { Some(self.shard) }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+pub enum FlexibleTypeRef<'a> {
+    Integer(i64),
+    Uuid(&'a Uuid),
+    String(&'a str),
+}
+
+impl<'a> Equivalent<FlexibleType> for FlexibleTypeRef<'a> {
+    fn equivalent(&self, key: &FlexibleType) -> bool {
+        match (self, key) {
+            (FlexibleTypeRef::Integer(a), FlexibleType::Integer(b)) => a == b,
+            (FlexibleTypeRef::Uuid(a), FlexibleType::Uuid(b)) => a == &b,
+            (FlexibleTypeRef::String(a), FlexibleType::String(b)) => a == b,
+            _ => false,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListShards {
-    mapping: HashMap<FlexibleType, usize>,
-    default: Option<usize>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum Mapping {
-    Range(Vec<ShardedMapping>), // TODO: optimize with a BTreeMap.
-    List(ListShards),           // Optimized.
-}
-
-impl Hash for ListShards {
-    fn hash<H: StdHasher>(&self, state: &mut H) {
-        // Hash the mapping in a deterministic way by XORing individual key-value hashes
-        let mut mapping_hash = 0u64;
-        for (key, value) in &self.mapping {
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            value.hash(&mut hasher);
-            mapping_hash ^= hasher.finish();
-        }
-        mapping_hash.hash(state);
-    }
-}
-
-impl Mapping {
-    pub fn new(mappings: &[ShardedMapping]) -> Option<Self> {
-        let range = mappings
-            .iter()
-            .filter(|m| m.kind == ShardedMappingKind::Range)
-            .cloned()
-            .collect::<Vec<_>>();
-        let list = mappings.iter().any(|m| {
-            matches!(
-                m.kind,
-                ShardedMappingKind::List | ShardedMappingKind::Default
-            )
-        });
-
-        if !range.is_empty() {
-            Some(Self::Range(range))
-        } else if list {
-            Some(Self::List(ListShards::new(mappings)))
-        } else {
-            None
-        }
-    }
-}
-
-impl ListShards {
-    pub fn is_empty(&self) -> bool {
-        self.mapping.is_empty()
-    }
-
-    pub fn new(mappings: &[ShardedMapping]) -> Self {
-        let mut mapping = HashMap::new();
-
-        for map in mappings
-            .iter()
-            .filter(|m| m.kind == ShardedMappingKind::List)
-        {
-            for value in &map.values {
-                mapping.insert(value.clone(), map.shard);
-            }
-        }
-
-        Self {
-            mapping,
-            default: mappings
-                .iter()
-                .find(|mapping| mapping.kind == ShardedMappingKind::Default)
-                .map(|mapping| mapping.shard),
-        }
-    }
-
-    pub fn shard(&self, value: &FlexibleType) -> Result<Option<usize>, Error> {
-        if let Some(shard) = self.mapping.get(value) {
-            Ok(Some(*shard))
-        } else if let Some(default) = self.default {
-            Ok(Some(default))
-        } else {
-            Ok(None)
+impl<'a> From<&'a FlexibleType> for FlexibleTypeRef<'a> {
+    fn from(v: &'a FlexibleType) -> Self {
+        match v {
+            FlexibleType::Integer(i) => Self::Integer(*i),
+            FlexibleType::Uuid(u) => Self::Uuid(u),
+            FlexibleType::String(s) => Self::String(s),
         }
     }
 }
 
 /// Controls when the query parser is active.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#query_parser
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#query_parser>
+#[derive(
+    Serialize,
+    Deserialize,
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    JsonSchema,
+    PartialOrd,
+    Ord,
+)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryParserLevel {
     /// Always enable the query parser.
@@ -413,16 +479,16 @@ pub enum QueryParserLevel {
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryParserEngine {
-    /// Use the protobuf parse tree from `pg_query` (default).
-    #[default]
+    /// Use the protobuf parse tree from `pg_query`.
     PgQueryProtobuf,
-    /// Use the raw JSON parse tree from `pg_query`.
+    /// Use the raw JSON parse tree from `pg_query` (default).
+    #[default]
     PgQueryRaw,
 }
 
 /// Controls how system catalog tables (like `pg_database`, `pg_class`, etc.) are treated by the query router.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#system_catalogs
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#system_catalogs>
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SystemCatalogsBehavior {
@@ -451,7 +517,7 @@ impl FromStr for SystemCatalogsBehavior {
 ///
 /// **Note:** Text format is required when migrating from `INTEGER` to `BIGINT` primary keys during resharding.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#resharding_copy_format
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#resharding_copy_format>
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CopyFormat {
@@ -471,9 +537,33 @@ impl Display for CopyFormat {
     }
 }
 
+/// How a `lookup_query` result is interpreted when routing.
+///
+/// **Note:** `shard` mode never hashes: the query returns the shard number.
+///
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#lookup_result>
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LookupResult {
+    /// The returned value is hashed to pick a shard (default).
+    #[default]
+    Value,
+    /// The returned value is the 0-based shard number itself.
+    Shard,
+}
+
+impl Display for LookupResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value => write!(f, "value"),
+            Self::Shard => write!(f, "shard"),
+        }
+    }
+}
+
 /// Controls whether PgDog loads the database schema at startup for query routing.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#load_schema
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#load_schema>
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LoadSchema {
@@ -555,57 +645,95 @@ impl Display for UniqueIdFunction {
     }
 }
 
+/// Per-database query parser configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct QueryParser {
+    /// Database name.
+    pub database: String,
+
+    #[serde(default)]
+    /// Query parser level.
+    pub level: QueryParserLevel,
+
+    /// Query parser engine used.
+    #[serde(default)]
+    pub engine: QueryParserEngine,
+}
+
 #[cfg(test)]
-mod test {
-    use super::*;
+mod tests {
+    use crate::{Config, ConfigAndUsers};
+
+    use super::{DataType, LookupResult, QueryParserEngine, QueryParserLevel};
 
     #[test]
-    fn test_list_shards_with_default() {
-        let mappings = vec![
-            ShardedMapping {
-                values: [FlexibleType::Integer(1), FlexibleType::Integer(2)]
-                    .into_iter()
-                    .collect(),
-                shard: 0,
-                ..Default::default()
-            },
-            ShardedMapping {
-                values: [FlexibleType::Integer(3)].into_iter().collect(),
-                shard: 1,
-                ..Default::default()
-            },
-            ShardedMapping {
-                kind: ShardedMappingKind::Default,
-                shard: 2,
-                ..Default::default()
-            },
-        ];
+    fn sharded_table_reads_lookup_query_from_config() {
+        let source = r#"
+[[sharded_tables]]
+database = "houston"
+column = "tenant_id"
+data_type = "varchar"
+lookup_query = "SELECT COALESCE(parent_tenant_id, id) FROM tenants WHERE id = $1"
+"#;
 
-        let list = ListShards::new(&mappings);
+        let config: Config = toml::from_str(source).unwrap();
 
-        // Explicitly mapped values go to their configured shard
-        assert_eq!(list.shard(&FlexibleType::Integer(1)).unwrap(), Some(0));
-        assert_eq!(list.shard(&FlexibleType::Integer(2)).unwrap(), Some(0));
-        assert_eq!(list.shard(&FlexibleType::Integer(3)).unwrap(), Some(1));
+        assert_eq!(config.sharded_tables.len(), 1);
+        let table = &config.sharded_tables[0];
+        assert_eq!(table.database, "houston");
+        assert_eq!(table.column, "tenant_id");
+        assert_eq!(table.data_type, DataType::Varchar);
+        assert_eq!(
+            table.lookup_query.as_deref(),
+            Some("SELECT COALESCE(parent_tenant_id, id) FROM tenants WHERE id = $1")
+        );
 
-        // Unmapped values fall back to the default shard
-        assert_eq!(list.shard(&FlexibleType::Integer(999)).unwrap(), Some(2));
-        assert_eq!(list.shard(&FlexibleType::Integer(-1)).unwrap(), Some(2));
+        let mut config = ConfigAndUsers {
+            config,
+            ..Default::default()
+        };
+        config.check().unwrap();
     }
 
     #[test]
-    fn test_list_shards_without_default() {
-        let mappings = vec![ShardedMapping {
-            values: [FlexibleType::Integer(1)].into_iter().collect(),
-            ..Default::default()
-        }];
+    fn sharded_table_reads_lookup_result_from_config() {
+        // Default when omitted.
+        let source = r#"
+[[sharded_tables]]
+database = "houston"
+column = "tenant_id"
+lookup_query = "SELECT shard_id FROM tenants WHERE id = $1"
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(config.sharded_tables[0].lookup_result, LookupResult::Value);
 
-        let list = ListShards::new(&mappings);
+        let source = r#"
+[[sharded_tables]]
+database = "houston"
+column = "tenant_id"
+lookup_query = "SELECT shard_id FROM tenants WHERE id = $1"
+lookup_result = "shard"
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(config.sharded_tables[0].lookup_result, LookupResult::Shard);
+    }
 
-        // Explicitly mapped value
-        assert_eq!(list.shard(&FlexibleType::Integer(1)).unwrap(), Some(0));
+    #[test]
+    fn query_parser_reads_default_values_from_config() {
+        let source = r#"
+[[query_parsers]]
+database = "production"
+"#;
 
-        // Unmapped value returns None when no default
-        assert_eq!(list.shard(&FlexibleType::Integer(999)).unwrap(), None);
+        let config: Config = toml::from_str(source).unwrap();
+
+        assert_eq!(config.query_parsers.len(), 1);
+        assert_eq!(config.query_parsers[0].database, "production");
+        assert_eq!(config.query_parsers[0].level, QueryParserLevel::Auto);
+        assert_eq!(
+            config.query_parsers[0].engine,
+            QueryParserEngine::PgQueryRaw
+        );
     }
 }

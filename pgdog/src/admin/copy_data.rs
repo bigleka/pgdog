@@ -1,19 +1,18 @@
 //! COPY_DATA command.
 
-use tokio::spawn;
 use tracing::info;
 
-use crate::backend::replication::logical::admin::{Task, TaskType};
-use crate::backend::replication::orchestrator::Orchestrator;
-use crate::backend::replication::AsyncTasks;
+use crate::api::resharding::ReshardTask;
+use crate::api::run_task;
+use crate::backend::replication::resharding_state::ReshardingState;
 
 use super::prelude::*;
 
-pub struct CopyData {
-    pub from_database: String,
-    pub to_database: String,
-    pub publication: String,
-    pub replication_slot: Option<String>,
+pub(crate) struct CopyData {
+    pub(crate) from_database: String,
+    pub(crate) to_database: String,
+    pub(crate) publication: String,
+    pub(crate) replication_slot: Option<String>,
 }
 
 #[async_trait]
@@ -32,7 +31,13 @@ impl Command for CopyData {
                 publication: publication.to_owned(),
                 replication_slot: None,
             }),
-            ["copy_data", from_database, to_database, publication, replication_slot] => Ok(Self {
+            [
+                "copy_data",
+                from_database,
+                to_database,
+                publication,
+                replication_slot,
+            ] => Ok(Self {
                 from_database: from_database.to_owned(),
                 to_database: to_database.to_owned(),
                 publication: publication.to_owned(),
@@ -48,37 +53,24 @@ impl Command for CopyData {
             self.from_database, self.to_database, self.publication
         );
 
-        let mut orchestrator = Orchestrator::new(
-            &self.from_database,
-            &self.to_database,
-            &self.publication,
-            self.replication_slot.clone(),
-        )?;
+        let state = ReshardingState::builder()
+            .source(&self.from_database)
+            .destination(&self.to_database)
+            .publication(&self.publication)
+            .maybe_replication_slot(self.replication_slot.clone())
+            .build()?;
 
-        let slot_name = orchestrator.replication_slot().to_owned();
+        let slot_name = state.replication_slot().to_owned();
 
-        let task_id = Task::register(TaskType::CopyData(spawn(async move {
-            orchestrator.load_schema().await?;
-            orchestrator.schema_sync_pre(true).await?;
-            orchestrator.data_sync().await?;
-            // data_sync can run for hours; any pool reload during the copy marks self.source
-            // offline.  Re-fetch live cluster refs from databases() before starting replication.
-            orchestrator.refresh()?;
-
-            AsyncTasks::insert(TaskType::Replication(Box::new(
-                orchestrator.replicate().await?,
-            )));
-
-            Ok(())
-        })));
+        let task_id = run_task(ReshardTask::builder().state(state).build()).id();
 
         let mut dr = DataRow::new();
         dr.add(task_id.to_string()).add(slot_name);
 
         Ok(vec![
             RowDescription::new(&[Field::text("task_id"), Field::text("replication_slot")])
-                .message()?,
-            dr.message()?,
+                .message(),
+            dr.message(),
         ])
     }
 }

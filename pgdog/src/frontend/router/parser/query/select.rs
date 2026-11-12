@@ -1,8 +1,6 @@
-use crate::frontend::router::parser::{
-    cache::Ast, from_clause::FromClause, where_clause::TablesSource,
-};
-
 use super::*;
+use crate::frontend::router::parser::advisory_lock::AdvisoryLockId;
+use pg_raw_parse::{Node, nodes};
 use pgdog_config::system_catalogs;
 use shared::ConvergeAlgorithm;
 
@@ -11,107 +9,184 @@ impl QueryParser {
     ///
     /// # Arguments
     ///
-    /// * `stmt`: SELECT statement from pg_query.
+    /// * `stmt`: SELECT statement.
     /// * `context`: Query parser context.
     ///
     pub(super) fn select(
         &mut self,
-        cached_ast: &Ast,
-        stmt: &SelectStmt,
+        stmt: &nodes::SelectStmt,
         context: &mut QueryParserContext,
     ) -> Result<Command, Error> {
-        let cte_writes = Self::cte_writes(stmt);
-        let has_locking = Self::has_locking_clause(stmt);
-        let mut overrides = Self::functions(stmt)?;
+        let mut parser = StatementParser::new(
+            stmt.into(),
+            context.router_context.bind,
+            context.sharding_schema,
+        )
+        .with_explain(self.recorder_mut().is_some());
 
-        // Write overwrite because of conservative read/write split.
-        if self.write_override {
-            overrides.writes = true;
-        }
-
-        if cte_writes || has_locking {
-            overrides.writes = true;
-        }
-
-        if overrides.cross_shard {
+        if parser.is_cross_shard() {
             context
                 .shards_calculator
                 .push(ShardWithPriority::new_override_cross_shard_function());
         }
 
+        // Does the statement itself change data: data-modifying CTEs,
+        // locking clauses, write functions. This decides omnisharded
+        // coverage; the primary/replica decision (`writes`) additionally
+        // honours the conservative read/write split's transaction override.
+        let mut mutates = parser.mutates();
+        let (advisory_locks, mut omnisharded) =
+            (parser.extract_advisory_locks(), parser.is_all_omnisharded());
+
+        // If there's an advisory lock function in this query, we must always route it
+        // to a deterministic `Shard`.
+        //
+        // If, specifically, it's advisory_lock_unlock_all(), broadcast to all shards.
+        if !advisory_locks.is_empty() && context.shards > 1 {
+            let unlock_all = advisory_locks
+                .iter()
+                .exactly_one()
+                .map(|adv_lock| adv_lock.unlock_all)
+                .unwrap_or(false);
+
+            let shard_override = if unlock_all {
+                // pg_advisory_unlock_all
+                ShardWithPriority::new_override_cross_shard_function()
+            } else {
+                // Very simplistic direct-to-shard hashing: abs(lock_id) % shard_count
+                //
+                // Since advisory locks are stored in memory, we don't have to worry
+                // about accounting for resharding / changing shard_count later in time
+                let hashed_shard: usize = match advisory_locks
+                    .iter()
+                    .map(|lock| {
+                        lock.id
+                            .map(AdvisoryLockId::get_first_parameter)
+                            .unwrap_or(0)
+                            .unsigned_abs() as usize
+                            % context.shards
+                    })
+                    .all_equal_value()
+                {
+                    Ok(singular_shard) => {
+                        // Either we got a singular lock, or all locks hashed to the same shard.
+                        singular_shard
+                    }
+                    Err(_) => {
+                        // 2+ different shards. In this case, we error to the client,
+                        // as otherwise, we'd need to do something like INSERT split, where we
+                        // break apart the Client's statement, route to separate shards,
+                        // and put together a response for them (+ consider deadlocks, etc).
+                        // Kinda complex!
+                        //
+                        // Since this is not common in production, I opted to defer this
+                        // in favor of quickly correcting the functionality for most common cases.
+                        // TODO: eventually support something that works better
+                        return Err(Error::CrossShardAdvisoryLockAttempt);
+                    }
+                };
+
+                ShardWithPriority::new_override_advisory_lock(Shard::Direct(hashed_shard))
+            };
+
+            // Overrides Comment / Set / etc, since ShardSource::Override(..) sorts above them.
+            context.shards_calculator.push(shard_override);
+        }
+
+        mutates |= !advisory_locks.is_empty();
+        // Write override because of conservative read/write split.
+        let writes = self.write_override || mutates;
+
         // Early return for any direct-to-shard queries.
         if context.shards_calculator.shard().is_direct() {
-            let advisory_locks = StatementParser::from_select(
-                stmt,
-                context.router_context.bind,
-                &context.sharding_schema,
-                None,
-            )
-            .extract_advisory_locks();
             return Ok(Command::Query(
                 Route::read(context.shards_calculator.shard().clone())
-                    .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
+                    .with_read(!writes)
+                    .with_mutates(mutates)
+                    .with_omnisharded(omnisharded)
+                    .with_advisory_locks(advisory_locks)
+                    .dml(),
             ));
         }
 
         let mut shards = HashSet::new();
 
-        let (shard, is_sharded, tables, advisory_locks) = {
-            let mut statement_parser = StatementParser::from_select(
-                stmt,
-                context.router_context.bind,
-                &context.sharding_schema,
-                self.recorder_mut(),
-            );
+        parser.set_resolved_lookups(&context.router_context.resolved_lookups);
 
-            let shard = statement_parser.shard()?;
+        let shard = parser.shard()?;
+        let pending_lookups = parser.take_pending_lookups();
 
-            // Piggyback on the parser's single AST walk — this reuses the cached
-            // traversal used for sharding / table extraction.
-            let advisory_locks = statement_parser.extract_advisory_locks();
+        // Collect explain entries from the parser.
+        if let Some(recorder) = self.recorder_mut() {
+            recorder.extend(parser.take_explain());
+        }
 
-            if shard.is_some() {
-                (shard, true, vec![], advisory_locks)
-            } else {
-                (
-                    None,
-                    statement_parser.is_sharded(
-                        &context.router_context.schema,
-                        context.router_context.cluster.user(),
-                        context.router_context.parameter_hints.search_path,
-                    ),
-                    statement_parser.extract_tables(),
-                    advisory_locks,
-                )
-            }
+        let is_sharded = if shard.is_some() {
+            true
+        } else {
+            parser.is_sharded(
+                context.router_context.schema,
+                context.router_context.cluster.user(),
+                context.router_context.parameter_hints.search_path,
+            )
         };
+        let tables = shard.is_none().then(|| parser.tables());
+
+        context.pending_lookups.extend(pending_lookups);
 
         if let Some(shard) = shard {
             shards.insert(shard);
         }
 
         // SELECT NOW(), SELECT 1
-        if shards.is_empty() && stmt.from_clause.is_empty() {
-            let shard = Shard::Direct(round_robin::next() % context.shards);
+        if shards.is_empty() && stmt.from_clause().is_empty() {
+            if omnisharded && mutates {
+                // e.g. `WITH ins AS (INSERT INTO omni ... RETURNING id) SELECT 1`.
+                // The write must reach every shard to keep them identical.
+                if let Some(recorder) = self.recorder_mut() {
+                    recorder.record_entry(None, "SELECT omnishard write broadcasted");
+                }
 
-            if let Some(recorder) = self.recorder_mut() {
-                recorder.record_entry(Some(shard.clone()), "SELECT omnishard no table".to_string());
+                context
+                    .shards_calculator
+                    .push(ShardWithPriority::new_table_omni(Shard::All));
+            } else {
+                // check if we have sticky setting somewhere and if do
+                // read the data from the sticked shard
+                let sharded_tables = context.sharding_schema.tables();
+                let index = if sharded_tables.is_system_catalog_sticky()
+                    || sharded_tables.is_omnisharded_sticky_default()
+                {
+                    context.router_context.sticky.omni_index % context.shards
+                } else {
+                    round_robin::next(context.shards)
+                };
+                let shard = Shard::Direct(index);
+
+                if let Some(recorder) = self.recorder_mut() {
+                    recorder.record_entry(Some(shard.clone()), "SELECT omnishard no table");
+                }
+
+                context
+                    .shards_calculator
+                    .push(ShardWithPriority::new_rr_no_table(shard));
             }
-
-            context
-                .shards_calculator
-                .push(ShardWithPriority::new_rr_no_table(shard));
 
             return Ok(Command::Query(
                 Route::read(context.shards_calculator.shard().clone())
-                    .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
+                    .with_read(!writes)
+                    .with_mutates(mutates)
+                    .with_omnisharded(omnisharded)
+                    .with_advisory_locks(advisory_locks)
+                    .dml(),
             ));
         }
 
-        let order_by = Self::select_sort(&stmt.sort_clause, context.router_context.bind);
-        let from_clause = TablesSource::from(FromClause::new(&stmt.from_clause));
+        let order_by = Self::select_sort(stmt, context.router_context.bind);
+        let from_clause_table_name = stmt.from_clause().first().and_then(|node| match node {
+            Node::RangeVar(r) => Some(r.relname().expect("RangeVar always has relname")),
+            _ => None,
+        });
 
         // Shard by vector in ORDER BY clause.
         for order in &order_by {
@@ -119,7 +194,7 @@ impl QueryParser {
                 for table in context.sharding_schema.tables.tables() {
                     if &table.column == column_name
                         && (table.name.is_none()
-                            || table.name.as_deref() == from_clause.table_name())
+                            || from_clause_table_name.is_some_and(|name| table.name_matches(name)))
                     {
                         let centroids = Centroids::from(&table.centroids);
                         let shard: Shard = centroids
@@ -138,9 +213,9 @@ impl QueryParser {
         }
 
         let shard = Self::converge(&shards, ConvergeAlgorithm::default());
-        let aggregates = Aggregate::parse(stmt);
+        let aggregates = Aggregate::parse(stmt, context.router_context.schema);
         let limit = LimitClause::new(stmt, context.router_context.bind).limit_offset()?;
-        let distinct = Distinct::new(stmt).distinct()?;
+        let distinct = Distinct::new(stmt).distinct();
 
         if let Some(shard) = shard {
             debug!("direct-to-shard {}", shard);
@@ -156,15 +231,12 @@ impl QueryParser {
                 .push(ShardWithPriority::new_table(Shard::All));
         } else {
             let system_catalog_sharded =
-                if context.sharding_schema.tables().is_system_catalog_sharded() {
-                    {
+                context.sharding_schema.tables().is_system_catalog_sharded()
+                    && tables.is_some_and(|tables| {
                         tables
                             .iter()
                             .any(|table| system_catalogs().contains(&table.name))
-                    }
-                } else {
-                    Default::default()
-                };
+                    });
 
             if system_catalog_sharded {
                 debug!("system catalog sharded");
@@ -178,40 +250,64 @@ impl QueryParser {
                     context.router_context.schema.is_loaded()
                 );
 
-                // Omnisharded by default.
-                let sticky = tables.iter().any(|table| {
+                // Omnisharded by default (non-sharded tables, including
+                // system catalogs).
+                omnisharded = true;
+
+                if mutates {
+                    // A write through an omnisharded table, e.g. a
+                    // data-modifying CTE, must reach every shard to keep
+                    // them identical, like an omnisharded INSERT or UPDATE.
+                    if let Some(recorder) = self.recorder_mut() {
+                        recorder.record_entry(None, "SELECT omnishard write broadcasted");
+                    }
+
                     context
-                        .sharding_schema
-                        .tables()
-                        .is_omnisharded_sticky(table.name)
-                        == Some(true)
-                });
-
-                let (rr_index, explain) = if sticky
-                    || context
-                        .sharding_schema
-                        .tables()
-                        .is_omnisharded_sticky_default()
-                {
-                    (context.router_context.sticky.omni_index, "sticky")
+                        .shards_calculator
+                        .push(ShardWithPriority::new_table_omni(Shard::All));
                 } else {
-                    (round_robin::next(), "round robin")
-                };
+                    // Any single shard can answer a read.
+                    let sharded_tables = context.sharding_schema.tables();
+                    let sticky = tables.is_some_and(|tables| {
+                        tables.iter().any(|table| {
+                            sharded_tables.is_omnisharded_sticky(table.name) == Some(true)
+                            // TODO: do we need to store and manage system_catalogs if we have `is_pg_catalog`?
+                                || (table.is_pg_catalog()
+                                    && sharded_tables.is_system_catalog_sticky())
+                        })
+                    });
 
-                let shard = Shard::Direct(rr_index % context.shards);
+                    let (rr_index, explain) = if sticky
+                        || context
+                            .sharding_schema
+                            .tables()
+                            .is_omnisharded_sticky_default()
+                    {
+                        (
+                            context.router_context.sticky.omni_index % context.shards,
+                            "sticky",
+                        )
+                    } else {
+                        (round_robin::next(context.shards), "round robin")
+                    };
 
-                if let Some(recorder) = self.recorder_mut() {
-                    recorder
-                        .record_entry(Some(shard.clone()), format!("SELECT omnishard {}", explain));
+                    let shard = Shard::Direct(rr_index);
+
+                    if let Some(recorder) = self.recorder_mut() {
+                        recorder.record_entry(
+                            Some(shard.clone()),
+                            format!("SELECT omnishard {}", explain),
+                        );
+                    }
+
+                    context
+                        .shards_calculator
+                        .push(ShardWithPriority::new_rr_omni(shard));
                 }
-
-                context
-                    .shards_calculator
-                    .push(ShardWithPriority::new_rr_omni(shard));
             }
         }
 
-        let mut query = Route::select(
+        let query = Route::select(
             context.shards_calculator.shard().clone(),
             order_by,
             aggregates,
@@ -219,14 +315,11 @@ impl QueryParser {
             distinct,
         );
 
-        // Only rewrite if query is cross-shard.
-        if query.is_cross_shard() && context.shards > 1 {
-            query.with_aggregate_rewrite_plan_mut(cached_ast.rewrite_plan.aggregates.clone());
-        }
-
         Ok(Command::Query(
             query
-                .with_functions(overrides)
+                .with_read(!writes)
+                .with_mutates(mutates)
+                .with_omnisharded(omnisharded)
                 .with_advisory_locks(advisory_locks),
         ))
     }
@@ -235,189 +328,85 @@ impl QueryParser {
     ///
     /// # Arguments
     ///
-    /// * `nodes`: List of pg_query-generated nodes from the ORDER BY clause.
-    /// * `params`: Bind parameters, if any.
+    /// * `nodes`: List of parser-generated nodes from the ORDER BY clause.
+    /// * `params`: Statement parameters, if any.
     ///
-    fn select_sort(nodes: &[Node], params: Option<&Bind>) -> Vec<OrderBy> {
-        let mut order_by = vec![];
-        for clause in nodes {
-            if let Some(NodeEnum::SortBy(ref sort_by)) = clause.node {
-                let asc = matches!(sort_by.sortby_dir, 0..=2);
-                let Some(ref node) = sort_by.node else {
-                    continue;
-                };
-                let Some(ref node) = node.node else {
-                    continue;
+    fn select_sort(
+        stmt: &nodes::SelectStmt,
+        params: Option<StatementParameters<'_>>,
+    ) -> Vec<OrderBy> {
+        stmt.sort_clause()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(sort_key_position, sort_by)| {
+                use pg_raw_parse::{
+                    ConstValue,
+                    raw::{A_Expr_Kind::*, SortByDir::*},
                 };
 
-                match node {
-                    NodeEnum::AConst(aconst) => {
-                        if let Some(Val::Ival(ref integer)) = aconst.val {
-                            order_by.push(if asc {
-                                OrderBy::Asc(integer.ival as usize)
-                            } else {
-                                OrderBy::Desc(integer.ival as usize)
-                            });
+                let asc = matches!(sort_by.sortby_dir, SORTBY_DEFAULT | SORTBY_ASC);
+                match sort_by.node() {
+                    Node::A_Const(c) if let Some(ConstValue::Integer(i)) = c.val() => {
+                        if asc {
+                            Some(OrderBy::Asc(i as _))
+                        } else {
+                            Some(OrderBy::Desc(i as _))
                         }
                     }
 
-                    NodeEnum::ColumnRef(column_ref) => {
+                    Node::ColumnRef(c) => {
                         // TODO: save the entire column and disambiguate
                         // when reading data with RowDescription as context.
-                        let Some(field) = column_ref.fields.last() else {
-                            continue;
-                        };
-                        if let Some(NodeEnum::String(ref string)) = field.node {
-                            order_by.push(if asc {
-                                OrderBy::AscColumn(string.sval.clone())
-                            } else {
-                                OrderBy::DescColumn(string.sval.clone())
-                            });
+                        let col_name = c.fields().into_iter().next_back()?.as_str()?;
+                        if asc {
+                            Some(OrderBy::AscColumn(col_name.into()))
+                        } else {
+                            Some(OrderBy::DescColumn(col_name.into()))
                         }
                     }
 
-                    NodeEnum::AExpr(expr) => {
-                        if expr.kind() == AExprKind::AexprOp {
-                            if let Some(node) = expr.name.first() {
-                                if let Some(NodeEnum::String(String { sval })) = &node.node {
-                                    match sval.as_str() {
-                                        "<->" => {
-                                            let mut vector: Option<Vector> = None;
-                                            let mut column: Option<std::string::String> = None;
+                    Node::A_Expr(e @ nodes::A_Expr { kind: AEXPR_OP, .. })
+                        if let Some("<->") = e.name().iter().next().and_then(Node::as_str) =>
+                    {
+                        let mut vector: Option<Vector> = None;
+                        let mut column: Option<&str> = None;
 
-                                            for e in
-                                                [&expr.lexpr, &expr.rexpr].iter().copied().flatten()
-                                            {
-                                                if let Ok(vec) = Value::try_from(&e.node) {
-                                                    match vec {
-                                                        Value::Placeholder(p) => {
-                                                            if let Some(bind) = params {
-                                                                if let Ok(Some(param)) =
-                                                                    bind.parameter((p - 1) as usize)
-                                                                {
-                                                                    vector = param.vector();
-                                                                }
-                                                            }
-                                                        }
-                                                        Value::Vector(vec) => vector = Some(vec),
-                                                        _ => (),
-                                                    }
-                                                }
-
-                                                if let Ok(col) = Column::try_from(&e.node) {
-                                                    column = Some(col.name.to_owned());
-                                                }
-                                            }
-
-                                            if let Some(vector) = vector {
-                                                if let Some(column) = column {
-                                                    order_by.push(OrderBy::AscVectorL2Column(
-                                                        column, vector,
-                                                    ));
-                                                }
-                                            }
+                        for e in [e.lexpr(), e.rexpr()] {
+                            if let Ok(vec) = Value::try_from(e) {
+                                match vec {
+                                    Value::Placeholder(p) => {
+                                        if let Ok(param) = params?.parameter((p - 1) as _) {
+                                            vector = param?.vector();
                                         }
-                                        _ => continue,
                                     }
+                                    Value::Vector(vec) => vector = Some(vec),
+                                    _ => (),
                                 }
+                            } else if let Ok(col) = Column::try_from(e) {
+                                column = Some(col.name);
                             }
+                        }
+
+                        if let Some(vector) = vector
+                            && let Some(column) = column
+                        {
+                            Some(OrderBy::AscVectorL2Column(column.into(), vector))
+                        } else {
+                            None
                         }
                     }
 
-                    _ => continue,
-                }
-            }
-        }
+                    _ => {
+                        let helper_column_alias = OrderBy::helper_column_name(sort_key_position);
 
-        order_by
-    }
-
-    /// Handle Postgres functions that could trigger the SELECT to go to a primary.
-    ///
-    /// # Arguments
-    ///
-    /// * `stmt`: SELECT statement from pg_query.
-    ///
-    fn functions(stmt: &SelectStmt) -> Result<FunctionBehavior, Error> {
-        for target in &stmt.target_list {
-            if let Ok(func) = Function::try_from(target) {
-                return Ok(func.behavior());
-            }
-        }
-
-        // Recurse into CTEs so a write-only function
-        // nested inside a WITH clause still routes to the primary.
-        if let Some(ref with_clause) = stmt.with_clause {
-            for cte in &with_clause.ctes {
-                if let Some(NodeEnum::CommonTableExpr(ref expr)) = cte.node {
-                    if let Some(ref query) = expr.ctequery {
-                        if let Some(NodeEnum::SelectStmt(ref inner)) = query.node {
-                            let behavior = Self::functions(inner)?;
-                            if behavior.writes {
-                                return Ok(behavior);
-                            }
+                        if asc {
+                            Some(OrderBy::AscColumn(helper_column_alias))
+                        } else {
+                            Some(OrderBy::DescColumn(helper_column_alias))
                         }
                     }
                 }
-            }
-        }
-
-        Ok(FunctionBehavior::default())
-    }
-
-    /// Recursively check for a locking clause (FOR UPDATE, FOR SHARE, etc.)
-    /// on this statement or any CTE nested within it.
-    fn has_locking_clause(stmt: &SelectStmt) -> bool {
-        if !stmt.locking_clause.is_empty() {
-            return true;
-        }
-
-        if let Some(ref with_clause) = stmt.with_clause {
-            for cte in &with_clause.ctes {
-                if let Some(NodeEnum::CommonTableExpr(ref expr)) = cte.node {
-                    if let Some(ref query) = expr.ctequery {
-                        if let Some(NodeEnum::SelectStmt(ref inner)) = query.node {
-                            if Self::has_locking_clause(inner) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Check for CTEs that could trigger this query to go to a primary.
-    ///
-    /// # Arguments
-    ///
-    /// * `stmt`: SELECT statement from pg_query.
-    ///
-    fn cte_writes(stmt: &SelectStmt) -> bool {
-        if let Some(ref with_clause) = stmt.with_clause {
-            for cte in &with_clause.ctes {
-                if let Some(NodeEnum::CommonTableExpr(ref expr)) = cte.node {
-                    if let Some(ref query) = expr.ctequery {
-                        if let Some(ref node) = query.node {
-                            match node {
-                                NodeEnum::SelectStmt(stmt) => {
-                                    if Self::cte_writes(stmt) {
-                                        return true;
-                                    }
-                                }
-
-                                _ => {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        false
+            })
+            .collect()
     }
 }

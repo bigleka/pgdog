@@ -13,7 +13,7 @@ pub(super) struct Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         if self.waiting {
-            self.pool.lock().remove_waiter(&self.request.id);
+            self.pool.lock().remove_waiter(self.request.id);
         }
     }
 }
@@ -32,7 +32,14 @@ impl Waiting {
             if !guard.online {
                 return Err(Error::Offline);
             }
-            guard.waiting.push_back(Waiter { request, tx });
+            if request.read {
+                guard.stats.counts.reads += 1;
+            } else {
+                guard.stats.counts.writes += 1;
+            }
+            // Recheck availability while registering, since cancellation may
+            // have completed after get_internal's first checkout attempt.
+            guard.add_waiter(Waiter { request, tx }, request.created_at)?;
             guard.full()
         };
 
@@ -84,10 +91,11 @@ pub(super) struct Waiter {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::backend::pool::Pool;
-    use crate::net::messages::BackendKeyData;
-    use tokio::time::{sleep, timeout, Duration};
+    use crate::net::messages::FrontendPid;
+    use tokio::time::{Duration, sleep, timeout};
 
     #[tokio::test]
     async fn test_cancellation_safety() {
@@ -99,7 +107,7 @@ mod tests {
 
         for i in 0..num_tasks {
             let pool_clone = pool.clone();
-            let request = Request::unrouted(BackendKeyData::new());
+            let request = Request::unrouted(FrontendPid::new());
             let mut waiting = Waiting::new(pool_clone, &request).unwrap();
 
             let wait_task = tokio::spawn(async move { waiting.wait().await });
@@ -137,12 +145,10 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_removes_waiter() {
         let config = crate::backend::pool::Config {
-            inner: pgdog_stats::Config {
-                max: 1,
-                min: 1,
-                checkout_timeout: Duration::from_millis(10),
-                ..crate::backend::pool::Config::default().inner
-            },
+            max: 1,
+            min: 1,
+            checkout_timeout: Duration::from_millis(10),
+            ..crate::backend::pool::Config::default()
         };
 
         let pool = Pool::new(&crate::backend::pool::PoolConfig {
@@ -162,7 +168,7 @@ mod tests {
 
         let _conn = pool.get(&Request::default()).await.unwrap();
 
-        let request = Request::unrouted(BackendKeyData::new());
+        let request = Request::unrouted(FrontendPid::new());
         let waiter_pool = pool.clone();
         let get_conn = async move {
             let mut waiting = Waiting::new(waiter_pool.clone(), &request).unwrap();

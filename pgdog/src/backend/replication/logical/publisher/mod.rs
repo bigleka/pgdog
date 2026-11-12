@@ -1,45 +1,43 @@
-pub mod slot;
-pub use slot::*;
-pub mod abort;
-pub mod copy;
-pub mod parallel_sync;
-pub mod progress;
-pub mod publisher_impl;
-pub mod queries;
-pub mod table;
-pub use abort::*;
-pub use copy::*;
-pub use parallel_sync::ParallelSyncManager;
-pub use queries::*;
-pub use table::*;
+pub(crate) mod non_identity_columns_presence;
+pub(crate) use non_identity_columns_presence::*;
+
+pub(crate) mod replication_slot;
+pub(crate) use replication_slot::*;
+pub(crate) mod copy;
+pub(crate) mod cutover_policy;
+pub(crate) mod queries;
+pub(crate) mod replication_progress;
+pub(crate) mod replication_stream;
+pub(crate) mod resharding_replicas;
+pub(crate) mod table;
+pub(crate) use queries::*;
+pub(crate) use resharding_replicas::*;
+pub(crate) use table::*;
 
 #[cfg(test)]
-pub mod test {
+pub(crate) mod test {
 
-    use crate::backend::{server::test::test_replication_server, Server};
+    use crate::backend::{Server, server::test::test_replication_server};
 
-    pub struct PublicationTest {
-        pub server: Server,
+    pub(crate) struct PublicationTest {
+        pub(crate) server: Server,
+        pub(crate) publication: String,
+        pub(crate) tables: Vec<String>,
     }
 
     impl PublicationTest {
-        pub async fn cleanup(&mut self) {
-            self.server
-                .execute("DROP PUBLICATION IF EXISTS publication_test")
-                .await
-                .unwrap();
-            self.server
-                .execute("DROP TABLE IF EXISTS publication_test_two")
-                .await
-                .unwrap();
-            self.server
-                .execute("DROP TABLE IF EXISTS publication_test_one")
-                .await
-                .unwrap();
+        pub(crate) async fn cleanup(&mut self) {
+            let drop_publication = format!("DROP PUBLICATION IF EXISTS {}", self.publication);
+            self.server.execute(drop_publication).await.unwrap();
+
+            for table in self.tables.iter().rev() {
+                let drop_table = format!("DROP TABLE IF EXISTS {}", table);
+                self.server.execute(drop_table).await.unwrap();
+            }
         }
     }
 
-    pub async fn setup_publication() -> PublicationTest {
+    pub(crate) async fn setup_publication() -> PublicationTest {
         let mut server = test_replication_server().await;
 
         server.execute("CREATE TABLE IF NOT EXISTS publication_test_one (id BIGSERIAL PRIMARY KEY, email VARCHAR NOT NULL)").await.unwrap();
@@ -68,6 +66,84 @@ pub mod test {
             .unwrap();
         server.execute("CREATE PUBLICATION publication_test FOR TABLE publication_test_one, publication_test_two").await.unwrap();
 
-        PublicationTest { server }
+        PublicationTest {
+            server,
+            publication: "publication_test".into(),
+            tables: vec!["publication_test_one".into(), "publication_test_two".into()],
+        }
+    }
+
+    pub(crate) async fn setup_publication_tables(
+        publication: &str,
+        tables: &[&str],
+    ) -> PublicationTest {
+        let mut test = PublicationTest {
+            server: test_replication_server().await,
+            publication: publication.to_owned(),
+            tables: tables.iter().map(|table| table.to_string()).collect(),
+        };
+
+        test.cleanup().await;
+
+        for table in &test.tables {
+            let create_table =
+                format!("CREATE TABLE {} (id BIGINT PRIMARY KEY, value TEXT)", table);
+            test.server.execute(create_table).await.unwrap();
+        }
+
+        let create_publication = format!(
+            "CREATE PUBLICATION {} FOR TABLE {}",
+            test.publication,
+            test.tables.join(", ")
+        );
+        test.server.execute(create_publication).await.unwrap();
+
+        test
+    }
+
+    /// Test wrapper for setting up a publication table with a specific kind of
+    /// identity column, if we wanted to test out how different types interact
+    /// with our functionality.
+    ///
+    /// Also performs a 10,000 row INSERT, so we have some data to test with
+    /// (e.g., how ctid ranges are generated)
+    pub(crate) async fn setup_publication_table_with_data_type_identity_col(
+        publication: &str,
+        table: &str,
+        data_type: &str,
+    ) -> PublicationTest {
+        let mut test = PublicationTest {
+            server: test_replication_server().await,
+            publication: publication.to_owned(),
+            tables: vec![table.to_owned()],
+        };
+
+        test.cleanup().await;
+
+        test.server
+            .execute(format!(
+                "CREATE TABLE {} (id {data_type}, value TEXT)",
+                table
+            ))
+            .await
+            .unwrap();
+
+        test.server
+            .execute(format!(
+                "INSERT INTO {table} (value) SELECT 'some random text' FROM generate_series(1, 100000)"
+            ))
+            .await
+            .unwrap();
+
+        test.server
+            .execute(format!(
+                "CREATE PUBLICATION {} FOR TABLE {}",
+                test.publication,
+                test.tables.join(", "),
+            ))
+            .await
+            .unwrap();
+
+        test
     }
 }

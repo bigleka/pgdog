@@ -7,17 +7,17 @@ use std::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{columns::Column, Error};
+use super::{Error, columns::Column};
 use crate::{
     backend::Server,
     net::messages::{DataRow, Format},
 };
 
 /// Get all relations in the database.
-pub static TABLES: &str = include_str!("relations.sql");
+pub(crate) static TABLES: &str = include_str!("relations.sql");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Relation {
+pub(crate) struct Relation {
     inner: StatsRelation,
 }
 
@@ -73,7 +73,7 @@ impl From<DataRow> for Relation {
 
 impl Relation {
     /// Load relations and their columns.
-    pub async fn load(server: &mut Server) -> Result<Vec<Relation>, Error> {
+    pub(crate) async fn load(server: &mut Server) -> Result<Vec<Relation>, Error> {
         let mut relations: HashMap<_, _> = server
             .fetch_all::<Relation>(TABLES)
             .await?
@@ -122,7 +122,7 @@ impl Relation {
 
 #[cfg(test)]
 mod test {
-    use crate::backend::pool::{test::pool, Request};
+    use crate::backend::pool::{Request, test::pool};
 
     use super::*;
 

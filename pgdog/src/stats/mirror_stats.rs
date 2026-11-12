@@ -2,10 +2,10 @@ use crate::backend::databases::databases;
 
 use super::{Measurement, Metric, OpenMetric};
 
-pub struct MirrorStatsMetrics;
+pub(crate) struct MirrorStatsMetrics;
 
 impl MirrorStatsMetrics {
-    pub fn load() -> Vec<Metric> {
+    pub(crate) fn load() -> Vec<Metric> {
         let mut metrics = vec![];
 
         let mut total_count_measurements = vec![];
@@ -24,7 +24,7 @@ impl MirrorStatsMetrics {
         for (user, cluster) in databases().all() {
             let stats = cluster.stats();
             let stats = stats.lock();
-            let counts = stats.counts;
+            let counts = stats.mirror;
 
             // Per-cluster metrics with labels
             let labels = vec![

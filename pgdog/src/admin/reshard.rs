@@ -2,15 +2,17 @@
 
 use tracing::info;
 
-use crate::backend::replication::orchestrator::Orchestrator;
+use crate::api::resharding::ReshardTask;
+use crate::api::run_task;
+use crate::backend::replication::resharding_state::ReshardingState;
 
 use super::prelude::*;
 
-pub struct Reshard {
-    pub from_database: String,
-    pub to_database: String,
-    pub publication: String,
-    pub replication_slot: Option<String>,
+pub(crate) struct Reshard {
+    pub(crate) from_database: String,
+    pub(crate) to_database: String,
+    pub(crate) publication: String,
+    pub(crate) replication_slot: Option<String>,
 }
 
 #[async_trait]
@@ -29,7 +31,13 @@ impl Command for Reshard {
                 publication: publication.to_owned(),
                 replication_slot: None,
             }),
-            ["reshard", from_database, to_database, publication, replication_slot] => Ok(Self {
+            [
+                "reshard",
+                from_database,
+                to_database,
+                publication,
+                replication_slot,
+            ] => Ok(Self {
                 from_database: from_database.to_owned(),
                 to_database: to_database.to_owned(),
                 publication: publication.to_owned(),
@@ -44,15 +52,27 @@ impl Command for Reshard {
             r#"resharding "{}" to "{}", publication="{}""#,
             self.from_database, self.to_database, self.publication
         );
-        let mut orchestrator = Orchestrator::new(
-            &self.from_database,
-            &self.to_database,
-            &self.publication,
-            self.replication_slot.clone(),
-        )?;
+        let state = ReshardingState::builder()
+            .source(&self.from_database)
+            .destination(&self.to_database)
+            .publication(&self.publication)
+            .maybe_replication_slot(self.replication_slot.clone())
+            .build()?;
 
-        orchestrator.replicate_and_cutover().await?;
+        let task_id = run_task(
+            ReshardTask::builder()
+                .state(state)
+                .auto_cutover(true)
+                .build(),
+        )
+        .id();
 
-        Ok(vec![])
+        let mut dr = DataRow::new();
+        dr.add(task_id.to_string());
+
+        Ok(vec![
+            RowDescription::new(&[Field::text("task_id")]).message(),
+            dr.message(),
+        ])
     }
 }

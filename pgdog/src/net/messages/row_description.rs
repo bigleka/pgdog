@@ -1,35 +1,35 @@
 //! RowDescription (B) message.
 
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::net::c_string_buf;
 use crate::stats::memory::MemoryUsage;
 
-use super::{code, DataType};
-use super::{prelude::*, Format};
+use super::{DataType, code};
+use super::{Format, prelude::*};
 
 /// Column field description.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Field {
+pub(crate) struct Field {
     /// Name of the field.
-    pub name: String,
+    pub(crate) name: String,
     /// Table OID.
-    pub table_oid: i32,
+    pub(crate) table_oid: i32,
     /// Column number.
-    pub column: i16,
+    pub(crate) column: i16,
     /// Type OID.
-    pub type_oid: i32,
+    pub(crate) type_oid: i32,
     /// Type size.
-    pub type_size: i16,
+    pub(crate) type_size: i16,
     /// Type modifier.
-    pub type_modifier: i32,
+    pub(crate) type_modifier: i32,
     /// Format code.
-    pub format: i16,
+    pub(crate) format: i16,
 }
 
 impl MemoryUsage for Field {
-    #[inline]
     fn memory_usage(&self) -> usize {
         self.name.capacity()
             + self.table_oid.memory_usage()
@@ -43,7 +43,7 @@ impl MemoryUsage for Field {
 
 impl Field {
     /// Numeric field (text format).
-    pub fn numeric(name: &str) -> Self {
+    pub(crate) fn numeric(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -56,7 +56,8 @@ impl Field {
     }
 
     /// Numeric field (binary format).
-    pub fn numeric_binary(name: &str) -> Self {
+    #[cfg(test)]
+    pub(crate) fn numeric_binary(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -69,7 +70,7 @@ impl Field {
     }
 
     /// Text field.
-    pub fn text(name: &str) -> Self {
+    pub(crate) fn text(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -82,7 +83,7 @@ impl Field {
     }
 
     /// Boolean field.
-    pub fn bool(name: &str) -> Self {
+    pub(crate) fn bool(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -94,7 +95,7 @@ impl Field {
         }
     }
 
-    pub fn bigint(name: &str) -> Self {
+    pub(crate) fn bigint(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -107,7 +108,8 @@ impl Field {
     }
 
     /// Timestamp field.
-    pub fn timestamp(name: &str) -> Self {
+    #[cfg(test)]
+    pub(crate) fn timestamp(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -119,34 +121,9 @@ impl Field {
         }
     }
 
-    /// Float4/Real field (text format).
-    pub fn float(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            table_oid: 0,
-            column: 0,
-            type_oid: 700, // PostgreSQL OID for float4/real
-            type_size: 4,
-            type_modifier: -1,
-            format: 0, // Text format
-        }
-    }
-
-    /// Float4/Real field (binary format).
-    pub fn float_binary(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            table_oid: 0,
-            column: 0,
-            type_oid: 700, // PostgreSQL OID for float4/real
-            type_size: 4,
-            type_modifier: -1,
-            format: 1, // Binary format
-        }
-    }
-
     /// Float8/Double Precision field (text format).
-    pub fn double(name: &str) -> Self {
+    #[cfg(test)]
+    pub(crate) fn double(name: &str) -> Self {
         Self {
             name: name.into(),
             table_oid: 0,
@@ -155,30 +132,15 @@ impl Field {
             type_size: 8,
             type_modifier: -1,
             format: 0, // Text format
-        }
-    }
-
-    /// Float8/Double Precision field (binary format).
-    pub fn double_binary(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            table_oid: 0,
-            column: 0,
-            type_oid: 701, // PostgreSQL OID for float8/double precision
-            type_size: 8,
-            type_modifier: -1,
-            format: 1, // Binary format
         }
     }
 
     /// Get the column data type.
-    #[inline]
-    pub fn data_type(&self) -> DataType {
+    pub(crate) fn data_type(&self) -> DataType {
         DataType::from_oid(self.type_oid)
     }
 
-    #[inline]
-    pub fn format(&self) -> Format {
+    pub(crate) fn format(&self) -> Format {
         match self.format {
             0 => Format::Text,
             _ => Format::Binary,
@@ -188,13 +150,12 @@ impl Field {
 
 /// RowDescription message.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct RowDescription {
+pub(crate) struct RowDescription {
     /// Fields.
-    pub fields: Arc<Vec<Field>>,
+    pub(crate) fields: Arc<Vec<Field>>,
 }
 
 impl MemoryUsage for RowDescription {
-    #[inline]
     fn memory_usage(&self) -> usize {
         self.fields.iter().map(|f| f.memory_usage()).sum::<usize>()
     }
@@ -202,20 +163,19 @@ impl MemoryUsage for RowDescription {
 
 impl RowDescription {
     /// Create new row description from fields.
-    pub fn new(fields: &[Field]) -> Self {
+    pub(crate) fn new(fields: &[Field]) -> Self {
         Self {
             fields: Arc::new(fields.to_vec()),
         }
     }
 
     /// Get field info.
-    #[inline]
-    pub fn field(&self, index: usize) -> Option<&Field> {
+    pub(crate) fn field(&self, index: usize) -> Option<&Field> {
         self.fields.get(index)
     }
 
     /// Get field index name, O(n).
-    pub fn field_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn field_index(&self, name: &str) -> Option<usize> {
         for (index, field) in self.fields.iter().enumerate() {
             if field.name == name {
                 return Some(index);
@@ -226,21 +186,15 @@ impl RowDescription {
     }
 
     /// Return a new row description without the specified columns (0-based indexes).
-    pub fn drop_columns(&self, drop: &[usize]) -> Self {
-        if drop.is_empty() {
-            return self.clone();
-        }
-
-        let mut indices = drop.to_vec();
-        indices.sort_unstable();
-        indices.dedup();
+    pub(crate) fn drop_columns(&self, drop: impl IntoIterator<Item = usize>) -> Self {
+        let indices = drop.into_iter().collect::<BTreeSet<_>>();
 
         let fields = self
             .fields
             .iter()
             .enumerate()
             .filter_map(|(idx, field)| {
-                if indices.binary_search(&idx).is_ok() {
+                if indices.contains(&idx) {
                     None
                 } else {
                     Some(field.clone())
@@ -253,23 +207,18 @@ impl RowDescription {
         }
     }
 
-    /// Check if the two row descriptions are materially the same.
-    pub fn equivalent(&self, other: &RowDescription) -> bool {
-        if self.fields.len() != other.fields.len() {
-            return false;
-        }
-
-        for (a, b) in self.fields.iter().zip(other.fields.iter()) {
-            if a.name != b.name {
-                return false;
-            }
-
-            if a.type_oid != b.type_oid {
-                return false;
+    /// Replaces the data types of each field using the given mapping.
+    /// Returns whether any changes actually occurred.
+    pub(crate) fn rewrite_data_types(&mut self, mapping: &HashMap<u32, u32>) -> bool {
+        let mut changed = false;
+        for field in Arc::make_mut(&mut self.fields) {
+            if let Some(&canonical) = mapping.get(&(field.type_oid as u32)) {
+                changed = true;
+                field.type_oid = canonical as i32;
             }
         }
 
-        true
+        changed
     }
 }
 
@@ -305,7 +254,7 @@ impl FromBytes for RowDescription {
 }
 
 impl ToBytes for RowDescription {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = Payload::named(self.code());
         payload.put_i16(self.fields.len() as i16);
 
@@ -319,7 +268,7 @@ impl ToBytes for RowDescription {
             payload.put_i16(field.format);
         }
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 

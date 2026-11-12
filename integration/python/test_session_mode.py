@@ -26,6 +26,16 @@ async def async_session_conn(schema):
         statement_cache_size=0,
     )
 
+async def async_session_conn_no_search_path():
+    return await asyncpg.connect(
+        user="pgdog_session_no_cross_shard",
+        password="pgdog",
+        database="pgdog_schema_no_cross",
+        host="127.0.0.1",
+        port=6432,
+        statement_cache_size=0,
+    )
+
 
 def test_session_simple_queries():
     for schema in ["shard_0", "shard_1"]:
@@ -336,3 +346,24 @@ async def test_async_session_multiple_statements_in_transaction():
         await conn.execute("DROP TABLE test_async_session_multi")
         await conn.close()
     no_out_of_sync()
+
+@pytest.mark.asyncio
+async def test_no_search_path_session_mode():
+    for _ in range(25):
+        conn = await async_session_conn_no_search_path()
+        await conn.execute("CREATE SCHEMA IF NOT EXISTS shard_0")
+        await conn.execute("CREATE TABLE IF NOT EXISTS shard_0.py_test_no_search_path_session_mode (id BIGINT)")
+
+        async with conn.transaction():
+            await conn.execute("SELECT * FROM shard_0.py_test_no_search_path_session_mode LIMIT 1")
+
+@pytest.mark.asyncio
+async def test_unrecognized_aggregate_function_works_on_schema_based_sharding():
+    conn = await async_session_conn("shard_0")
+    await conn.execute("DROP AGGREGATE IF EXISTS pgdog_sum_python(int4)")
+    await conn.execute("CREATE AGGREGATE pgdog_sum_python (int4) (sfunc = int4_sum, stype = bigint)")
+    await conn.execute("DROP TABLE IF EXISTS unrecognized_agg_test_python")
+    await conn.execute("CREATE TABLE unrecognized_agg_test_python (lol int4)")
+
+    async with conn.transaction():
+        await conn.execute("SELECT pgdog_sum_python(lol) FROM unrecognized_agg_test_python")

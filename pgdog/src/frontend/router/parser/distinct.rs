@@ -1,61 +1,55 @@
-use super::Error;
-use pg_query::{
-    protobuf::{self, a_const::Val, AConst, ColumnRef, Integer, SelectStmt},
-    Node, NodeEnum,
-};
+use pg_raw_parse::{Node, nodes};
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum DistinctColumn {
+pub(crate) enum DistinctColumn {
     Name(String),
     Index(usize),
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum DistinctBy {
+pub(crate) enum DistinctBy {
     Row,
     Columns(Vec<DistinctColumn>),
 }
 
 #[derive(Debug, Clone)]
-pub struct Distinct<'a> {
-    stmt: &'a SelectStmt,
+pub(crate) struct Distinct<'a> {
+    stmt: &'a nodes::SelectStmt,
 }
 
 impl<'a> Distinct<'a> {
-    pub fn new(stmt: &'a SelectStmt) -> Self {
+    pub(crate) fn new(stmt: &'a nodes::SelectStmt) -> Self {
         Self { stmt }
     }
 
-    pub fn distinct(&self) -> Result<Option<DistinctBy>, Error> {
-        match self.stmt.distinct_clause.first() {
-            Some(Node { node: None }) => return Ok(Some(DistinctBy::Row)),
-            None => return Ok(None),
+    pub(crate) fn distinct(&self) -> Option<DistinctBy> {
+        match self.stmt.distinct_clause().first() {
+            Some(Node::None) => return Some(DistinctBy::Row),
+            None => return None,
             _ => (),
         }
 
-        let mut columns = vec![];
+        let columns = self
+            .stmt
+            .distinct_clause()
+            .iter()
+            .filter_map(|node| match node {
+                Node::A_Const(c) => Some(DistinctColumn::Index(
+                    c.val()?.numeric_value::<i32>()? as usize - 1,
+                )),
+                // org_id -> [*org_id*]
+                // t.org_id -> [t, *org_id*]
+                // public.t.org_id -> [public, t, *org_id*]
+                Node::ColumnRef(c) => Some(DistinctColumn::Name(
+                    c.fields().into_iter().next_back()?.as_str()?.to_owned(),
+                )),
+                // FIXME: We should return an error to the client name if they
+                // sent a form we don't support and the query is routed
+                // cross-shard
+                _ => None,
+            })
+            .collect();
 
-        for node in &self.stmt.distinct_clause {
-            if let Node { node: Some(node) } = node {
-                match node {
-                    NodeEnum::AConst(AConst {
-                        val: Some(Val::Ival(Integer { ival })),
-                        ..
-                    }) => columns.push(DistinctColumn::Index(*ival as usize - 1)),
-                    NodeEnum::ColumnRef(ColumnRef { fields, .. }) => {
-                        if let Some(Node {
-                            node: Some(NodeEnum::String(protobuf::String { sval })),
-                        }) = fields.first()
-                        {
-                            columns.push(DistinctColumn::Name(sval.to_string()));
-                        }
-                    }
-
-                    _ => (),
-                }
-            }
-        }
-
-        Ok(Some(DistinctBy::Columns(columns)))
+        Some(DistinctBy::Columns(columns))
     }
 }

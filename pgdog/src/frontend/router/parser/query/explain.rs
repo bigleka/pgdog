@@ -1,14 +1,13 @@
 use super::*;
+use pg_raw_parse::nodes;
 
 impl QueryParser {
     pub(super) fn explain(
         &mut self,
-        cached_ast: &Ast,
-        stmt: &ExplainStmt,
+        stmt: &nodes::ExplainStmt,
         context: &mut QueryParserContext,
     ) -> Result<Command, Error> {
-        let query = stmt.query.as_ref().ok_or(Error::EmptyQuery)?;
-        let node = query.node.as_ref().ok_or(Error::EmptyQuery)?;
+        let query = stmt.query();
 
         if context.expanded_explain() {
             if self.explain_recorder.is_none() {
@@ -18,11 +17,11 @@ impl QueryParser {
             self.explain_recorder = None;
         }
 
-        let result = match node {
-            NodeEnum::SelectStmt(ref stmt) => self.select(cached_ast, stmt, context),
-            NodeEnum::InsertStmt(ref stmt) => self.insert(stmt, context),
-            NodeEnum::UpdateStmt(ref stmt) => self.update(stmt, context),
-            NodeEnum::DeleteStmt(ref stmt) => self.delete(stmt, context),
+        let result = match query {
+            Node::SelectStmt(stmt) => self.select(stmt, context),
+            Node::InsertStmt(stmt) => self.insert(stmt.into(), context),
+            Node::UpdateStmt(stmt) => self.update(stmt.into(), context),
+            Node::DeleteStmt(stmt) => self.delete(stmt.into(), context),
 
             _ => {
                 // For other statement types, route to all shards
@@ -51,13 +50,11 @@ mod tests {
 
     use crate::backend::Cluster;
     use crate::config::{self, config};
-    use crate::frontend::client::Sticky;
+    use crate::frontend::client::{QueryTimestamps, Sticky};
     use crate::frontend::router::parser::{AstContext, Cache};
     use crate::frontend::{BufferedQuery, ClientRequest, PreparedStatements, RouterContext};
-    use crate::net::{
-        messages::{Bind, Parameter, Parse, Query},
-        Parameters,
-    };
+    use crate::net::messages::{Bind, Parse, Query, bind::Parameter};
+    use crate::parameters::ParameterStore;
     use bytes::Bytes;
     use std::sync::Once;
 
@@ -75,13 +72,15 @@ mod tests {
         enable_expanded_explain();
         let cluster = Cluster::new_test(&config());
         let mut stmts = PreparedStatements::default();
-        let params = Parameters::default();
-        let ast_ctx = AstContext::from_cluster(&cluster, &params);
+        let params = ParameterStore::default();
+        let ast_ctx = AstContext::from_cluster(&cluster, &params, QueryTimestamps::default());
 
         let buffered = BufferedQuery::Query(Query::new(sql));
         let ast = Cache::get().query(&buffered, &ast_ctx, &mut stmts).unwrap();
         let mut buffer = ClientRequest::from(vec![Query::new(sql).into()]);
-        buffer.ast = Some(ast);
+        buffer.ast = Some(ast.ast);
+        buffer.cached = ast.cached;
+        buffer.routing_comment = Some(ast.comment);
 
         let ctx = RouterContext::new(&buffer, &cluster, &params, None, Sticky::new()).unwrap();
 
@@ -107,13 +106,15 @@ mod tests {
 
         let cluster = Cluster::new_test(&config());
         let mut stmts = PreparedStatements::default();
-        let params = Parameters::default();
-        let ast_ctx = AstContext::from_cluster(&cluster, &params);
+        let params = ParameterStore::default();
+        let ast_ctx = AstContext::from_cluster(&cluster, &params, QueryTimestamps::default());
 
         let buffered = BufferedQuery::Prepared(Parse::new_anonymous(sql));
         let ast = Cache::get().query(&buffered, &ast_ctx, &mut stmts).unwrap();
         let mut buffer: ClientRequest = vec![parse_msg.into(), bind.into()].into();
-        buffer.ast = Some(ast);
+        buffer.ast = Some(ast.ast);
+        buffer.cached = ast.cached;
+        buffer.routing_comment = Some(ast.comment);
 
         let ctx = RouterContext::new(&buffer, &cluster, &params, None, Sticky::new()).unwrap();
 
@@ -144,9 +145,11 @@ mod tests {
         assert!(matches!(r.shard(), Shard::Direct(_)));
         assert!(r.is_read());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("matched sharding key")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("matched sharding key"))
+        );
 
         let r = route_parameterized("EXPLAIN SELECT * FROM sharded WHERE id = $1", &[b"11"]);
         assert!(matches!(r.shard(), Shard::Direct(_)));
@@ -173,9 +176,11 @@ mod tests {
         assert!(matches!(r.shard(), Shard::Direct(_)));
         assert!(r.is_write());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("INSERT matched sharding key")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("INSERT matched sharding key"))
+        );
     }
 
     #[test]
@@ -187,17 +192,21 @@ mod tests {
         assert!(matches!(r.shard(), Shard::Direct(_)));
         assert!(r.is_write());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("UPDATE matched WHERE clause")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("UPDATE matched WHERE clause"))
+        );
 
         let r = route("EXPLAIN UPDATE sharded SET active = true");
         assert_eq!(r.shard(), &Shard::All);
         assert!(r.is_write());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("UPDATE fell back to broadcast")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("UPDATE fell back to broadcast"))
+        );
     }
 
     #[test]
@@ -206,17 +215,21 @@ mod tests {
         assert!(matches!(r.shard(), Shard::Direct(_)));
         assert!(r.is_write());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("DELETE matched WHERE clause")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("DELETE matched WHERE clause"))
+        );
 
         let r = route("EXPLAIN DELETE FROM sharded");
         assert_eq!(r.shard(), &Shard::All);
         assert!(r.is_write());
         let lines = r.explain().unwrap().render_lines();
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("DELETE fell back to broadcast")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("DELETE fell back to broadcast"))
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::backend::databases::databases;
 
 use super::prelude::*;
 
-pub struct ShowMirrors;
+pub(crate) struct ShowMirrors;
 
 #[async_trait]
 impl Command for ShowMirrors {
@@ -28,14 +28,14 @@ impl Command for ShowMirrors {
             Field::numeric("queue_length"),
         ];
 
-        let mut messages = vec![RowDescription::new(&fields).message()?];
+        let mut messages = vec![RowDescription::new(&fields).message()];
 
         // Iterate through all clusters and create a row for each
         for (user, cluster) in databases().all() {
             let counts = {
                 let stats = cluster.stats();
                 let stats = stats.lock();
-                stats.counts
+                stats.mirror
             };
 
             // Create a data row for this cluster
@@ -48,7 +48,7 @@ impl Command for ShowMirrors {
                 .add(counts.error_count as i64)
                 .add(counts.queue_length as i64);
 
-            messages.push(dr.message()?);
+            messages.push(dr.message());
         }
 
         Ok(messages)
@@ -85,7 +85,7 @@ mod tests {
         );
 
         // Parse the RowDescription to check column names
-        let row_desc = RowDescription::from_bytes(messages[0].to_bytes().unwrap()).unwrap();
+        let row_desc = RowDescription::from_bytes(messages[0].to_bytes()).unwrap();
         let fields = &row_desc.fields;
 
         // Should have 7 columns for per-cluster stats
@@ -119,7 +119,7 @@ mod tests {
         // If we have data rows, validate their format
         if !data_rows.is_empty() {
             // Parse the first data row to ensure it has valid format
-            let data_row = DataRow::from_bytes(data_rows[0].to_bytes().unwrap()).unwrap();
+            let data_row = DataRow::from_bytes(data_rows[0].to_bytes()).unwrap();
 
             // Skip validating database and user strings for now since DataRow doesn't have get_string
             // Just validate the counter values are integers (>= 0)

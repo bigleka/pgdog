@@ -3,8 +3,11 @@ use std::{
     time::Duration,
 };
 
-use pgdog_config::{PoolerMode, pooling::ConnectionRecovery};
+use pgdog_config::PoolerMode;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub use pgdog_config::pool::{PoolConfig, RoleSpecificConfig};
 
 use crate::{LsnStats, ReplicaLag};
 
@@ -12,7 +15,7 @@ use crate::{LsnStats, ReplicaLag};
 ///
 /// These are updated after each connection check-in.
 ///
-#[derive(Debug, Clone, Default, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct Counts {
     /// Number of committed transactions.
     pub xact_count: usize,
@@ -41,6 +44,8 @@ pub struct Counts {
     pub bind_count: usize,
     /// Number of times the pool had to rollback unfinished transactions.
     pub rollbacks: usize,
+    /// Server connections terminated by Postgres with SQLSTATE `25P03`.
+    pub idle_xact_timeouts: usize,
     /// Number of times the pool sent the health check query.
     pub healthchecks: usize,
     /// Total count of Close messages sent to server connections.
@@ -60,6 +65,26 @@ pub struct Counts {
     pub reads: usize,
     /// Number of write transactions.
     pub writes: usize,
+    /// Password attempts.
+    pub auth_attempts: usize,
+    /// Rows reported affected by INSERT command tags.
+    pub rows_inserted: usize,
+    /// Rows reported affected by UPDATE command tags.
+    pub rows_updated: usize,
+    /// Rows reported affected by DELETE command tags.
+    pub rows_deleted: usize,
+    /// Rows reported by COPY command tags.
+    pub rows_copied: usize,
+    /// Tables created by successfully executed parsed statements.
+    pub tables_created: usize,
+    /// Tables dropped by successfully executed parsed statements.
+    pub tables_dropped: usize,
+    /// Successfully executed DDL commands identified by the query parser.
+    pub ddl_commands: usize,
+    /// Successfully executed DML commands identified by the query parser.
+    pub dml_commands: usize,
+    /// Checkout timeouts.
+    pub checkout_timeouts: usize,
 }
 
 impl Sub for Counts {
@@ -82,6 +107,9 @@ impl Sub for Counts {
             parse_count: self.parse_count.saturating_sub(rhs.parse_count),
             bind_count: self.bind_count.saturating_sub(rhs.bind_count),
             rollbacks: self.rollbacks.saturating_sub(rhs.rollbacks),
+            idle_xact_timeouts: self
+                .idle_xact_timeouts
+                .saturating_sub(rhs.idle_xact_timeouts),
             healthchecks: self.healthchecks.saturating_sub(rhs.healthchecks),
             close: self.close.saturating_sub(rhs.close),
             errors: self.errors.saturating_sub(rhs.errors),
@@ -91,6 +119,16 @@ impl Sub for Counts {
             connect_count: self.connect_count.saturating_sub(rhs.connect_count),
             reads: self.reads.saturating_sub(rhs.reads),
             writes: self.writes.saturating_sub(rhs.writes),
+            auth_attempts: self.auth_attempts.saturating_sub(rhs.auth_attempts),
+            rows_inserted: self.rows_inserted.saturating_sub(rhs.rows_inserted),
+            rows_updated: self.rows_updated.saturating_sub(rhs.rows_updated),
+            rows_deleted: self.rows_deleted.saturating_sub(rhs.rows_deleted),
+            rows_copied: self.rows_copied.saturating_sub(rhs.rows_copied),
+            tables_created: self.tables_created.saturating_sub(rhs.tables_created),
+            tables_dropped: self.tables_dropped.saturating_sub(rhs.tables_dropped),
+            ddl_commands: self.ddl_commands.saturating_sub(rhs.ddl_commands),
+            dml_commands: self.dml_commands.saturating_sub(rhs.dml_commands),
+            checkout_timeouts: self.checkout_timeouts.saturating_sub(rhs.checkout_timeouts),
         }
     }
 }
@@ -115,6 +153,9 @@ impl Add for Counts {
             parse_count: self.parse_count.saturating_add(rhs.parse_count),
             bind_count: self.bind_count.saturating_add(rhs.bind_count),
             rollbacks: self.rollbacks.saturating_add(rhs.rollbacks),
+            idle_xact_timeouts: self
+                .idle_xact_timeouts
+                .saturating_add(rhs.idle_xact_timeouts),
             healthchecks: self.healthchecks.saturating_add(rhs.healthchecks),
             close: self.close.saturating_add(rhs.close),
             errors: self.errors.saturating_add(rhs.errors),
@@ -124,6 +165,16 @@ impl Add for Counts {
             connect_time: self.connect_time.saturating_add(rhs.connect_time),
             reads: self.reads.saturating_add(rhs.reads),
             writes: self.writes.saturating_add(rhs.writes),
+            auth_attempts: self.auth_attempts.saturating_add(rhs.auth_attempts),
+            rows_inserted: self.rows_inserted.saturating_add(rhs.rows_inserted),
+            rows_updated: self.rows_updated.saturating_add(rhs.rows_updated),
+            rows_deleted: self.rows_deleted.saturating_add(rhs.rows_deleted),
+            rows_copied: self.rows_copied.saturating_add(rhs.rows_copied),
+            tables_created: self.tables_created.saturating_add(rhs.tables_created),
+            tables_dropped: self.tables_dropped.saturating_add(rhs.tables_dropped),
+            ddl_commands: self.ddl_commands.saturating_add(rhs.ddl_commands),
+            dml_commands: self.dml_commands.saturating_add(rhs.dml_commands),
+            checkout_timeouts: self.checkout_timeouts.saturating_add(rhs.checkout_timeouts),
         }
     }
 }
@@ -149,6 +200,7 @@ impl Div<usize> for Counts {
             parse_count: self.parse_count.checked_div(rhs).unwrap_or(0),
             bind_count: self.bind_count.checked_div(rhs).unwrap_or(0),
             rollbacks: self.rollbacks.checked_div(rhs).unwrap_or(0),
+            idle_xact_timeouts: self.idle_xact_timeouts.checked_div(rhs).unwrap_or(0),
             healthchecks: self.healthchecks.checked_div(rhs).unwrap_or(0),
             close: self.close.checked_div(rhs).unwrap_or(0),
             errors: self.errors.checked_div(rhs).unwrap_or(0),
@@ -161,11 +213,21 @@ impl Div<usize> for Counts {
             connect_count: self.connect_count.checked_div(rhs).unwrap_or(0),
             reads: self.reads.checked_div(rhs).unwrap_or(0),
             writes: self.writes.checked_div(rhs).unwrap_or(0),
+            auth_attempts: self.auth_attempts.checked_div(rhs).unwrap_or(0),
+            rows_inserted: self.rows_inserted.checked_div(rhs).unwrap_or(0),
+            rows_updated: self.rows_updated.checked_div(rhs).unwrap_or(0),
+            rows_deleted: self.rows_deleted.checked_div(rhs).unwrap_or(0),
+            rows_copied: self.rows_copied.checked_div(rhs).unwrap_or(0),
+            tables_created: self.tables_created.checked_div(rhs).unwrap_or(0),
+            tables_dropped: self.tables_dropped.checked_div(rhs).unwrap_or(0),
+            ddl_commands: self.ddl_commands.checked_div(rhs).unwrap_or(0),
+            dml_commands: self.dml_commands.checked_div(rhs).unwrap_or(0),
+            checkout_timeouts: self.checkout_timeouts.checked_div(rhs).unwrap_or(0),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct Stats {
     // Total counts.
     pub counts: Counts,
@@ -223,7 +285,7 @@ impl Stats {
 
 /// Real-time state of each connection pool.
 /// Pool state.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, JsonSchema)]
 pub struct State {
     /// Number of connections checked out.
     pub checked_out: usize,
@@ -237,7 +299,7 @@ pub struct State {
     pub empty: bool,
     /// Pool configuration.
     #[serde(skip)]
-    pub config: Config,
+    pub config: PoolConfig,
     /// The pool is paused.
     pub paused: bool,
     /// Number of clients waiting for a connection.
@@ -248,6 +310,8 @@ pub struct State {
     pub out_of_sync: usize,
     /// Re-synced servers.
     pub re_synced: usize,
+    /// Locked
+    pub locked: usize,
     /// Statistics
     pub stats: Stats,
     /// Max wait.
@@ -262,110 +326,42 @@ pub struct State {
     pub lsn_stats: LsnStats,
 }
 
-/// Pool configuration.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub struct Config {
-    /// Minimum connections that should be in the pool.
-    pub min: usize,
-    /// Maximum connections allowed in the pool.
-    pub max: usize,
-    /// How long to wait for a connection before giving up.
-    pub checkout_timeout: Duration, // ms
-    /// Interval duration of DNS cache refresh.
-    pub dns_ttl: Duration, // ms
-    /// Close connections that have been idle for longer than this.
-    pub idle_timeout: Duration, // ms
-    /// How long to wait for connections to be created.
-    pub connect_timeout: Duration, // ms
-    /// How many times to attempt a connection before returning an error.
-    pub connect_attempts: u64,
-    /// How long to wait between connection attempts.
-    pub connect_attempt_delay: Duration,
-    /// How long a connection can be open.
-    pub max_age: Duration,
-    /// Can this pool be banned from serving traffic?
-    pub bannable: bool,
-    /// Healtheck timeout.
-    pub healthcheck_timeout: Duration, // ms
-    /// Healtcheck interval.
-    pub healthcheck_interval: Duration, // ms
-    /// Idle healthcheck interval.
-    pub idle_healthcheck_interval: Duration, // ms
-    /// Idle healthcheck delay.
-    pub idle_healthcheck_delay: Duration, // ms
-    /// Read timeout (dangerous).
-    pub read_timeout: Duration, // ms
-    /// Write timeout (dangerous).
-    pub write_timeout: Duration, // ms
-    /// Query timeout (dangerous).
-    pub query_timeout: Duration, // ms
-    /// Max ban duration.
-    pub ban_timeout: Duration, // ms
-    /// Rollback timeout for dirty connections.
-    pub rollback_timeout: Duration,
-    /// Statement timeout
-    pub statement_timeout: Option<Duration>,
-    /// Replication mode.
-    pub replication_mode: bool,
-    /// Pooler mode.
-    pub pooler_mode: PoolerMode,
-    /// Read only mode.
-    pub read_only: bool,
-    /// Maximum prepared statements per connection.
-    pub prepared_statements_limit: usize,
-    /// Stats averaging period.
-    pub stats_period: Duration,
-    /// Recovery algo.
-    pub connection_recovery: ConnectionRecovery,
-    /// LSN check interval.
-    pub lsn_check_interval: Duration,
-    /// LSN check timeout.
-    pub lsn_check_timeout: Duration,
-    /// LSN check delay.
-    pub lsn_check_delay: Duration,
-    /// Automatic role detection enabled.
-    pub role_detection: bool,
-    /// Used for resharding only.
-    pub resharding_only: bool,
-    /// LB weight.
-    pub lb_weight: u8,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            min: 1,
-            max: 10,
-            checkout_timeout: Duration::from_millis(5_000),
-            idle_timeout: Duration::from_millis(60_000),
-            connect_timeout: Duration::from_millis(5_000),
-            connect_attempts: 1,
-            connect_attempt_delay: Duration::from_millis(10),
-            max_age: Duration::from_millis(24 * 3600 * 1000),
-            bannable: true,
-            healthcheck_timeout: Duration::from_millis(5_000),
-            healthcheck_interval: Duration::from_millis(30_000),
-            idle_healthcheck_interval: Duration::from_millis(5_000),
-            idle_healthcheck_delay: Duration::from_millis(5_000),
-            read_timeout: Duration::MAX,
-            write_timeout: Duration::MAX,
-            query_timeout: Duration::MAX,
-            ban_timeout: Duration::from_secs(300),
-            rollback_timeout: Duration::from_secs(5),
-            statement_timeout: None,
-            replication_mode: false,
-            pooler_mode: PoolerMode::default(),
-            read_only: false,
-            prepared_statements_limit: usize::MAX,
-            stats_period: Duration::from_millis(15_000),
-            dns_ttl: Duration::from_millis(60_000),
-            connection_recovery: ConnectionRecovery::Recover,
-            lsn_check_interval: Duration::from_millis(5_000),
-            lsn_check_timeout: Duration::from_millis(5_000),
-            lsn_check_delay: Duration::from_millis(5_000),
-            role_detection: false,
-            resharding_only: false,
-            lb_weight: 255,
+    fn statement_counts(value: usize) -> Counts {
+        Counts {
+            rows_copied: value,
+            tables_created: value,
+            tables_dropped: value,
+            ddl_commands: value,
+            dml_commands: value,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn statement_metrics_support_count_arithmetic() {
+        let sum = statement_counts(4) + statement_counts(2);
+        assert_eq!(sum.rows_copied, 6);
+        assert_eq!(sum.tables_created, 6);
+        assert_eq!(sum.tables_dropped, 6);
+        assert_eq!(sum.ddl_commands, 6);
+        assert_eq!(sum.dml_commands, 6);
+
+        let difference = statement_counts(4) - statement_counts(2);
+        assert_eq!(difference.rows_copied, 2);
+        assert_eq!(difference.tables_created, 2);
+        assert_eq!(difference.tables_dropped, 2);
+        assert_eq!(difference.ddl_commands, 2);
+        assert_eq!(difference.dml_commands, 2);
+
+        let average = statement_counts(4) / 2;
+        assert_eq!(average.rows_copied, 2);
+        assert_eq!(average.tables_created, 2);
+        assert_eq!(average.tables_dropped, 2);
+        assert_eq!(average.ddl_commands, 2);
+        assert_eq!(average.dml_commands, 2);
     }
 }

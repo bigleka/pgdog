@@ -1,50 +1,189 @@
 use crate::{
     config::config,
     frontend::{
-        router::parser::{
-            route::{OverrideReason, ShardSource},
-            Shard,
-        },
         Command,
+        router::parser::{
+            Shard,
+            route::{OverrideReason, ShardSource},
+        },
     },
     net::parameter::ParameterValue,
 };
 
+use super::Error;
 use super::setup::*;
+
+#[test]
+fn test_set_local_default_preserves_local() {
+    let mut test = QueryParserTest::new();
+    for sql in [
+        "SET LOCAL statement_timeout TO DEFAULT",
+        "SET LOCAL statement_timeout = DEFAULT; RESET lock_timeout",
+    ] {
+        let command = test.execute(vec![Query::new(sql).into()]);
+        let Command::Set { params, .. } = command else {
+            panic!("expected Command::Set, got {command:?}");
+        };
+        assert_eq!(params[0].name, "statement_timeout");
+        assert_eq!(params[0].value, None);
+        assert!(params[0].local);
+        if let Some(reset) = params.get(1) {
+            assert!(!reset.local);
+        }
+    }
+}
+
+#[test]
+fn test_set_default_and_reset_remain_session_scoped() {
+    let mut test = QueryParserTest::new();
+    for sql in [
+        "SET statement_timeout TO DEFAULT",
+        "SET SESSION statement_timeout = DEFAULT",
+        "RESET statement_timeout",
+    ] {
+        let command = test.execute(vec![Query::new(sql).into()]);
+        let Command::Set { params, .. } = command else {
+            panic!("expected Command::Set, got {command:?}");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "statement_timeout");
+        assert_eq!(params[0].value, None);
+        assert!(!params[0].local);
+    }
+}
+
+#[test]
+fn test_npgsql_reset_is_split() {
+    for mut test in [
+        QueryParserTest::new(),
+        QueryParserTest::new_single_shard(&config()),
+    ] {
+        let command = test.execute(vec![Query::new(
+            "SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;SELECT pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP",
+        ).into()]);
+
+        let Command::Split(queries) = command else {
+            panic!("expected Npgsql reset batch to split, got {command:?}");
+        };
+        assert_eq!(
+            queries,
+            [
+                "SET session_authorization TO DEFAULT",
+                "RESET ALL",
+                "CLOSE ALL",
+                "UNLISTEN *",
+                "SELECT pg_advisory_unlock_all()",
+                "DISCARD SEQUENCES",
+                "DISCARD TEMP",
+            ],
+        );
+    }
+}
+
+#[test]
+fn test_mixed_set_passthrough_in_session_mode() {
+    let mut test = QueryParserTest::new_session_mode(&config());
+
+    // In session mode, mixed SET + non-SET multi-statement queries must not be rejected.
+    // This is the exact batch psqlODBC sends during connection startup (issue #1087).
+    let command = test.execute(vec![
+        Query::new("SET DateStyle='ISO';SET extra_float_digits = 2;show transaction_isolation")
+            .into(),
+    ]);
+    assert!(
+        matches!(command, Command::Query(_)),
+        "expected Command::Query passthrough in session mode, got {command:#?}",
+    );
+}
+
+#[test]
+fn test_mixed_set_split_in_transaction_mode() {
+    let mut test = QueryParserTest::new();
+
+    let command = test.execute(vec![
+        Query::new("SET DateStyle='ISO'; show transaction_isolation").into(),
+    ]);
+    assert!(matches!(command, Command::Split(queries) if queries.len() == 2));
+}
+
+#[test]
+fn test_mixed_set_multiple_queries_error() {
+    let mut test = QueryParserTest::new();
+
+    let result = test
+        .try_execute(vec![
+            Query::new("SET application_name TO 'test'; SELECT 1; SELECT 2;").into(),
+        ])
+        .unwrap_err();
+
+    assert!(matches!(result, Error::MultiStatementSafety));
+}
+
+#[test]
+fn test_mixed_set_reset_query_works() {
+    let mut test = QueryParserTest::new();
+
+    let command = test
+        .execute(vec![
+            Query::new("SET application_name TO 'test'; SELECT 1; RESET application_name; SHOW application_name;").into(),
+        ]);
+
+    assert!(matches!(command, Command::Split(queries) if queries.len() == 4));
+}
 
 #[test]
 fn test_set_comment() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "/* pgdog_sharding_key: 1234 */ SET statement_timeout TO 1",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("/* pgdog_sharding_key: 1234 */ SET statement_timeout TO 1").into(),
+    ]);
 
     assert!(
-        matches!(command.clone(), Command::Set { ref params, ref route } if params.len() == 1 && params[0].name == "statement_timeout" && !params[0].local && params[0].value == ParameterValue::String("1".into()) && route.shard().is_direct()),
+        matches!(command.clone(), Command::Set { ref params, ref route, ..} if params.len() == 1 && params[0].name == "statement_timeout" && !params[0].local && params[0].value == Some(ParameterValue::String("1".into())) && route.shard().is_direct()),
         "expected Command::Set, got {:#?}",
         command,
     );
 }
 
 #[test]
+fn test_set_config_null_value() {
+    let mut test = QueryParserTest::new();
+
+    let command = test.execute(vec![
+        Query::new("SELECT set_config('lock_timeout', NULL, false)").into(),
+    ]);
+
+    match command {
+        Command::Set {
+            params, set_config, ..
+        } => {
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].name, "lock_timeout");
+            assert_eq!(params[0].value, None);
+            assert!(!params[0].local);
+            assert!(set_config);
+        }
+        _ => panic!("expected Command::Set, got {command:#?}"),
+    }
+}
+
+#[test]
 fn test_set_multi_statement() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "SET statement_timeout TO 1; SET work_mem TO '64MB'",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("SET statement_timeout TO 1; SET work_mem TO '64MB'").into(),
+    ]);
 
     match command {
         Command::Set { ref params, .. } => {
             assert_eq!(params.len(), 2);
             assert_eq!(params[0].name, "statement_timeout");
-            assert_eq!(params[0].value, ParameterValue::String("1".into()));
+            assert_eq!(params[0].value, Some(ParameterValue::String("1".into())));
             assert!(!params[0].local);
             assert_eq!(params[1].name, "work_mem");
-            assert_eq!(params[1].value, ParameterValue::String("64MB".into()));
+            assert_eq!(params[1].value, Some(ParameterValue::String("64MB".into())));
             assert!(!params[1].local);
         }
         _ => panic!("expected Command::Set, got {command:#?}"),
@@ -55,10 +194,9 @@ fn test_set_multi_statement() {
 fn test_set_multi_statement_mixed_local() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "SET statement_timeout TO 1; SET LOCAL work_mem TO '64MB'",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("SET statement_timeout TO 1; SET LOCAL work_mem TO '64MB'").into(),
+    ]);
 
     match command {
         Command::Set { ref params, .. } => {
@@ -71,18 +209,19 @@ fn test_set_multi_statement_mixed_local() {
 }
 
 #[test]
-fn test_set_multi_statement_mixed_returns_error() {
+fn test_set_multi_statement_mixed_returns_split() {
     let mut test = QueryParserTest::new();
 
-    let result = test.try_execute(vec![
-        Query::new("SET statement_timeout TO 1; SELECT 1").into()
+    let command = test.execute(vec![
+        Query::new("SET statement_timeout TO 1; SELECT 1").into(),
     ]);
-    assert!(result.is_err());
+
+    assert!(matches!(command, Command::Split(queries) if queries.len() == 2));
 }
 
 #[test]
 fn test_multi_statement_no_set_falls_through() {
-    let mut test = QueryParserTest::new();
+    let mut test = QueryParserTest::new_single_shard(&config());
 
     let command = test.execute(vec![Query::new("SELECT 1; SELECT 2").into()]);
     assert!(
@@ -92,21 +231,39 @@ fn test_multi_statement_no_set_falls_through() {
 }
 
 #[test]
+fn test_multi_statement_no_set_cross_shard_requires_transaction() {
+    let mut test = QueryParserTest::new();
+
+    let result = test
+        .try_execute(vec![Query::new("SELECT 1; SELECT 2").into()])
+        .unwrap_err();
+    assert!(matches!(result, Error::MultiStatementSafety))
+}
+
+#[test]
 fn test_set_multi_statement_with_timezone_interval() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "SET client_min_messages TO warning;SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new(
+            "SET client_min_messages TO warning;SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE",
+        )
+        .into(),
+    ]);
 
     match command {
         Command::Set { ref params, .. } => {
             assert_eq!(params.len(), 2);
             assert_eq!(params[0].name, "client_min_messages");
-            assert_eq!(params[0].value, ParameterValue::String("warning".into()));
+            assert_eq!(
+                params[0].value,
+                Some(ParameterValue::String("warning".into()))
+            );
             assert_eq!(params[1].name, "timezone");
-            assert_eq!(params[1].value, ParameterValue::String("+00:00".into()));
+            assert_eq!(
+                params[1].value,
+                Some(ParameterValue::String("+00:00".into()))
+            );
         }
         _ => panic!("expected Command::Set, got {command:#?}"),
     }
@@ -152,7 +309,7 @@ fn test_reset() {
         Command::Set { params, .. } => {
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].name, "statement_timeout");
-            assert!(params[0].reset);
+            assert_eq!(params[0].value, None);
         }
         _ => panic!("expected Command::Set, got {command:#?}"),
     }
@@ -167,14 +324,14 @@ fn test_reset() {
 #[test]
 fn test_set_single_primary() {
     let mut test = QueryParserTest::new_single_primary(&config());
-    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()].into());
+    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()]);
     assert!(matches!(command, Command::Set { .. }));
 
     let mut config = (*config()).clone();
     config.config.general.query_parser = pgdog_config::QueryParserLevel::Off;
 
     let mut test = QueryParserTest::new_single_primary(&config);
-    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()].into());
+    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()]);
     match command {
         Command::Query(query) => assert_eq!(
             query.shard_with_priority().source(),
@@ -182,4 +339,15 @@ fn test_set_single_primary() {
         ),
         _ => panic!("expected Query, got {:?}", command),
     };
+}
+
+#[test]
+fn test_single_shard_set() {
+    let mut test = QueryParserTest::new_single_shard(&config());
+    let command = test.execute(vec![Query::new("SET lock_timeout TO '1s'").into()]);
+
+    match command {
+        Command::Set { route, .. } => assert!(!route.is_cross_shard()),
+        _ => panic!("not a set"),
+    }
 }

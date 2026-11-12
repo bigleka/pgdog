@@ -3,49 +3,50 @@
 use std::time::Duration;
 
 use pgdog_config::MirroringLevel;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use tokio::select;
-use tokio::time::{sleep, Instant};
-use tokio::{spawn, sync::mpsc::*};
+use tokio::sync::mpsc::*;
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::backend::Cluster;
-use crate::config::{config, ConfigAndUsers};
+use crate::config::{ConfigAndUsers, config};
 use crate::frontend::client::query_engine::{QueryEngine, QueryEngineContext};
 use crate::frontend::client::timeouts::Timeouts;
-use crate::frontend::client::TransactionType;
+use crate::frontend::client::transaction_type::Transaction;
 use crate::frontend::{ClientComms, PreparedStatements};
-use crate::net::{BackendKeyData, Parameter, Parameters, Stream};
+use crate::net::{FrontendPid, Parameter, Parameters, Stream};
+use crate::parameters::ParameterStore;
+use crate::tasks;
 
 use super::Error;
+use crate::util::safe_sleep;
 
-pub mod buffer_with_delay;
-pub mod handler;
-pub mod request;
+pub(crate) mod buffer_with_delay;
+pub(crate) mod handler;
+pub(crate) mod request;
 
-pub use buffer_with_delay::*;
-pub use handler::*;
-pub use request::*;
+pub(crate) use buffer_with_delay::*;
+pub(crate) use handler::*;
+pub(crate) use request::*;
 
 /// Mirror handler. One is created for each client connected
 /// to PgDog.
 #[derive(Debug)]
-pub struct Mirror {
+pub(crate) struct Mirror {
     /// Random identifier for this mirror connection.
-    pub id: BackendKeyData,
+    pub(crate) id: FrontendPid,
     /// Mirror's prepared statements. Should be similar
     /// to client's statements, if exposure is high.
-    pub prepared_statements: PreparedStatements,
+    pub(crate) prepared_statements: PreparedStatements,
     /// Mirror connection parameters.
-    pub params: Parameters,
+    pub(crate) params: ParameterStore,
     /// Timeouts.
-    pub timeouts: Timeouts,
+    pub(crate) timeouts: Timeouts,
     /// Stream that absorbs all data.
-    pub stream: Stream,
+    pub(crate) stream: Stream,
     /// Transaction state.
-    pub transaction: Option<TransactionType>,
-    /// Cross-shard queries.
-    pub cross_shard_disabled: bool,
+    pub(crate) transaction: Option<Transaction>,
 }
 
 impl Mirror {
@@ -54,13 +55,12 @@ impl Mirror {
         prepared_statements.set_level(config.prepared_statements());
 
         Self {
-            id: BackendKeyData::new(),
+            id: FrontendPid::new(),
             prepared_statements,
-            params: params.clone(),
+            params: ParameterStore::new(params.clone()),
             timeouts: Timeouts::from_config(&config.config.general),
             stream: Stream::dev_null(),
             transaction: None,
-            cross_shard_disabled: config.config.general.cross_shard_disabled,
         }
     }
 
@@ -76,7 +76,7 @@ impl Mirror {
     ///
     /// Handler for sending queries to the background task.
     ///
-    pub fn spawn(
+    pub(crate) fn spawn(
         _source_db: &str,
         cluster: &Cluster,
         mirror_config: Option<&crate::config::MirrorConfig>,
@@ -93,12 +93,12 @@ impl Mirror {
             },
         ]);
 
-        // Same query engine as the client, except with a potentially different database config.
-        let mut query_engine =
-            QueryEngine::new(&params, &ClientComms::new(&BackendKeyData::new()), false)?;
-
         // Mirror traffic handler.
         let mut mirror = Self::new(&params, &config);
+
+        // Same query engine as the client, except with a potentially different database config.
+        // Use mirror.id so pool checkout (Request) and comms keying share one identity.
+        let mut query_engine = QueryEngine::new(&params, &ClientComms::new(mirror.id), false)?;
 
         // Use provided mirror config or fall back to global defaults
         let mirror_config = mirror_config
@@ -114,7 +114,7 @@ impl Mirror {
         let handler = MirrorHandler::new(tx, &mirror_config, cluster.stats());
 
         let stats_for_errors = cluster.stats();
-        spawn(async move {
+        tasks::spawn("mirror", async move {
             loop {
                 select! {
                     req = rx.recv() => {
@@ -122,14 +122,14 @@ impl Mirror {
                             // Decrement queue_length when we receive a message from the channel
                             {
                                 let mut stats = stats_for_errors.lock();
-                                stats.counts.queue_length = stats.counts.queue_length.saturating_sub(1);
+                                stats.mirror.queue_length = stats.mirror.queue_length.saturating_sub(1);
                             }
                             // TODO: timeout these.
                             if let Err(err) = mirror.handle(&mut req, &mut query_engine).await {
                                 error!("mirror error: {}", err);
                                 // Increment error count on mirror handling error
                                 let mut stats = stats_for_errors.lock();
-                                stats.counts.error_count += 1;
+                                stats.mirror.error_count += 1;
                             }
                         } else {
                             debug!("mirror client shutting down");
@@ -144,7 +144,7 @@ impl Mirror {
     }
 
     /// Handle a single mirror request.
-    pub async fn handle(
+    pub(crate) async fn handle(
         &mut self,
         request: &mut MirrorRequest,
         query_engine: &mut QueryEngine,
@@ -153,11 +153,11 @@ impl Mirror {
 
         for req in &mut request.buffer {
             if req.delay > Duration::ZERO {
-                sleep(req.delay).await;
+                safe_sleep(req.delay).await;
             }
 
-            let mut context = QueryEngineContext::new_mirror(self, &mut req.buffer);
-            query_engine.handle(&mut context).await?;
+            let mut context = QueryEngineContext::new_mirror(self);
+            query_engine.handle(&mut context, &mut req.buffer).await?;
             self.transaction = context.transaction();
         }
 
@@ -170,21 +170,22 @@ mod test {
     use pgdog_config::MirrorConfig;
 
     use crate::{
-        backend::pool::Request,
-        config::{self, PoolerMode, PreparedStatements as PreparedStatementsLevel},
+        backend::{Error as BackendError, pool::Request},
+        config::{self, PoolerMode, PreparedStatementsLevel},
         net::{Parameter, Parameters, Query},
+        util::safe_timeout,
     };
 
     use super::*;
 
     #[tokio::test]
     async fn test_mirror_exposure() {
-        use crate::backend::pool::MirrorStats;
+        use crate::backend::pool::ClusterMetrics;
         use parking_lot::Mutex;
         use std::sync::Arc;
 
         let (tx, rx) = channel(25);
-        let stats = Arc::new(Mutex::new(MirrorStats::default()));
+        let stats = Arc::new(Mutex::new(ClusterMetrics::default()));
         let mut handle = MirrorHandler::new(
             tx.clone(),
             &MirrorConfig {
@@ -205,7 +206,7 @@ mod test {
         assert_eq!(rx.len(), 25);
 
         let (tx, rx) = channel(25);
-        let stats2 = Arc::new(Mutex::new(MirrorStats::default()));
+        let stats2 = Arc::new(Mutex::new(ClusterMetrics::default()));
         let mut handle = MirrorHandler::new(
             tx.clone(),
             &MirrorConfig {
@@ -239,6 +240,9 @@ mod test {
         cluster.launch();
         let mut mirror = Mirror::spawn("pgdog", &cluster, None).unwrap();
         let mut conn = cluster.primary(0, &Request::default()).await.unwrap();
+        conn.execute("DROP TABLE IF EXISTS pgdog.test_mirror")
+            .await
+            .expect("clear the mirror fixture");
 
         for _ in 0..3 {
             assert!(
@@ -264,22 +268,26 @@ mod test {
                 3,
                 "mirror buffer should have 3 requests"
             );
-            sleep(Duration::from_millis(50)).await;
+            safe_sleep(Duration::from_millis(50)).await;
             // Nothing happens until we flush.
             assert!(
                 conn.execute("DROP TABLE pgdog.test_mirror").await.is_err(),
                 "table pgdog.test_mirror shouldn't exist yet"
             );
             assert!(mirror.flush(), "mirror didn't flush");
-            // The mirror runs it in the background: give slow runners time.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while conn.execute("DROP TABLE pgdog.test_mirror").await.is_err() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "pgdog.test_mirror should exist"
-                );
-                sleep(Duration::from_millis(20)).await;
-            }
+            safe_timeout(Duration::from_secs(5), async {
+                loop {
+                    match conn.execute("DROP TABLE pgdog.test_mirror").await {
+                        Ok(_) => break,
+                        Err(BackendError::ExecutionError(error)) if error.code == "42P01" => {
+                            safe_sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("checking the mirrored table failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("the flushed mirror request should create pgdog.test_mirror");
             assert!(mirror.buffer().is_empty(), "mirror buffer should be empty");
         }
 
@@ -296,7 +304,7 @@ mod test {
         let initial_stats = {
             let stats_arc = cluster.stats();
             let stats = stats_arc.lock();
-            stats.counts
+            stats.mirror
         };
 
         let mut mirror = Mirror::spawn("pgdog", &cluster, None).unwrap();
@@ -310,13 +318,13 @@ mod test {
         assert!(mirror.flush());
 
         // Wait for async processing
-        sleep(Duration::from_millis(100)).await;
+        safe_sleep(Duration::from_millis(100)).await;
 
         // Verify stats were incremented
         let final_stats = {
             let stats_arc = cluster.stats();
             let stats = stats_arc.lock();
-            stats.counts
+            stats.mirror
         };
 
         assert_eq!(

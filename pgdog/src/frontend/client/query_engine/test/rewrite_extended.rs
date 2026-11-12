@@ -1,5 +1,9 @@
 use super::prelude::*;
-use super::{test_client, test_sharded_client};
+use super::{multi_statement::assert_connection_usable, test_client, test_sharded_client};
+use crate::{
+    expect_message,
+    net::{ErrorResponse, ParseComplete, ReadyForQuery},
+};
 
 async fn run_test(messages: Vec<ProtocolMessage>) -> Vec<ProtocolMessage> {
     let mut results = vec![];
@@ -8,11 +12,13 @@ async fn run_test(messages: Vec<ProtocolMessage>) -> Vec<ProtocolMessage> {
         client.client_request = messages.clone().into();
 
         let mut engine = QueryEngine::from_client(&client).unwrap();
-        let mut context = QueryEngineContext::new(&mut client);
+        let (mut context, client_request) = QueryEngineContext::new(&mut client);
 
-        engine.rewrite_extended(&mut context).unwrap();
+        engine
+            .rewrite_extended(&mut context, &mut client_request.messages)
+            .unwrap();
 
-        results.push(client.client_request.messages.clone());
+        results.push(client_request.messages.clone());
     }
 
     assert_eq!(
@@ -79,4 +85,46 @@ async fn test_rewrite_simple() {
     );
 
     assert_eq!(messages.len(), 1);
+}
+
+#[tokio::test]
+async fn test_reject_other_clients_prepared_statement() {
+    let mut owner = TestClient::new_replicas(Parameters::default()).await;
+    owner.send(Parse::named("owned", "SELECT 1")).await;
+    owner.send(Sync).await;
+    owner
+        .try_process()
+        .await
+        .expect("prepare owner's statement");
+    expect_message!(owner.read().await, ParseComplete);
+    expect_message!(owner.read().await, ReadyForQuery);
+
+    let name = owner
+        .client()
+        .prepared_statements
+        .name("owned")
+        .expect("owner's statement has a global name")
+        .clone();
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    for message in [
+        ProtocolMessage::from(Bind::new_statement(&name)),
+        ProtocolMessage::from(Describe::new_statement(&name)),
+    ] {
+        client.send(message).await;
+        client.send(Sync).await;
+        client.try_process().await.expect("return statement error");
+
+        let error = expect_message!(client.read().await, ErrorResponse);
+        assert_eq!(error.severity, "ERROR");
+        assert_eq!(error.code, "26000");
+        assert_eq!(
+            error.message,
+            format!("prepared statement \"{name}\" does not exist")
+        );
+        expect_message!(client.read().await, ReadyForQuery);
+        assert!(!client.backend_connected());
+
+        assert_connection_usable(&mut client).await;
+    }
 }

@@ -3,22 +3,22 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use tokio::time::sleep;
 use tracing::debug;
 
 use crate::frontend::ClientRequest;
+use crate::net::ProtocolMessage;
+use crate::net::ToBytes;
 use crate::net::messages::command_complete::CommandComplete;
 use crate::net::messages::{ErrorResponse, FromBytes, Protocol, Query, ReadyForQuery};
-use crate::net::ToBytes;
-use crate::net::{BackendKeyData, ProtocolMessage};
 
+use super::Error;
 use super::parser::Parser;
 use super::prelude::Message;
-use super::Error;
+use crate::util::safe_sleep;
 
 /// Admin backend.
 #[derive(Debug)]
-pub struct AdminServer {
+pub(crate) struct AdminServer {
     messages: VecDeque<Message>,
 }
 
@@ -30,14 +30,14 @@ impl Default for AdminServer {
 
 impl AdminServer {
     /// New admin backend handler.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             messages: VecDeque::new(),
         }
     }
 
     /// Handle command.
-    pub async fn send(&mut self, client_request: &ClientRequest) -> Result<(), Error> {
+    pub(crate) async fn send(&mut self, client_request: &ClientRequest) -> Result<(), Error> {
         let message = client_request.messages.first().ok_or(Error::Empty)?;
         let message: ProtocolMessage = message.clone();
 
@@ -46,43 +46,37 @@ impl AdminServer {
             return Err(Error::SimpleOnly);
         }
 
-        let query = Query::from_bytes(message.to_bytes()?)?;
+        let query = Query::from_bytes(message.to_bytes())?;
 
-        let messages = match Parser::parse(&query.query().to_lowercase()) {
+        let messages = match Parser::parse(query.query()) {
             Ok(command) => {
                 let mut messages = command.execute().await?;
-                messages.push(CommandComplete::new(command.name()).message()?);
+                messages.push(CommandComplete::new(command.name()).message());
 
                 messages
             }
             Err(err) => {
-                vec![ErrorResponse::protocol_violation(err.to_string().as_str()).message()?]
+                vec![ErrorResponse::protocol_violation(err.to_string().as_str()).message()]
             }
         };
 
         self.messages.extend(messages);
-        self.messages.push_back(ReadyForQuery::idle().message()?);
-
-        self.messages = std::mem::take(&mut self.messages)
-            .into_iter()
-            .map(|m| m.backend(BackendKeyData::default()))
-            .collect();
+        self.messages.push_back(ReadyForQuery::idle().message());
 
         Ok(())
     }
 
     /// Receive command result.
-    pub async fn read(&mut self) -> Result<Message, Error> {
-        if let Some(message) = self.messages.pop_front() {
-            Ok(message)
-        } else {
-            loop {
-                sleep(Duration::MAX).await;
-            }
+    pub(crate) async fn read(&mut self) -> Result<Message, Error> {
+        match self.messages.pop_front() {
+            Some(message) => Ok(message),
+            _ => loop {
+                safe_sleep(Duration::MAX).await;
+            },
         }
     }
 
-    pub fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.messages.is_empty()
     }
 }

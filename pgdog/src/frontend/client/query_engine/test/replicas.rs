@@ -1,6 +1,7 @@
 use crate::{
     backend::databases::databases,
     config::Role,
+    net::ParseComplete,
     net::{Parameters, ToBytes},
 };
 
@@ -17,7 +18,7 @@ async fn test_round_robin_with_replicas() {
 
     // Write goes to primary.
     let query = Query::new("CREATE TABLE IF NOT EXISTS test_round_robin_replicas (id BIGINT)");
-    len_sent += query.to_bytes().unwrap().len();
+    len_sent += query.to_bytes().len();
     client.send_simple(query).await;
     for msg in client.read_until('Z').await.unwrap() {
         len_recv += msg.len();
@@ -29,10 +30,10 @@ async fn test_round_robin_with_replicas() {
         let bind = Bind::new_statement("test");
         let execute = Execute::new();
         let sync = Sync;
-        len_sent += parse.to_bytes().unwrap().len();
-        len_sent += bind.to_bytes().unwrap().len();
-        len_sent += execute.to_bytes().unwrap().len();
-        len_sent += sync.to_bytes().unwrap().len();
+        len_sent += parse.to_bytes().len();
+        len_sent += bind.to_bytes().len();
+        len_sent += execute.to_bytes().len();
+        len_sent += sync.to_bytes().len();
 
         client.send(parse).await;
         client.send(bind).await;
@@ -69,7 +70,13 @@ async fn test_round_robin_with_replicas() {
                 assert_eq!(state.stats.counts.healthchecks, idle);
                 // Parse count depends on number of idle connections (prepared statement sync).
                 assert!(state.stats.counts.parse_count >= idle);
-                assert!(state.stats.counts.parse_count <= idle + 1);
+                assert_eq!(
+                    state.stats.counts.parse_count,
+                    13, // We are counting simulated messages too
+                    "{} <= {}",
+                    state.stats.counts.parse_count,
+                    idle + 1
+                );
                 pool_recv -= (healthcheck_len_recv * state.stats.counts.healthchecks) as isize;
             }
             Role::Replica => {
@@ -78,7 +85,13 @@ async fn test_round_robin_with_replicas() {
                 assert_eq!(state.stats.counts.bind_count, 13);
                 assert_eq!(state.stats.counts.rollbacks, 0);
                 assert!(state.stats.counts.healthchecks <= idle + 1);
-                assert!(state.stats.counts.parse_count <= idle + 1);
+                assert_eq!(
+                    state.stats.counts.parse_count,
+                    13, // We are counting simulated messages.
+                    "{} <= {}",
+                    state.stats.counts.parse_count,
+                    idle + 1
+                );
                 pool_sent -= (healthcheck_len_sent * state.stats.counts.healthchecks) as isize;
             }
             Role::Auto => unreachable!("role auto"),
@@ -94,6 +107,16 @@ async fn test_round_robin_with_replicas() {
         );
     }
 
-    assert!(pool_sent <= len_sent as isize);
-    assert!(pool_recv <= len_recv as isize);
+    assert!(
+        pool_sent <= len_sent as isize,
+        "{} <= {}",
+        pool_sent,
+        len_sent
+    );
+    assert!(
+        pool_recv <= len_recv as isize + (ParseComplete.to_bytes().len() as isize * 12), // We count simulated length now
+        "{} <= {}",
+        pool_recv,
+        len_recv
+    );
 }

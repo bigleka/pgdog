@@ -1,10 +1,10 @@
-use crate::{frontend::ClientRequest, net::messages::Query as QueryMsg, net::ProtocolMessage};
+use crate::{frontend::ClientRequest, net::ProtocolMessage, net::messages::Query as QueryMsg};
 
 use super::CacheableRequest;
 
 #[test]
 fn cacheable_request_only_simple_select_read_route() {
-    let mut req = ClientRequest::new();
+    let mut req = ClientRequest::default();
     req.messages
         .push(ProtocolMessage::Query(QueryMsg::new("SELECT 1")));
 
@@ -39,18 +39,18 @@ mod redis {
     };
 
     use pgdog_config::{RedisMode, ResultCache};
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     use crate::{
-        config::{set, ConfigAndUsers},
-        frontend::router::parser::OwnedTable,
-        net::Parameters,
+        config::{ConfigAndUsers, set},
+        parameters::ParameterStore,
+        result_cache::tables::OwnedTable,
         result_cache::{
+            CacheableRequest, ResultCacheKey,
             entry::Entry,
             lock::{Lock, Remote},
             redis::RedisResultCache,
             singleflight::Flight,
-            CacheableRequest, ResultCacheKey,
         },
     };
 
@@ -175,7 +175,6 @@ mod redis {
         OwnedTable {
             name: name.into(),
             schema: Some(schema.into()),
-            ..Default::default()
         }
     }
 
@@ -211,7 +210,7 @@ mod redis {
     async fn stored_result_is_served(topology: Topology) {
         let cache = cache(topology).await;
         let req = request(&[table("users")]);
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         let stored = entry(b"fresh");
@@ -234,7 +233,7 @@ mod redis {
         let cache = cache(topology).await;
         let users = table("users");
         let req = request(std::slice::from_ref(&users));
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         // Slow read: cache miss, key computed, query still running...
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
@@ -258,7 +257,7 @@ mod redis {
         let cache = cache(topology).await;
         let tables = [table("users"), table("orders"), table("items")];
         let req = request(&tables);
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         cache
@@ -282,7 +281,7 @@ mod redis {
     async fn invalidation_keeps_entries_of_other_tables(topology: Topology) {
         let cache = cache(topology).await;
         let req = request(&[table("users")]);
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         cache
@@ -317,7 +316,7 @@ mod redis {
     async fn some_key(cache: &RedisResultCache) -> ResultCacheKey {
         let req = request(&[table("users")]);
         cache
-            .build_key("db", "user", &Parameters::default(), &req)
+            .build_key("db", "user", &ParameterStore::default(), &req)
             .await
             .unwrap()
     }
@@ -459,7 +458,7 @@ mod redis {
         let cache = cache(topology).await;
         let users = request(&[table("users")]);
         let orders = request(&[table("orders")]);
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         let key = cache
             .build_key("db", "user", &params, &users)
@@ -492,7 +491,7 @@ mod redis {
     async fn write_invalidates(topology: Topology, read: OwnedTable, written: OwnedTable) -> bool {
         let cache = cache(topology).await;
         let req = request(&[read]);
-        let params = Parameters::default();
+        let params = ParameterStore::default();
 
         let key = cache.build_key("db", "user", &params, &req).await.unwrap();
         cache

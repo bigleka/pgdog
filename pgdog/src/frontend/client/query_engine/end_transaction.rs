@@ -1,39 +1,35 @@
-use crate::net::{BackendKeyData, CommandComplete, NoticeResponse, Protocol, ReadyForQuery};
+use crate::net::NoticeResponse;
 
+use super::fake::{FakeCommand, FakeResponse};
 use super::*;
 
 impl QueryEngine {
     pub(super) async fn end_not_connected(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        client_request: &ClientRequest,
         rollback: bool,
-        extended: bool,
     ) -> Result<(), Error> {
-        let bytes_sent = if extended {
-            self.extended_transaction_reply(context, false, rollback)
-                .await?
-        } else {
-            let cmd = if rollback {
-                CommandComplete::new_rollback()
-            } else {
-                CommandComplete::new_commit()
-            };
-            let mut messages = if !context.in_transaction() {
-                vec![NoticeResponse::from(ErrorResponse::no_transaction()).message()?]
-            } else {
-                vec![]
-            };
-            messages.push(cmd.message()?.backend(BackendKeyData::default()));
-            messages.push(ReadyForQuery::idle().message()?);
+        let executable = client_request.is_executable();
 
-            context.stream.send_many(&messages).await?
-        };
+        let mut command = FakeCommand::new(if rollback { "ROLLBACK" } else { "COMMIT" });
+        if !context.in_transaction() {
+            command = command.with_notice(NoticeResponse::from(ErrorResponse::no_transaction()));
+        }
+        if executable {
+            for status in context.params.transaction_end_status(rollback) {
+                command = command.with_parameter_status(status, None);
+            }
+            self.backend.end_transaction();
+            context.transaction = None; // Clear transaction state
+        }
 
-        self.stats.sent(bytes_sent);
-        self.begin_stmt = None;
-        context.transaction = None; // Clear transaction state
-
-        self.invalidate_pending().await;
+        self.fake_command_response(
+            context,
+            &client_request.messages,
+            &FakeResponse::new([command]),
+        )
+        .await?;
 
         if rollback {
             self.notify_buffer.clear();
@@ -45,16 +41,18 @@ impl QueryEngine {
     pub(super) async fn end_connected(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        // FIXME(sage): Remove mut
+        client_request: &mut ClientRequest,
         rollback: bool,
-        extended: bool,
     ) -> Result<(), Error> {
-        self.backend.transaction_params_hook(rollback);
+        self.backend.transaction_complete(rollback);
         let cluster = self.backend.cluster()?;
 
         // If we experienced an error and client
         // tries to commit transaction anyway,
         // we rollback to prevent cross-shard inconsistencies.
         if context.in_error() && !rollback {
+            self.temp_tables.finish_transaction(true);
             self.backend.execute("ROLLBACK").await?;
 
             // Update stats.
@@ -62,19 +60,23 @@ impl QueryEngine {
             self.stats.transaction(true);
 
             // Disconnect from servers.
-            self.cleanup_backend(context)?;
+            self.cleanup_backend(context).await?;
 
             // Tell client we finished the transaction.
-            self.end_not_connected(context, true, extended).await?;
+            self.end_not_connected(context, client_request, true)
+                .await?;
 
             return Ok(());
         }
 
-        // 2pc is used only for writes and is not needed for rollbacks.
+        // 2pc is used for cross-shard writes and is not needed for rollbacks.
         let two_pc = cluster.two_pc_enabled()
-            && context.client_request.route().is_write()
+            && client_request.route().is_write()
             && !rollback
-            && context.transaction().map(|t| t.write()).unwrap_or(false);
+            && context.transaction().map(|t| t.write()).unwrap_or(false)
+            && self.backend.connected_servers() > 1;
+
+        self.temp_tables.finish_transaction(rollback);
 
         if two_pc {
             self.end_two_pc(false).await?;
@@ -84,16 +86,17 @@ impl QueryEngine {
             self.stats.transaction(true);
 
             // Disconnect from servers.
-            self.cleanup_backend(context)?;
+            self.cleanup_backend(context).await?;
 
             // Tell client we finished the transaction.
-            self.end_not_connected(context, false, extended).await?;
+            self.end_not_connected(context, client_request, false)
+                .await?;
         } else {
             if rollback {
                 self.notify_buffer.clear();
             }
             context.rollback = rollback;
-            self.execute(context).await?;
+            self.execute(context, client_request, None).await?;
         }
 
         Ok(())
@@ -104,26 +107,33 @@ impl QueryEngine {
 
         if rollback {
             self.backend.execute("ROLLBACK").await?;
+            self.backend.end_transaction();
+            self.two_pc.reset();
             return Ok(());
         }
 
         let identifier = cluster.identifier();
-        let name = self.two_pc.transaction().to_string();
+        let transaction = self.two_pc.transaction();
 
         // If interrupted here, the transaction must be rolled back.
         let _guard_phase_1 = self.two_pc.phase_one(&identifier).await?;
-        self.backend.two_pc(&name, TwoPcPhase::Phase1).await?;
+        self.backend
+            .two_pc(transaction, TwoPcPhase::Phase1, false)
+            .await?;
 
         debug!("[2pc] phase 1 complete");
 
         // If interrupted here, the transaction must be committed.
         let _guard_phase_2 = self.two_pc.phase_two(&identifier).await?;
-        self.backend.two_pc(&name, TwoPcPhase::Phase2).await?;
+        self.backend
+            .two_pc(transaction, TwoPcPhase::Phase2, false)
+            .await?;
 
         debug!("[2pc] phase 2 complete");
 
         // Remove transaction from 2pc state manager.
         self.two_pc.done().await?;
+        self.backend.end_transaction();
 
         Ok(())
     }
@@ -133,8 +143,8 @@ impl QueryEngine {
 mod tests {
     use super::*;
     use crate::config::load_test;
-    use crate::frontend::client::TransactionType;
-    use crate::net::Stream;
+    use crate::frontend::client::{Transaction, TransactionType};
+    use crate::net::{Query, Stream};
 
     #[tokio::test]
     async fn test_transaction_state_not_cleared() {
@@ -143,19 +153,28 @@ mod tests {
         // Create a test client with DevNull stream (doesn't require real I/O)
         let mut client =
             crate::frontend::Client::new_test(Stream::dev_null(), Parameters::default());
-        client.transaction = Some(TransactionType::ReadWrite);
+        client.transaction = Some(Transaction::new(TransactionType::ReadWrite));
 
         // Create a default query engine (avoids backend connection)
         let mut engine = QueryEngine::from_client(&client).unwrap();
         // state copied from client
-        let mut context = QueryEngineContext::new(&mut client);
-        let result = engine.end_not_connected(&mut context, false, false).await;
+        let (mut context, client_request) = QueryEngineContext::new(&mut client);
+        client_request.messages.push(Query::new("COMMIT").into());
+
+        let result = engine
+            .end_not_connected(&mut context, client_request, false)
+            .await;
         assert!(result.is_ok(), "end_transaction should succeed");
 
         assert_eq!(
-            context.transaction, None,
-            "Transaction state should be None, but is {:?}",
-            context.transaction
+            context
+                .transaction
+                .map(|transaction| transaction.transaction_type()),
+            None,
+            "transaction state should be cleared, but is {:?}",
+            context
+                .transaction
+                .map(|transaction| transaction.transaction_type())
         );
     }
 }

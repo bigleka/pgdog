@@ -8,11 +8,15 @@
 
 [![CI](https://github.com/levkk/pgdog/actions/workflows/ci.yml/badge.svg)](https://github.com/levkk/pgdog/actions/workflows/ci.yml)
 
-PgDog is a proxy for scaling PostgreSQL. It supports connection pooling, load balancing queries and sharding entire databases. Written in Rust, PgDog is fast, secure and can manage thousands of connections on commodity hardware.
+PgDog is an open source proxy for scaling PostgreSQL. It supports connection pooling, load balancing queries and sharding entire databases. Written in Rust, PgDog is fast, secure and can manage thousands of connections on commodity hardware.
 
 ## Documentation
 
 &#128216; PgDog documentation can be **[found here](https://docs.pgdog.dev/)**. Any questions? Chat with us on **[Discord](https://discord.com/invite/CcBZkjSJdd)**.
+
+##### Enterprise edition
+
+&#127970; Enterprise edition (EE) documentation is available **[here](https://docs.pgdog.dev/enterprise_edition/)**. Changelog is available **[here](CHANGELOG-ENTERPRISE.md)**.
 
 ## Quick start
 
@@ -44,7 +48,7 @@ gets installed, several instances per host and building the packages.
 
 | Tag | |
 |-----|-|
-| `1.1.0`, `1.1`, `latest` | Releases (each version also keeps its own tags, e.g. `1.0.0`). |
+| `2.0.0`, `2.0`, `latest` | Releases (each version also keeps its own tags, e.g. `1.1.0`). |
 | `main` | The latest commit on `main`. |
 | `<short SHA>` | One commit. |
 
@@ -55,7 +59,7 @@ PgDog reads `pgdog.toml` and `users.toml` from its working directory,
 docker run -p 6432:6432 \
     -v ./pgdog.toml:/pgdog/pgdog.toml:ro -v ./users.toml:/pgdog/users.toml:ro \
     -e PGDOG_RESULT_CACHE_ENCRYPTION_KEY \
-    ghcr.io/bigleka/pgdog:1.1
+    ghcr.io/bigleka/pgdog:2.0
 ```
 
 It stops gracefully on `SIGINT`, the image's stop signal: give it up to
@@ -70,7 +74,7 @@ result cache settings, the encryption key from a Secret and an optional
 Valkey. It's published with every release:
 
 ```bash
-helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 1.1.0 -f values.yaml
+helm install pgdog oci://ghcr.io/bigleka/charts/pgdog --version 2.0.0 -f values.yaml
 ```
 
 Upstream's chart (`helm repo add pgdogdev https://helm.pgdog.dev`) deploys
@@ -243,7 +247,6 @@ PgDog also has more advanced connection recovery options, like automatic abandon
 
 PgDog is an application layer (OSI Level 7) load balancer for PostgreSQL. It understands the Postgres protocol, can proxy multiple replicas (and primary) and distributes transactions evenly between databases. The load balancer supports 3 strategies: round robin, random and least active connections.
 
-
 **Example**
 
 The load balancer is enabled automatically when a database has more than one host:
@@ -264,24 +267,19 @@ role = "replica"
 
 &#128216; **[Healthchecks](https://docs.pgdog.dev/features/load-balancer/healthchecks/)**
 
-
 PgDog maintains a real-time list of healthy hosts. When a database fails a health check, it's removed from the active rotation and queries are re-routed to other replicas. This works like an HTTP load balancer, except it's for your database.
 
 Health checks maximize database availability and protect against bad network connections, temporary hardware failures or misconfiguration.
-
 
 #### Single endpoint
 
 &#128216; **[Single endpoint](https://docs.pgdog.dev/features/load-balancer/#single-endpoint)**
 
-
-PgDog uses [`pg_query`](https://github.com/pganalyze/pg_query.rs), which includes the PostgreSQL native parser. By parsing queries, PgDog can detect writes (e.g. `INSERT`, `UPDATE`, `CREATE TABLE`, etc.) and send them to the primary, leaving the replicas to serve reads (`SELECT`). This allows applications to connect to the same PgDog deployment for both reads and writes.
-
+PgDog uses [`pg_raw_parse`](https://github.com/pgdogdev/pg_raw_parse), which includes the PostgreSQL native parser. By parsing queries, PgDog can detect writes (e.g. `INSERT`, `UPDATE`, `CREATE TABLE`, etc.) and send them to the primary, leaving the replicas to serve reads (`SELECT`). This allows applications to connect to the same PgDog deployment for both reads and writes.
 
 ##### Transactions
 
 &#128216; **[Load balancer & transactions](https://docs.pgdog.dev/features/load-balancer/transactions/)**
-
 
 Transactions can execute multiple statements, so in a primary & replica configuration, PgDog routes them to the primary. Clients can indicate a transaction is read-only, in which case PgDog will send it to a replica:
 
@@ -292,14 +290,11 @@ SELECT * FROM users LIMIT 1;
 COMMIT;
 ```
 
-
 #### Failover
 
 &#128216; **[Failover](https://docs.pgdog.dev/features/load-balancer/replication-failover/)**
 
-
 PgDog monitors Postgres replication state and can automatically redirect writes to a different database if a replica is promoted. This doesn't replace tools like Patroni that actually orchestrate failovers. You can use PgDog alongside Patroni (or AWS RDS or other managed Postgres host), to gracefully failover live traffic.
-
 
 **Example**
 
@@ -324,11 +319,13 @@ role = "auto"
 
 &#128216; **[Authentication](https://docs.pgdog.dev/features/authentication/)**
 
-PgDog supports three authentication methods:
+PgDog supports five authentication methods:
 
 1. Password-based
 2. AWS RDS IAM
 3. Azure Workload Identity
+4. HashiCorp Vault dynamic credentials
+5. HashiCorp Vault static role credentials
 
 #### Password-based authentication
 
@@ -377,6 +374,66 @@ When any user has `server_auth = "azure_workload_identity"`, the following setti
 
 - `tls_verify` must **not** be `"disabled"`.
 - `passthrough_auth` must be `"disabled"`.
+
+#### HashiCorp Vault dynamic role authentication
+
+PgDog can fetch dynamic database credentials (username and password) from HashiCorp Vault's database secrets engine, while keeping client-to-PgDog authentication unchanged. Credentials are cached and rotated automatically after a configured percentage of the Vault lease has elapsed.
+
+**Example**
+
+In `users.toml`:
+
+```toml
+[[users]]
+name = "alice"
+database = "pgdog"
+password = "client-password"
+server_auth = "vault_dynamic"
+server_vault_path = "database/creds/pgdog"
+# Refresh credentials after 80% of the lease has elapsed (default).
+# vault_refresh_percent = 80
+```
+
+In `pgdog.toml`:
+
+```toml
+[vault]
+url = "https://vault.internal:8200"
+auth_method = "kubernetes" # or "approle"
+kubernetes_role = "pgdog"
+```
+
+PgDog logs into Vault with Kubernetes auth (using the pod's service account JWT) or AppRole (`approle_role_id` plus `approle_secret_id_file` or the `VAULT_SECRET_ID` environment variable).
+
+When any user has `server_auth = "vault_dynamic"` or `"vault_static"`, the following settings must be configured as well:
+
+- `tls_verify` must **not** be `"disabled"`.
+- `passthrough_auth` must be `"disabled"`.
+
+#### HashiCorp Vault static role authentication
+
+Unlike dynamic credentials, a Vault static database role has a fixed username and only its password rotates, on a schedule Vault manages. PgDog supports two independent uses of a static role, they don't need to point at the same role, and each has its own username setting:
+
+- `vault_path`: verify the password a client sends to PgDog against Vault's current password for the role, instead of a statically configured password.
+- `server_auth = "vault_static"` with `server_vault_path`: use the role's Vault-managed password for PgDog-to-PostgreSQL connections. Unlike `vault_dynamic`, PgDog doesn't take the username from Vault, it connects as `server_user` or `name`, if `server_user` isn't set.
+
+**Example**
+
+In `users.toml`, for a client authenticating as `alice` (verified against a static role registered under that same name) while PgDog connects to Postgres as `pgdog_service` (a separate static role):
+
+```toml
+[[users]]
+name = "alice"
+database = "pgdog"
+vault_path = "database/static-creds/alice"
+server_user = "pgdog_service"
+server_auth = "vault_static"
+server_vault_path = "database/static-creds/pgdog-service"
+```
+
+In `pgdog.toml`, the same `[vault]` section used for dynamic credentials applies.
+
+Both settings are optional and independent: set only `vault_path` to verify client passwords while keeping any other backend authentication method, or only `server_auth = "vault_static"` to use a static role for backend connections while clients authenticate with a regular password.
 
 ### Sharding
 
@@ -507,7 +564,6 @@ COMMIT;
 
 &#128216; **[Direct-to-shard queries](https://docs.pgdog.dev/features/sharding/query-routing/)**
 
-
 Queries that contain a sharding key are sent to one database only. This is the best case scenario for sharded databases, since the load is uniformly distributed across the cluster.
 
 **Example**:
@@ -529,16 +585,15 @@ Queries with multiple sharding keys or without one are sent to all databases and
 
 Currently, support for certain SQL features in cross-shard queries is limited. However, the list of supported ones keeps growing:
 
-| Feature | Supported | Notes |
-|-|-|-|
-| Aggregates | Partial | `count`, `min`, `max`, `stddev`, `variance`, `sum`, `avg` are supported. |
-| `ORDER BY` | Partial | Column in `ORDER BY` clause must be present in the result set. |
-| `GROUP BY` | Partial | Same as `ORDER BY`, referenced columns must be present in result set. |
-| Multi-tuple `INSERT` | Supported | PgDog generates one statement per tuple and executes them automatically. |
+| Feature               | Supported | Notes                                                                                        |
+| --------------------- | --------- | -------------------------------------------------------------------------------------------- |
+| Aggregates            | Partial   | `count`, `min`, `max`, `stddev`, `variance`, `sum`, `avg` are supported.                     |
+| `ORDER BY`            | Partial   | Column in `ORDER BY` clause must be present in the result set.                               |
+| `GROUP BY`            | Partial   | Same as `ORDER BY`, referenced columns must be present in result set.                        |
+| Multi-tuple `INSERT`  | Supported | PgDog generates one statement per tuple and executes them automatically.                     |
 | Sharding key `UPDATE` | Supported | PgDog generates a `SELECT`, `INSERT` and `DELETE` statements and execute them automatically. |
-| Subqueries | No | The same subquery is executed on all shards. |
-| CTEs | No | The same CTE is executed on all shards. |
-
+| Subqueries            | No        | The same subquery is executed on all shards.                                                 |
+| CTEs                  | No        | The same CTE is executed on all shards. Data-modifying CTEs on omnisharded tables reach every shard. |
 
 #### Using `COPY`
 
@@ -553,7 +608,6 @@ COPY orders (id, user_id, amount) FROM STDIN CSV HEADER;
 ```
 
 Columns must be specified in the `COPY` statement, so PgDog can infer the sharding key automatically, but are optional in the data file.
-
 
 #### Consistency (two-phase commit)
 
@@ -638,22 +692,33 @@ The re-sharding process is done in 5 steps:
 1. Create new empty cluster with the desired number of shards
 2. Configure it in `pgdog.toml` and run `schema-sync` command to copy table schemas to the new databases
 3. Run `data-sync` command to copy and re-shard table data with logical replication (tables are copied in parallel)
-4. While keeping previous command running (it streams row updates in real-time), run `schema-sync --data-sync-complete` to create secondary indexes on the new databases (much faster to do this after data is copied)
+4. Keep the previous command running. It restores indexes and constraints after copying and before streaming row updates.
 5. Cutover traffic to new cluster with `MAINTENANCE ON`, `RELOAD`, `MAINTENANCE OFF` command sequence
 
-Cutover can be done atomically with multiple PgDog containers because `RELOAD` doesn't resume traffic, `MAINTENANCE OFF` does, so the config is the same in all containers before queries are resumed. No complex synchronization tooling like etcd or  Zookeeper is required.
+Cutover can be done atomically with multiple PgDog containers because `RELOAD` doesn't resume traffic, `MAINTENANCE OFF` does, so the config is the same in all containers before queries are resumed. No complex synchronization tooling like etcd or Zookeeper is required.
 
 ### Monitoring
 
 &#128216; **[Metrics](https://docs.pgdog.dev/features/metrics/)**
 
-PgDog exposes both the standard PgBouncer-style admin database and an OpenMetrics endpoint. The admin database isn't 100% compatible,
-so we recommend you use OpenMetrics for monitoring. Example Datadog configuration and dashboard are [included](examples/datadog).
+PgDog exposes both the standard PgBouncer-style admin database, an OpenMetrics endpoint and can push metrics to an OTEL endpoint. The admin database isn't 100% compatible,
+so we recommend you use either OpenMetrics or OTEL ingestion for monitoring.
 
+We include two examples:
+
+- [Datadog configuration and dashboard](examples/datadog)
+- [Graphana + Prometheus configuration and dashboard](examples/grafana_prometheus)
 
 ## Running PgDog locally
 
 Install the latest version of the Rust compiler from [rust-lang.org](https://rust-lang.org).
+PgDog builds Postgres' parser too, which needs clang, bison, flex and the
+ICU, readline and zlib headers. On Debian and Ubuntu:
+
+```bash
+sudo apt install clang libclang-dev pkg-config bison flex libicu-dev libreadline-dev zlib1g-dev
+```
+
 Clone this repository and build the project in release mode:
 
 ```bash
@@ -751,14 +816,18 @@ PgDog is heavily optimized for performance. We use Rust, [Tokio](https://tokio.r
 PgDog is free and open source software, licensed under the AGPL v3. While often misunderstood, this license is very permissive
 and allows the following without any additional requirements from you or your organization:
 
-* Internal use
-* Private modifications for internal use without sharing any source code
+- Internal use
+- Private modifications for internal use without sharing any source code
 
 You can freely use PgDog to power your PostgreSQL databases without having to
 share any source code, including proprietary work product or any PgDog modifications you make.
 
 AGPL was written specifically for organizations that offer PgDog _as a public service_ (e.g. database cloud providers) and require
 those organizations to share any modifications they make to PgDog, including new features and bug fixes.
+
+### Enterprise edition
+
+If your organization doesn't allow AGPL software, PgDog is also available under an [enterprise](https://docs.pgdog.dev/enterprise_edition/) license.
 
 ## Contributions
 

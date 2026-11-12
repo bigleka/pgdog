@@ -4,7 +4,7 @@ use super::prelude::*;
 
 /// Terminate the connection.
 #[derive(Debug)]
-pub struct Terminate;
+pub(crate) struct Terminate;
 
 impl FromBytes for Terminate {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
@@ -16,9 +16,9 @@ impl FromBytes for Terminate {
 }
 
 impl ToBytes for Terminate {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let payload = Payload::named(self.code());
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 

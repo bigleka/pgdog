@@ -1,8 +1,12 @@
 //! PostgreSQL authentication mechanisms.
 
-pub mod error;
-pub mod md5;
-pub mod scram;
+pub(crate) mod auth_result;
+pub(crate) mod error;
+pub(crate) mod md5;
+pub(crate) mod scram;
+pub(crate) mod token_cache;
+pub(crate) mod vault;
 
-pub use error::Error;
-pub use md5::Client;
+pub(crate) use auth_result::AuthResult;
+pub(crate) use error::Error;
+pub(crate) use token_cache::AUTH_TOKEN_CACHE;

@@ -1,15 +1,15 @@
 use super::{code, prelude::*};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CopyFail {
+pub(crate) struct CopyFail {
     error: Bytes,
 }
 
 impl CopyFail {
-    pub fn new(error: impl ToString) -> Self {
-        let error = error.to_string();
+    #[cfg(test)]
+    pub(crate) fn new(error: impl AsRef<str>) -> Self {
         Self {
-            error: Bytes::from(format!("{}\0", error)),
+            error: super::c_string_bytes(error.as_ref()),
         }
     }
 }
@@ -24,10 +24,10 @@ impl FromBytes for CopyFail {
 }
 
 impl ToBytes for CopyFail {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = Payload::named(self.code());
         payload.put(self.error.clone());
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -38,7 +38,7 @@ impl Protocol for CopyFail {
 }
 
 impl CopyFail {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.error.len() + 4
     }
 }

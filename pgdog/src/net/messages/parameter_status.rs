@@ -1,19 +1,18 @@
 //! ParameterStatus (B) message.
 
 use crate::net::{
-    c_string_buf,
+    Parameter, c_string_buf,
     messages::{code, prelude::*},
     parameter::ParameterValue,
-    Parameter,
 };
 
 /// ParameterStatus (B) message.
 #[derive(Debug)]
-pub struct ParameterStatus {
+pub(crate) struct ParameterStatus {
     /// Parameter name, e.g. `client_encoding`.
-    pub name: String,
+    pub(crate) name: String,
     /// Parameter value, e.g. `UTF8`.
-    pub value: ParameterValue,
+    pub(crate) value: ParameterValue,
 }
 
 impl From<Parameter> for ParameterStatus {
@@ -46,7 +45,7 @@ impl From<ParameterStatus> for Parameter {
 impl ParameterStatus {
     /// Fake parameter status messages we can return
     /// to a client to make this seem like a legitimate PostgreSQL connection.
-    pub fn fake() -> Vec<ParameterStatus> {
+    pub(crate) fn fake() -> Vec<ParameterStatus> {
         vec![
             ParameterStatus {
                 name: "server_name".into(),
@@ -73,13 +72,13 @@ impl ParameterStatus {
 }
 
 impl ToBytes for ParameterStatus {
-    fn to_bytes(&self) -> Result<bytes::Bytes, crate::net::Error> {
+    fn to_bytes(&self) -> bytes::Bytes {
         let mut payload = Payload::named(self.code());
 
         payload.put_string(&self.name);
-        payload.put(self.value.to_bytes()?);
+        payload.put(self.value.to_bytes());
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -90,7 +89,15 @@ impl FromBytes for ParameterStatus {
         let _len = bytes.get_i32();
 
         let name = c_string_buf(&mut bytes);
-        let mut value = c_string_buf(&mut bytes)
+        let raw_value = c_string_buf(&mut bytes);
+        // DateStyle is special.
+        if name.eq_ignore_ascii_case("DateStyle") {
+            return Ok(Self {
+                name,
+                value: raw_value.into(),
+            });
+        }
+        let mut value = raw_value
             .split(",")
             .map(|s| s.trim().to_string())
             .collect::<Vec<_>>();
@@ -126,6 +133,14 @@ mod test {
         buf.put_slice(value.as_bytes());
         buf.put_u8(0);
         buf.freeze()
+    }
+
+    #[test]
+    fn datestyle_roundtrip_preserves_canonical_value() {
+        let original = ParameterStatus::from(("DateStyle", "SQL, YMD"));
+        let parsed = ParameterStatus::from_bytes(original.to_bytes()).expect("DateStyle status");
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.value, original.value);
     }
 
     #[test]
@@ -168,7 +183,7 @@ mod test {
             value: ParameterValue::String("UTF8".into()),
         };
 
-        let bytes = original.to_bytes().unwrap();
+        let bytes = original.to_bytes();
         let parsed = ParameterStatus::from_bytes(bytes).unwrap();
 
         assert_eq!(parsed.name, original.name);

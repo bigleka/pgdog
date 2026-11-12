@@ -1,35 +1,41 @@
 //! Databases behind pgDog.
 
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::Arc;
-
 use arc_swap::ArcSwap;
 use futures::future::try_join_all;
+use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use parking_lot::lock_api::MutexGuard;
 use parking_lot::{Mutex, RawMutex};
+use pgdog_config::pool::ShardNodes;
 use pgdog_config::users::PasswordKind;
-use tracing::{debug, error, info, warn};
+use pgdog_config::util::normalize_identifier;
+use pgdog_config::{
+    AuthType, EnumeratedDatabase, QueryParser, ShardedMappingConfig, ShardedMappingKey,
+    ShardedMappingKeyRef, ShardedMappingKindDeprecated, ShardedMappingList, ShardedMappingRange,
+    ShardedTableConfig,
+};
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 use crate::backend::replication::ShardedSchemas;
+use crate::backend::schema::SchemaCache;
 use crate::config::PoolerMode;
+use crate::frontend::PreparedStatements;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::frontend::router::parser::Cache;
-use crate::frontend::router::sharding::mapping::mapping_valid;
-use crate::frontend::router::sharding::Mapping;
-use crate::frontend::PreparedStatements;
+use crate::frontend::router::sharding::{Mapping, ShardedTable};
 use crate::{
     backend::pool::PoolConfig,
-    config::{config, load, set, ConfigAndUsers, ManualQuery, Role, User as ConfigUser},
-    net::{messages::BackendKeyData, tls},
+    config::{ConfigAndUsers, ShardedMappingDeprecated, config, load},
+    net::{messages::FrontendPid, tls},
 };
 
 use super::{
-    pool::{Address, ClusterConfig, Config},
-    reload_notify,
-    replication::ReplicationConfig,
     Cluster, ClusterShardConfig, Error, ShardedTables,
+    pool::{Address, ClusterConfig},
+    reload_notify,
 };
 
 static DATABASES: Lazy<ArcSwap<Databases>> =
@@ -37,58 +43,64 @@ static DATABASES: Lazy<ArcSwap<Databases>> =
 static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Sync databases during modification.
-pub fn lock() -> MutexGuard<'static, RawMutex, ()> {
+pub(crate) fn lock() -> MutexGuard<'static, RawMutex, ()> {
     LOCK.lock()
 }
 
 /// Get databases handle.
 ///
 /// This allows to access any database proxied by pgDog.
-pub fn databases() -> Arc<Databases> {
+pub(crate) fn databases() -> Arc<Databases> {
     DATABASES.load().clone()
 }
 
 /// Replace databases pooler-wide.
-pub fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), Error> {
+pub(crate) fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), Error> {
     // Order of operations is important
     // to ensure zero downtime for clients.
+    //
+    // 1. Prevent concurrent reloads. The guard restores the ready flag and
+    //    wakes waiters on drop, even if a step below errors out.
+    let _guard = reload_notify::started();
+
+    // 2. Move connections from old databases into new ones.
     let old_databases = databases();
     let new_databases = Arc::new(new_databases);
-    reload_notify::started();
     if reload {
         // Move whatever connections we can over to new pools.
         old_databases.move_conns_to(&new_databases)?;
     }
+    // 3. Launch new databases first.
     new_databases.launch();
     DATABASES.store(new_databases);
+    // 4. Shutdown all databases.
     old_databases.shutdown();
-    reload_notify::done();
+
+    super::reload_signal::notify();
 
     Ok(())
 }
 
 /// Re-create all connections.
-pub fn reconnect() -> Result<(), Error> {
+pub(crate) fn reconnect() -> Result<(), Error> {
     let config = config();
     let databases = from_config(&config);
-    warn!("reconnect: dropping all server connections and re-creating pools");
     replace_databases(databases, false)?;
     Ok(())
 }
 
 /// Re-create databases from existing config,
 /// preserving connections.
-pub fn reload_from_existing() -> Result<(), Error> {
+pub(crate) fn reload_from_existing() -> Result<(), Error> {
     let _lock = lock();
     let config = config();
     let databases = from_config(&config);
-    info!("reloading pools from current config (connections preserved where possible)");
     replace_databases(databases, true)?;
     Ok(())
 }
 
 /// Initialize the databases for the first time.
-pub fn init() -> Result<(), Error> {
+pub(crate) fn init() -> Result<(), Error> {
     let config = config();
     replace_databases(from_config(&config), false)?;
 
@@ -102,12 +114,23 @@ pub fn init() -> Result<(), Error> {
 }
 
 /// Shutdown all databases.
-pub fn shutdown() {
+pub(crate) fn shutdown() {
     databases().shutdown();
 }
 
+/// Reset cumulative statistics for all connection pools.
+pub(crate) fn reset_stats() {
+    for cluster in databases().all().values() {
+        for shard in cluster.shards() {
+            for pool in shard.pool_iter() {
+                pool.reset_stats();
+            }
+        }
+    }
+}
+
 /// Cancel all queries running on a database.
-pub async fn cancel_all(database: &str) -> Result<(), Error> {
+pub(crate) async fn cancel_all(database: &str) -> Result<(), Error> {
     let clusters: Vec<_> = databases()
         .all()
         .iter()
@@ -120,77 +143,54 @@ pub async fn cancel_all(database: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Terminates all active connections on all `Pool`s.
+pub(crate) fn terminate_active_connections() {
+    databases()
+        .all()
+        .values()
+        .for_each(Cluster::terminate_active_connections);
+}
+
 /// Re-create pools from config.
-pub fn reload() -> Result<(), Error> {
+pub(crate) fn reload(force: bool) -> Result<(), Error> {
+    if force {
+        info!("force reloading configuration");
+    } else {
+        info!("reloading configuration");
+    }
+
+    // Load config from disk.
     let old_config = config();
     let new_config = load(&old_config.config_path, &old_config.users_path)?;
     let databases = from_config(&new_config);
-    info!("reloading configuration");
+
+    // Terminate after checking config for validity.
+    if force {
+        terminate_active_connections();
+    }
+
+    // Replace databases.
     replace_databases(databases, true)?;
+
+    // Reload TLS connectors.
     tls::reload()?;
+
     // Remove any unused prepared statements.
     PreparedStatements::global()
         .write()
         .close_unused(new_config.config.general.prepared_statements_limit);
-    // Resize query cache
+
+    // Resize query cache.
     Cache::resize(new_config.config.general.query_cache_limit);
+
     Ok(())
-}
-
-/// Add new user to pool via passthrough authentication.
-///
-/// Return true if user can login, false otherwise.
-///
-pub(crate) fn add(user: ConfigUser) -> Result<bool, Error> {
-    fn add_user(user: ConfigUser) -> Result<(), Error> {
-        debug!(
-            r#"adding user "{}" to database "{}" via passthrough auth"#,
-            user.name, user.database
-        );
-
-        let _lock = lock();
-        let mut config = (*config()).clone();
-        config.users.add_or_replace(user);
-        set(config)?;
-
-        Ok(())
-    }
-
-    let config = config();
-    let existing = config.users.find(&user);
-
-    // User already exists in users.toml.
-    if let Some(mut existing) = existing {
-        // Password hasn't been set yet.
-        if existing.password.is_none() {
-            existing.password = user.password.clone();
-            add_user(existing)?;
-            reload_from_existing()?;
-            Ok(true)
-        } else if existing.password == user.password {
-            // Passwords match.
-            Ok(true)
-        } else if config.config.general.passthrough_auth.allows_change() {
-            // Passwords don't match but we can change it.
-            existing.password = user.password.clone();
-            add_user(user)?;
-            reload_from_existing()?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    } else {
-        add_user(user)?;
-        reload_from_existing()?;
-        Ok(true)
-    }
 }
 
 /// Swap database configs between source and destination.
 /// Both databases keep their names, but their configs (host, port, etc.) are exchanged.
 /// User database references are also swapped.
 /// Persists changes to disk (best effort).
-pub async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
+pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
     use tokio::fs::{copy, write};
 
     let config = {
@@ -201,6 +201,7 @@ pub async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
         config.config.cutover(source, destination);
         config.users.cutover(source, destination);
 
+        let config = crate::config::set(config)?;
         let databases = from_config(&config);
 
         replace_databases(databases, true)?;
@@ -252,32 +253,10 @@ pub async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Database/user pair that identifies a database cluster pool.
-#[derive(Debug, PartialEq, Hash, Eq, Clone, Default)]
-pub struct User {
-    /// User name.
-    pub user: String,
-    /// Database name.
-    pub database: String,
-}
-
-impl From<User> for pgdog_stats::User {
-    fn from(value: User) -> Self {
-        Self {
-            user: value.user,
-            database: value.database,
-        }
-    }
-}
-
-impl std::fmt::Display for User {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.user, self.database)
-    }
-}
+pub(crate) use pgdog_stats::User;
 
 /// Convert to a database/user pair.
-pub trait ToUser {
+pub(crate) trait ToUser {
     /// Perform the conversion.
     fn to_user(&self) -> User;
 }
@@ -302,16 +281,15 @@ impl ToUser for (&str, Option<&str>) {
 
 /// Databases.
 #[derive(Default, Clone)]
-pub struct Databases {
+pub(crate) struct Databases {
     databases: HashMap<User, Cluster>,
-    manual_queries: HashMap<String, ManualQuery>,
     mirrors: HashMap<User, Vec<Cluster>>,
     mirror_configs: HashMap<(String, String), crate::config::MirrorConfig>,
 }
 
 impl Databases {
     /// Get the database user password, if one is configured.
-    pub fn passwords(&self, user: impl ToUser) -> Option<&[PasswordKind]> {
+    pub(crate) fn passwords(&self, user: impl ToUser) -> Option<&[PasswordKind]> {
         if let Some(cluster) = self.databases.get(&user.to_user()) {
             if cluster.passwords().is_empty() {
                 None
@@ -323,8 +301,15 @@ impl Databases {
         }
     }
 
+    /// Get a configured auth type for this user, if the user exists.
+    pub(crate) fn auth_type(&self, user: impl ToUser) -> Option<AuthType> {
+        self.databases
+            .get(&user.to_user())
+            .map(|cluster| *cluster.auth_type())
+    }
+
     /// Get a cluster for the user/database pair if it's configured.
-    pub fn cluster(&self, user: impl ToUser) -> Result<Cluster, Error> {
+    pub(crate) fn cluster(&self, user: impl ToUser) -> Result<Cluster, Error> {
         let user = user.to_user();
         if let Some(cluster) = self.databases.get(&user) {
             Ok(cluster.clone())
@@ -334,7 +319,7 @@ impl Databases {
     }
 
     /// Get the schema owner for this database.
-    pub fn schema_owner(&self, database: &str) -> Result<Cluster, Error> {
+    pub(crate) fn schema_owner(&self, database: &str) -> Result<Cluster, Error> {
         for (user, cluster) in &self.databases {
             if cluster.schema_admin() && user.database == database {
                 return Ok(cluster.clone());
@@ -349,7 +334,7 @@ impl Databases {
     ///
     /// N.B.: Subsequent entry will override previous entry.
     ///
-    pub fn schema_owners(&self) -> Vec<Cluster> {
+    pub(crate) fn schema_owners(&self) -> Vec<Cluster> {
         let mut schema_owners = HashMap::new();
 
         for cluster in self.databases.values() {
@@ -361,7 +346,7 @@ impl Databases {
         schema_owners.into_values().collect()
     }
 
-    pub fn mirrors(&self, user: impl ToUser) -> Result<Option<&[Cluster]>, Error> {
+    pub(crate) fn mirrors(&self, user: impl ToUser) -> Result<Option<&[Cluster]>, Error> {
         let user = user.to_user();
         if self.databases.contains_key(&user) {
             Ok(self.mirrors.get(&user).map(|m| m.as_slice()))
@@ -371,7 +356,7 @@ impl Databases {
     }
 
     /// Get precomputed mirror configuration.
-    pub fn mirror_config(
+    pub(crate) fn mirror_config(
         &self,
         source_db: &str,
         destination_db: &str,
@@ -380,42 +365,18 @@ impl Databases {
             .get(&(source_db.to_string(), destination_db.to_string()))
     }
 
-    /// Get replication configuration for the database.
-    pub fn replication(&self, database: &str) -> Option<ReplicationConfig> {
-        for (user, cluster) in &self.databases {
-            if user.database == database {
-                return Some(ReplicationConfig {
-                    shards: cluster.shards().len(),
-                    sharded_tables: cluster.sharded_tables().into(),
-                });
-            }
-        }
-
-        None
-    }
-
     /// Get all clusters and databases.
-    pub fn all(&self) -> &HashMap<User, Cluster> {
+    pub(crate) fn all(&self) -> &HashMap<User, Cluster> {
         &self.databases
     }
 
     /// Cancel a query running on one of the databases proxied by the pooler.
-    pub async fn cancel(&self, id: &BackendKeyData) -> Result<(), Error> {
+    pub(crate) async fn cancel(&self, id: FrontendPid) -> Result<(), Error> {
         for cluster in self.databases.values() {
             cluster.cancel(id).await?;
         }
 
         Ok(())
-    }
-
-    /// Get manual query, if exists.
-    pub fn manual_query(&self, fingerprint: &str) -> Option<&ManualQuery> {
-        self.manual_queries.get(fingerprint)
-    }
-
-    /// Manual queries collection, keyed by query fingerprint.
-    pub fn manual_queries(&self) -> &HashMap<String, ManualQuery> {
-        &self.manual_queries
     }
 
     /// Move all connections we can from old databases config to new
@@ -425,11 +386,11 @@ impl Databases {
         for (user, cluster) in &self.databases {
             let dest = destination.databases.get(user);
 
-            if let Some(dest) = dest {
-                if cluster.can_move_conns_to(dest) {
-                    cluster.move_conns_to(dest)?;
-                    moved += 1;
-                }
+            if let Some(dest) = dest
+                && cluster.can_move_conns_to(dest)
+                && cluster.move_conns_to(dest)?
+            {
+                moved += 1;
             }
         }
 
@@ -460,12 +421,18 @@ impl Databases {
 
         // Launch all clusters
         for cluster in self.all().values() {
-            if cluster.passwords().is_empty() {
+            if cluster.passwords().is_empty()
+                && cluster.identity().is_none()
+                && !cluster.auth_type().external_token()
+            {
                 warn!(
                     r#"disabling pool for user "{}" and database "{}", password not set"#,
                     cluster.user(),
                     cluster.name()
                 );
+                // No boot-time maintenance will run, don't block
+                // readiness waiters. Checkouts will fail instead.
+                cluster.mark_ready();
             } else {
                 cluster.launch();
             }
@@ -481,68 +448,130 @@ impl Databases {
     }
 }
 
-fn new_pool(user: &crate::config::User, config: &crate::config::Config) -> Option<(User, Cluster)> {
-    let sharded_tables = config.sharded_tables();
+fn resolve_sharded_table(
+    config: &ShardedTableConfig,
+    mappings: &IndexMap<ShardedMappingKey, Vec<ShardedMappingDeprecated>>,
+    num_shards: usize,
+) -> ShardedTable {
+    let mapping = config
+        .mapping
+        .clone()
+        .or_else(|| resolve_table_mapping_deprecated(config, mappings));
+
+    let mapping = mapping.map(|configs| {
+        let tname = config.name.as_deref().unwrap_or("*");
+        let column = &config.column;
+        for error in crate::backend::validation::validate(&configs, config.data_type, num_shards) {
+            warn!("sharded table name=\"{tname}\", column=\"{column}\": {error}");
+        }
+        Mapping::new(configs)
+    });
+
+    ShardedTable {
+        database: config.database.clone(),
+        name: config.name.as_deref().map(normalize_identifier),
+        prefix: config.prefix,
+        schema: config.schema.as_deref().map(normalize_identifier),
+        column: normalize_identifier(&config.column),
+        primary: config.primary,
+        centroids: config.centroids.clone(),
+        data_type: config.data_type,
+        centroid_probes: config.centroid_probes,
+        hasher: config.hasher.clone(),
+        mapping: mapping.flatten(),
+        lookup_query: config.lookup_query.clone(),
+        lookup_result: config.lookup_result,
+    }
+}
+
+fn resolve_table_mapping_deprecated(
+    table: &ShardedTableConfig,
+    mappings: &IndexMap<ShardedMappingKey, Vec<ShardedMappingDeprecated>>,
+) -> Option<Vec<ShardedMappingConfig>> {
+    let found = mappings.get(&ShardedMappingKeyRef {
+        database: &table.database,
+        column: &table.column,
+        table: table.name.as_ref(),
+    })?;
+
+    Some(
+        found
+            .iter()
+            .map(|map| match map.kind {
+                ShardedMappingKindDeprecated::List => {
+                    ShardedMappingConfig::List(ShardedMappingList {
+                        shard: map.shard,
+                        values: map.values.clone(),
+                    })
+                }
+                ShardedMappingKindDeprecated::Range => {
+                    ShardedMappingConfig::Range(ShardedMappingRange {
+                        shard: map.shard,
+                        start: map.start.clone(),
+                        end: map.end.clone(),
+                    })
+                }
+                ShardedMappingKindDeprecated::Default => {
+                    ShardedMappingConfig::Default { shard: map.shard }
+                }
+            })
+            .collect(),
+    )
+}
+
+// Create new Cluster from user and databases in `pgdog.toml`.
+//
+// # Arguments
+//
+// - `user`: `[[users]]` entry in `users.toml`
+// - `config`: all of `pgdog.toml`
+// - `schema_cache`: A cache of database tables, shared between all clusters. This is passed here
+//                   to ensure all clusters share the same schema cache, and to make sure a new one
+//                   is created on each config reload.
+pub(super) fn new_pool(
+    user: &crate::config::User,
+    config: &crate::config::Config,
+    schema_cache: SchemaCache,
+) -> Option<(User, Cluster)> {
     let omnisharded_tables = config.omnisharded_tables();
     let sharded_mappings = config.sharded_mappings();
     let sharded_schemas = config.sharded_schemas();
     let general = &config.general;
     let databases = config.databases();
 
-    let shards = databases.get(&user.database).cloned()?;
+    let shards = databases.get(&user.database)?;
 
-    let mut shard_configs = vec![];
-    for user_databases in shards {
-        let has_single_replica = user_databases.len() == 1;
-        let primary = user_databases
-            .iter()
-            .find(|d| d.role == Role::Primary)
-            .map(|primary| PoolConfig {
-                address: Address::new(primary, user, primary.number),
-                config: Config::new(general, primary, user, has_single_replica),
-            });
-        let replicas = user_databases
-            .iter()
-            .filter(|d| matches!(d.role, Role::Replica | Role::Auto)) // Auto role is assumed read-only until proven otherwise.
-            .map(|replica| PoolConfig {
-                address: Address::new(replica, user, replica.number),
-                config: Config::new(general, replica, user, has_single_replica),
-            })
-            .collect::<Vec<_>>();
+    let shard_configs: Vec<ClusterShardConfig> = shards
+        .iter()
+        .map(|entries| {
+            let shard = ShardNodes::new(entries);
+            let pool = |database: &EnumeratedDatabase| PoolConfig {
+                address: Address::new(database, user, database.number),
+                config: pgdog_config::pool::PoolConfig::resolve(
+                    general,
+                    &shard,
+                    &database.database,
+                    user,
+                ),
+            };
 
-        shard_configs.push(ClusterShardConfig { primary, replicas });
-    }
+            ClusterShardConfig {
+                primary: shard.primary().map(&pool),
+                replicas: shard.replicas().map(&pool).collect(),
+            }
+        })
+        .collect();
 
-    let mut sharded_tables = sharded_tables
-        .get(&user.database)
-        .cloned()
-        .unwrap_or_default();
+    let sharded_tables: Vec<_> = config
+        .sharded_tables
+        .iter()
+        .filter(|t| t.database == user.database)
+        .map(|t| resolve_sharded_table(t, &sharded_mappings, shard_configs.len()))
+        .collect();
     let sharded_schemas = sharded_schemas
         .get(&user.database)
         .cloned()
         .unwrap_or_default();
-
-    for sharded_table in &mut sharded_tables {
-        let mappings = sharded_mappings.get(&(
-            sharded_table.database.clone(),
-            sharded_table.column.clone(),
-            sharded_table.name.clone(),
-        ));
-
-        if let Some(mappings) = mappings {
-            sharded_table.mapping = Mapping::new(mappings);
-
-            if let Some(ref mapping) = sharded_table.mapping {
-                if !mapping_valid(mapping) {
-                    warn!(
-                        "sharded table name=\"{}\", column=\"{}\" has overlapping ranges",
-                        sharded_table.name.as_ref().unwrap_or(&String::from("")),
-                        sharded_table.column
-                    );
-                }
-            }
-        }
-    }
 
     let omnisharded_tables = omnisharded_tables
         .get(&user.database)
@@ -555,6 +584,16 @@ fn new_pool(user: &crate::config::User, config: &crate::config::Config) -> Optio
         general.system_catalogs,
     );
     let sharded_schemas = ShardedSchemas::new(sharded_schemas);
+    let query_parser = config
+        .query_parsers
+        .iter()
+        .find(|config| config.database == user.database)
+        .cloned()
+        .unwrap_or(QueryParser {
+            database: user.database.clone(),
+            level: config.general.query_parser,
+            engine: config.general.query_parser_engine,
+        });
 
     let cluster_config = ClusterConfig::new(
         config,
@@ -562,6 +601,8 @@ fn new_pool(user: &crate::config::User, config: &crate::config::Config) -> Optio
         &shard_configs,
         sharded_tables,
         sharded_schemas,
+        query_parser,
+        schema_cache,
     );
 
     Some((
@@ -574,44 +615,20 @@ fn new_pool(user: &crate::config::User, config: &crate::config::Config) -> Optio
 }
 
 /// Load databases from config.
-pub fn from_config(config: &ConfigAndUsers) -> Databases {
+pub(crate) fn from_config(config: &ConfigAndUsers) -> Databases {
     let mut databases = HashMap::new();
+    // The schema cache is shared between all databases.
+    let schema_cache = SchemaCache::default();
 
     for user in &config.users.users {
-        let users = if user.databases.is_empty() && !user.all_databases {
-            vec![user.clone()]
-        } else if user.all_databases {
+        for database in config.config.user_databases(user) {
             let mut user = user.clone();
-            user.databases.clear(); // all_databases takes priority
-
-            config
-                .config
-                .databases()
-                .into_keys()
-                .map(|database| {
-                    let mut user = user.clone();
-                    user.database = database;
-                    user
-                })
-                .collect()
-        } else {
-            let mut user = user.clone();
-            let databases = user.databases.clone();
+            // FIXME: this is a hacky way to specify a single database entry
+            // through the user, since user can have different configs
             user.databases.clear();
+            user.database = database;
 
-            // User is mapped to multiple databases.
-            databases
-                .into_iter()
-                .map(|database| {
-                    let mut user = user.clone();
-                    user.database = database;
-                    user
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for user in users {
-            if let Some((user, cluster)) = new_pool(&user, &config.config) {
+            if let Some((user, cluster)) = new_pool(&user, &config.config, schema_cache.clone()) {
                 databases.insert(user, cluster);
             }
         }
@@ -713,7 +730,6 @@ pub fn from_config(config: &ConfigAndUsers) -> Databases {
 
     Databases {
         databases,
-        manual_queries: config.config.manual_queries(),
         mirrors,
         mirror_configs,
     }
@@ -721,153 +737,38 @@ pub fn from_config(config: &ConfigAndUsers) -> Databases {
 
 #[cfg(test)]
 mod tests {
-    use pgdog_config::General;
+    use pgdog_config::Mirroring;
 
     use super::*;
     use crate::config::{Config, ConfigAndUsers, Database, Role};
 
-    fn setup_config(passthrough_auth: crate::config::PassthroughAuth, users: Vec<ConfigUser>) {
-        let _lock = lock();
-        let config = Config {
-            databases: vec![Database {
-                name: "db1".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                role: Role::Primary,
-                ..Default::default()
-            }],
-            general: General {
-                passthrough_auth,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let users = crate::config::Users {
-            users,
-            ..Default::default()
-        };
-
-        let cu = ConfigAndUsers {
-            config,
-            users,
-            config_path: std::path::PathBuf::new(),
-            users_path: std::path::PathBuf::new(),
-        };
-
-        crate::config::set(cu).expect("set config");
-        let databases = from_config(&crate::config::config());
-        replace_databases(databases, false).expect("replace databases");
-    }
-
-    fn make_user(name: &str, password: Option<&str>) -> ConfigUser {
-        ConfigUser {
-            name: name.to_string(),
-            database: "db1".to_string(),
-            password: password.map(|p| p.to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_add_new_user() {
-        setup_config(crate::config::PassthroughAuth::EnabledPlain, vec![]);
-
-        let result = add(make_user("new_user", Some("secret")));
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-
-        let config = crate::config::config();
-        let found = config.users.find(&make_user("new_user", None));
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().password, Some("secret".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_add_existing_user_matching_password() {
-        setup_config(
-            crate::config::PassthroughAuth::EnabledPlain,
-            vec![make_user("alice", Some("pass123"))],
-        );
-
-        let result = add(make_user("alice", Some("pass123")));
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_add_existing_user_no_password_set() {
-        setup_config(
-            crate::config::PassthroughAuth::EnabledPlain,
-            vec![make_user("bob", None)],
-        );
-
-        let result = add(make_user("bob", Some("new_pass")));
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-
-        let config = crate::config::config();
-        let found = config.users.find(&make_user("bob", None));
-        assert_eq!(found.unwrap().password, Some("new_pass".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_add_existing_user_wrong_password_no_change_allowed() {
-        setup_config(
-            crate::config::PassthroughAuth::EnabledPlain,
-            vec![make_user("charlie", Some("old_pass"))],
-        );
-
-        let result = add(make_user("charlie", Some("wrong_pass")));
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_add_existing_user_wrong_password_change_allowed() {
-        setup_config(
-            crate::config::PassthroughAuth::EnabledPlainAllowChange,
-            vec![make_user("dave", Some("old_pass"))],
-        );
-
-        let result = add(make_user("dave", Some("new_pass")));
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-
-        let config = crate::config::config();
-        let found = config.users.find(&make_user("dave", None));
-        assert_eq!(found.unwrap().password, Some("new_pass".to_string()));
-    }
-
     #[test]
     fn test_mirror_user_isolation() {
         // Test that each user gets their own mirror cluster
-        let mut config = Config::default();
-
-        // Source database and one mirror destination
-        config.databases = vec![
-            Database {
-                name: "db1".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                role: Role::Primary,
+        let config = Config {
+            databases: vec![
+                Database {
+                    name: "db1".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+                Database {
+                    name: "db1_mirror".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5433,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+            ],
+            mirroring: vec![Mirroring {
+                source_db: "db1".to_string(),
+                destination_db: "db1_mirror".to_string(),
                 ..Default::default()
-            },
-            Database {
-                name: "db1_mirror".to_string(),
-                host: "localhost".to_string(),
-                port: 5433,
-                role: Role::Primary,
-                ..Default::default()
-            },
-        ];
-
-        // Set up mirroring configuration - one mirror for all users
-        config.mirroring = vec![crate::config::Mirroring {
-            source_db: "db1".to_string(),
-            destination_db: "db1_mirror".to_string(),
+            }],
             ..Default::default()
-        }];
+        };
 
         let users = crate::config::Users {
             users: vec![
@@ -904,6 +805,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         let alice_mirrors = databases.mirrors(("alice", "db1")).unwrap().unwrap_or(&[]);
@@ -922,31 +824,30 @@ mod tests {
     #[test]
     fn test_mirror_user_mismatch_handling() {
         // Test that mirroring is disabled gracefully when users don't match
-        let mut config = Config::default();
-
-        // Source database with two users, destination with only one
-        config.databases = vec![
-            Database {
-                name: "source_db".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                role: Role::Primary,
+        let config = Config {
+            databases: vec![
+                Database {
+                    name: "source_db".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+                Database {
+                    name: "dest_db".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5433,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+            ],
+            mirroring: vec![Mirroring {
+                source_db: "source_db".to_string(),
+                destination_db: "dest_db".to_string(),
                 ..Default::default()
-            },
-            Database {
-                name: "dest_db".to_string(),
-                host: "localhost".to_string(),
-                port: 5433,
-                role: Role::Primary,
-                ..Default::default()
-            },
-        ];
-
-        config.mirroring = vec![crate::config::Mirroring {
-            source_db: "source_db".to_string(),
-            destination_db: "dest_db".to_string(),
+            }],
             ..Default::default()
-        }];
+        };
 
         let users = crate::config::Users {
             users: vec![
@@ -978,6 +879,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Mirrors should be empty due to user mismatch
@@ -1018,7 +920,7 @@ mod tests {
             },
         ];
 
-        config.mirroring = vec![crate::config::Mirroring {
+        config.mirroring = vec![Mirroring {
             source_db: "source_db".to_string(),
             destination_db: "dest_db".to_string(),
             queue_length: Some(256),
@@ -1049,6 +951,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Verify mirror config exists and has custom values
@@ -1097,7 +1000,7 @@ mod tests {
         ];
 
         // Mirror config without custom values - should use defaults
-        config.mirroring = vec![crate::config::Mirroring {
+        config.mirroring = vec![Mirroring {
             source_db: "db1".to_string(),
             destination_db: "db2".to_string(),
             ..Default::default()
@@ -1126,6 +1029,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         let mirror_config = databases.mirror_config("db1", "db2");
@@ -1176,13 +1080,13 @@ mod tests {
         ];
 
         config.mirroring = vec![
-            crate::config::Mirroring {
+            Mirroring {
                 source_db: "primary".to_string(),
                 destination_db: "mirror1".to_string(),
                 queue_length: Some(200), // Override queue only
                 ..Default::default()
             },
-            crate::config::Mirroring {
+            Mirroring {
                 source_db: "primary".to_string(),
                 destination_db: "mirror2".to_string(),
                 exposure: Some(0.25), // Override exposure only
@@ -1219,6 +1123,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Check mirror1 config - custom queue, default exposure
@@ -1247,32 +1152,32 @@ mod tests {
     #[test]
     fn test_invalid_mirror_not_precomputed() {
         // Test that invalid mirror configs (user mismatch) are not precomputed
-        let mut config = Config::default();
-
-        config.databases = vec![
-            Database {
-                name: "source".to_string(),
-                host: "localhost".to_string(),
-                port: 5432,
-                role: Role::Primary,
+        let config = Config {
+            databases: vec![
+                Database {
+                    name: "source".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+                Database {
+                    name: "dest".to_string(),
+                    host: "localhost".to_string(),
+                    port: 5433,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+            ],
+            mirroring: vec![Mirroring {
+                source_db: "source".to_string(),
+                destination_db: "dest".to_string(),
+                queue_length: Some(256),
+                exposure: Some(0.5),
                 ..Default::default()
-            },
-            Database {
-                name: "dest".to_string(),
-                host: "localhost".to_string(),
-                port: 5433,
-                role: Role::Primary,
-                ..Default::default()
-            },
-        ];
-
-        config.mirroring = vec![crate::config::Mirroring {
-            source_db: "source".to_string(),
-            destination_db: "dest".to_string(),
-            queue_length: Some(256),
-            exposure: Some(0.5),
+            }],
             ..Default::default()
-        }];
+        };
 
         // Create user mismatch - user1 for source, user2 for dest
         let users = crate::config::Users {
@@ -1298,6 +1203,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Should not have precomputed this invalid config
@@ -1333,7 +1239,7 @@ mod tests {
         ];
 
         // Configure mirroring
-        config.mirroring = vec![crate::config::Mirroring {
+        config.mirroring = vec![Mirroring {
             source_db: "source_db".to_string(),
             destination_db: "dest_db".to_string(),
             queue_length: Some(256),
@@ -1352,6 +1258,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Mirror config should not be precomputed when there are no users
@@ -1380,6 +1287,7 @@ mod tests {
             users: users_partial,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Mirror config should not be precomputed when destination has no users
@@ -1408,6 +1316,7 @@ mod tests {
             users: users_dest_only,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Mirror config should not be precomputed when source has no users
@@ -1462,6 +1371,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // User should have pools for all three databases
@@ -1526,6 +1436,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // User should have pools for db1 and db3 only
@@ -1592,6 +1503,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // all_databases should take priority - user gets all 3 databases
@@ -1622,7 +1534,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = new_pool(&user, &config);
+        let result = new_pool(&user, &config, SchemaCache::default());
         assert!(
             result.is_none(),
             "new_pool should return None when database doesn't exist"
@@ -1666,6 +1578,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         assert!(
@@ -1738,6 +1651,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Admin has all 3 databases
@@ -1788,6 +1702,7 @@ mod tests {
             users,
             config_path: std::path::PathBuf::new(),
             users_path: std::path::PathBuf::new(),
+            ..Default::default()
         });
 
         // Should only create pool for db1, nonexistent is silently skipped
@@ -1809,13 +1724,13 @@ mod tests {
         let original_config = r#"
 [[databases]]
 name = "source_db"
-host = "source-host"
+host = "127.0.0.1"
 port = 5432
 role = "primary"
 
 [[databases]]
 name = "destination_db"
-host = "destination-host"
+host = "127.0.0.2"
 port = 5433
 role = "primary"
 "#;
@@ -1839,56 +1754,136 @@ password = "testpass"
         cutover("source_db", "destination_db").await.unwrap();
 
         // Verify backup files contain original content
-        let backup_config_str = fs::read_to_string(config_path.with_extension("bak.toml"))
+        let backup_config = fs::read_to_string(config_path.with_extension("bak.toml"))
             .await
             .unwrap();
-        let backup_config: crate::config::Config = toml::from_str(&backup_config_str).unwrap();
+        let backup_config: crate::config::Config = toml::from_str(&backup_config).unwrap();
         let backup_source = backup_config
             .databases
             .iter()
             .find(|d| d.name == "source_db")
             .unwrap();
-        assert_eq!(backup_source.host, "source-host");
+        assert_eq!(backup_source.host, "127.0.0.1");
         assert_eq!(backup_source.port, 5432);
         let backup_dest = backup_config
             .databases
             .iter()
             .find(|d| d.name == "destination_db")
             .unwrap();
-        assert_eq!(backup_dest.host, "destination-host");
+        assert_eq!(backup_dest.host, "127.0.0.2");
         assert_eq!(backup_dest.port, 5433);
 
-        let backup_users_str = fs::read_to_string(users_path.with_extension("bak.toml"))
+        let backup_users = fs::read_to_string(users_path.with_extension("bak.toml"))
             .await
             .unwrap();
-        let backup_users: crate::config::Users = toml::from_str(&backup_users_str).unwrap();
+        let backup_users: crate::config::Users = toml::from_str(&backup_users).unwrap();
         assert_eq!(backup_users.users.len(), 1);
         assert_eq!(backup_users.users[0].name, "testuser");
         assert_eq!(backup_users.users[0].database, "source_db");
 
         // Verify new config files have swapped values
-        let new_config_str = fs::read_to_string(&config_path).await.unwrap();
-        let new_config: crate::config::Config = toml::from_str(&new_config_str).unwrap();
+        let new_config = fs::read_to_string(&config_path).await.unwrap();
+        let new_config: crate::config::Config = toml::from_str(&new_config).unwrap();
         let new_source = new_config
             .databases
             .iter()
             .find(|d| d.name == "source_db")
             .unwrap();
-        assert_eq!(new_source.host, "destination-host");
+        assert_eq!(new_source.host, "127.0.0.2");
         assert_eq!(new_source.port, 5433);
         let new_dest = new_config
             .databases
             .iter()
             .find(|d| d.name == "destination_db")
             .unwrap();
-        assert_eq!(new_dest.host, "source-host");
+        assert_eq!(new_dest.host, "127.0.0.1");
         assert_eq!(new_dest.port, 5432);
 
         // Verify users were swapped
-        let new_users_str = fs::read_to_string(&users_path).await.unwrap();
-        let new_users: crate::config::Users = toml::from_str(&new_users_str).unwrap();
+        let new_users = fs::read_to_string(&users_path).await.unwrap();
+        let new_users: crate::config::Users = toml::from_str(&new_users).unwrap();
         assert_eq!(new_users.users.len(), 1);
         assert_eq!(new_users.users[0].name, "testuser");
         assert_eq!(new_users.users[0].database, "destination_db");
+    }
+
+    /// PostgreSQL folds unquoted identifiers to lower case, so the parser
+    /// hands the router `orders` for `FROM Orders`. Identifiers configured
+    /// in `pgdog.toml` must be folded the same way, otherwise they never
+    /// match and the table silently isn't sharded.
+    #[test]
+    fn test_unquoted_config_identifiers_are_folded() {
+        let config = ShardedTableConfig {
+            database: "pgdog".into(),
+            name: Some("Orders".into()),
+            schema: Some("Public".into()),
+            column: "Tenant_Id".into(),
+            ..Default::default()
+        };
+
+        let resolved = resolve_sharded_table(&config, &IndexMap::new(), 2);
+
+        assert_eq!(resolved.name.as_deref(), Some("orders"));
+        assert_eq!(resolved.schema.as_deref(), Some("public"));
+        assert_eq!(resolved.column, "tenant_id");
+    }
+
+    /// Quoted identifiers keep their case, and the surrounding quotes are
+    /// not part of the identifier itself.
+    #[test]
+    fn test_quoted_config_identifiers_preserve_case() {
+        let config = ShardedTableConfig {
+            database: "pgdog".into(),
+            name: Some(r#""Orders""#.into()),
+            schema: Some(r#""Public""#.into()),
+            column: r#""Tenant_Id""#.into(),
+            ..Default::default()
+        };
+
+        let resolved = resolve_sharded_table(&config, &IndexMap::new(), 2);
+
+        assert_eq!(resolved.name.as_deref(), Some("Orders"));
+        assert_eq!(resolved.schema.as_deref(), Some("Public"));
+        assert_eq!(resolved.column, "Tenant_Id");
+    }
+
+    #[tokio::test]
+    async fn test_cutover_swaps_back_on_the_second_call() {
+        use pgdog_config::User as ConfigUser;
+
+        let mut config = ConfigAndUsers::default();
+        config.config.databases.push(Database {
+            name: "single".into(),
+            host: "127.0.0.1".into(),
+            port: 5432,
+            ..Default::default()
+        });
+        for shard in 0..2 {
+            config.config.databases.push(Database {
+                name: "sharded".into(),
+                host: "127.0.0.1".into(),
+                port: 5432,
+                database_name: Some(format!("shard_{shard}")),
+                shard,
+                ..Default::default()
+            });
+        }
+        for database in ["single", "sharded"] {
+            let mut user = ConfigUser::new("pgdog", "pgdog", database);
+            user.schema_admin = true;
+            config.users.users.push(user);
+        }
+        crate::config::set(config).unwrap();
+        init().unwrap();
+
+        let shards = |database: &str| databases().schema_owner(database).unwrap().shards().len();
+
+        assert_eq!((shards("single"), shards("sharded")), (1, 2));
+
+        cutover("single", "sharded").await.unwrap();
+        assert_eq!((shards("single"), shards("sharded")), (2, 1));
+
+        cutover("single", "sharded").await.unwrap();
+        assert_eq!((shards("single"), shards("sharded")), (1, 2));
     }
 }

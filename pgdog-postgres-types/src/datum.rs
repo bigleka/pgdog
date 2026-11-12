@@ -1,15 +1,20 @@
-use std::ops::Add;
+use std::cmp::{Ordering, PartialOrd};
+use std::fmt;
 
 use bytes::Bytes;
 use pgdog_vector::{Float, Vector};
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::{
-    Array, Data, Double, Error, Format, FromDataType, Interval, Numeric, Oid, Timestamp,
-    TimestampTz, ToDataRowColumn,
+    Array, Data, Double, Error, Format, FromDataType, Inet, Interval, Money, Numeric, Oid,
+    Timestamp, TimestampTz, ToDataRowColumn,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+/// Represents a single piece of data in expression position. Trait
+/// implementations for Rust operators match the semantics of that
+/// operator/opclass in expression position in PG
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Datum {
     /// BIGINT.
     Bigint(i64),
@@ -39,6 +44,10 @@ pub enum Datum {
     Oid(Oid),
     /// Array.
     Array(Array),
+    /// MONEY.
+    Money(Money),
+    /// INET or CIDR.
+    Inet(Inet),
     /// We don't know.
     Unknown(Bytes),
     /// NULL.
@@ -47,98 +56,48 @@ pub enum Datum {
     Boolean(bool),
 }
 
-impl Eq for Datum {}
-
-impl std::hash::Hash for Datum {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        use Datum::*;
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Bigint(v) => v.hash(state),
-            Integer(v) => v.hash(state),
-            SmallInt(v) => v.hash(state),
-            Interval(v) => v.hash(state),
-            Text(v) => v.hash(state),
-            Timestamp(v) => v.hash(state),
-            TimestampTz(v) => v.hash(state),
-            Uuid(v) => v.hash(state),
-            Numeric(v) => v.hash(state),
-            Float(v) => {
-                if v.0.is_nan() {
-                    0u32.hash(state);
-                } else {
-                    v.0.to_bits().hash(state);
-                }
-            }
-            Double(v) => {
-                if v.0.is_nan() {
-                    0u64.hash(state);
-                } else {
-                    v.0.to_bits().hash(state);
-                }
-            }
-            Vector(v) => v.hash(state),
-            Oid(v) => v.hash(state),
-            Array(v) => v.hash(state),
-            Unknown(v) => v.hash(state),
-            Null => {}
-            Boolean(v) => v.hash(state),
-        }
-    }
-}
-
 impl PartialOrd for Datum {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Datum {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn partial_cmp(&self, other: &Datum) -> Option<Ordering> {
         use Datum::*;
+
         match (self, other) {
-            (Bigint(a), Bigint(b)) => a.cmp(b),
-            (Integer(a), Integer(b)) => a.cmp(b),
-            (SmallInt(a), SmallInt(b)) => a.cmp(b),
-            (Interval(a), Interval(b)) => a.cmp(b),
-            (Text(a), Text(b)) => a.cmp(b),
-            (Timestamp(a), Timestamp(b)) => a.cmp(b),
-            (TimestampTz(a), TimestampTz(b)) => a.cmp(b),
-            (Uuid(a), Uuid(b)) => a.cmp(b),
-            (Numeric(a), Numeric(b)) => a.cmp(b),
-            (Float(a), Float(b)) => a.cmp(b),
-            (Double(a), Double(b)) => a.cmp(b),
-            (Vector(a), Vector(b)) => a.cmp(b),
-            (Oid(a), Oid(b)) => a.cmp(b),
-            (Array(a), Array(b)) => a.cmp(b),
-            (Unknown(a), Unknown(b)) => a.cmp(b),
-            (Boolean(a), Boolean(b)) => a.cmp(b),
-            (Null, Null) => std::cmp::Ordering::Equal,
-            // For different variants, compare by their variant index
-            _ => {
-                fn variant_index(datum: &Datum) -> u8 {
-                    match datum {
-                        Datum::Bigint(_) => 0,
-                        Datum::Integer(_) => 1,
-                        Datum::SmallInt(_) => 2,
-                        Datum::Interval(_) => 3,
-                        Datum::Text(_) => 4,
-                        Datum::Timestamp(_) => 5,
-                        Datum::TimestampTz(_) => 6,
-                        Datum::Uuid(_) => 7,
-                        Datum::Numeric(_) => 8,
-                        Datum::Float(_) => 9,
-                        Datum::Double(_) => 10,
-                        Datum::Vector(_) => 11,
-                        Datum::Oid(_) => 12,
-                        Datum::Array(_) => 13,
-                        Datum::Unknown(_) => 14,
-                        Datum::Null => 15,
-                        Datum::Boolean(_) => 16,
-                    }
-                }
-                variant_index(self).cmp(&variant_index(other))
-            }
+            (Bigint(a), Bigint(b)) => a.partial_cmp(b),
+            (Bigint(_), _) | (_, Bigint(_)) => None,
+            (Integer(a), Integer(b)) => a.partial_cmp(b),
+            (Integer(_), _) | (_, Integer(_)) => None,
+            (SmallInt(a), SmallInt(b)) => a.partial_cmp(b),
+            (SmallInt(_), _) | (_, SmallInt(_)) => None,
+            (Interval(a), Interval(b)) => a.partial_cmp(b),
+            (Interval(_), _) | (_, Interval(_)) => None,
+            (Text(a), Text(b)) => a.partial_cmp(b),
+            (Text(_), _) | (_, Text(_)) => None,
+            (Timestamp(a), Timestamp(b)) => a.partial_cmp(b),
+            (Timestamp(_), _) | (_, Timestamp(_)) => None,
+            (TimestampTz(a), TimestampTz(b)) => a.partial_cmp(b),
+            (TimestampTz(_), _) | (_, TimestampTz(_)) => None,
+            (Uuid(a), Uuid(b)) => a.partial_cmp(b),
+            (Uuid(_), _) | (_, Uuid(_)) => None,
+            (Numeric(a), Numeric(b)) => a.partial_cmp(b),
+            (Numeric(_), _) | (_, Numeric(_)) => None,
+            (Float(a), Float(b)) => a.partial_cmp(b),
+            (Float(_), _) | (_, Float(_)) => None,
+            (Double(a), Double(b)) => a.partial_cmp(b),
+            (Double(_), _) | (_, Double(_)) => None,
+            (Vector(a), Vector(b)) => a.partial_cmp(b),
+            (Vector(_), _) | (_, Vector(_)) => None,
+            (Oid(a), Oid(b)) => a.partial_cmp(b),
+            (Oid(_), _) | (_, Oid(_)) => None,
+            (Array(a), Array(b)) => a.partial_cmp(b),
+            (Array(_), _) | (_, Array(_)) => None,
+            (Money(a), Money(b)) => a.partial_cmp(b),
+            (Money(_), _) | (_, Money(_)) => None,
+            (Inet(a), Inet(b)) => a.partial_cmp(b),
+            (Inet(_), _) | (_, Inet(_)) => None,
+            (Unknown(a), Unknown(b)) => a.partial_cmp(b),
+            (Unknown(_), _) | (_, Unknown(_)) => None,
+            (Boolean(a), Boolean(b)) => a.partial_cmp(b),
+            (Boolean(_), _) | (_, Boolean(_)) => None,
+            (Null, _) => None,
         }
     }
 }
@@ -165,6 +124,8 @@ impl ToDataRowColumn for Datum {
                 .encode(Format::Text)
                 .expect("array text encode should succeed for any decoded array")
                 .into(),
+            Money(money) => money.to_data_row_column(),
+            Inet(inet) => inet.to_data_row_column(),
             Unknown(bytes) => bytes.clone().into(),
             Null => Data::null(),
             Boolean(val) => val.to_data_row_column(),
@@ -172,24 +133,33 @@ impl ToDataRowColumn for Datum {
     }
 }
 
-impl Add for Datum {
-    type Output = Datum;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        use Datum::*;
-
-        match (self, rhs) {
-            (Bigint(a), Bigint(b)) => Bigint(a + b),
-            (Integer(a), Integer(b)) => Integer(a + b),
-            (SmallInt(a), SmallInt(b)) => SmallInt(a + b),
-            (Interval(a), Interval(b)) => Interval(a + b),
-            (Numeric(a), Numeric(b)) => Numeric(a + b),
-            (Float(a), Float(b)) => Float(crate::Float(a.0 + b.0)),
-            (Double(a), Double(b)) => Double(crate::Double(a.0 + b.0)),
-            (Datum::Null, b) => b,
-            (a, Datum::Null) => a,
-            _ => Datum::Null, // Might be good to raise an error.
+impl<T> From<Option<T>> for Datum
+where
+    Datum: From<T>,
+{
+    fn from(val: Option<T>) -> Self {
+        match val {
+            Some(v) => v.into(),
+            None => Datum::Null,
         }
+    }
+}
+
+impl From<i64> for Datum {
+    fn from(i: i64) -> Self {
+        Datum::Bigint(i)
+    }
+}
+
+impl From<f64> for Datum {
+    fn from(f: f64) -> Self {
+        Datum::Double(f.into())
+    }
+}
+
+impl From<Decimal> for Datum {
+    fn from(d: Decimal) -> Self {
+        Datum::Numeric(d.into())
     }
 }
 
@@ -219,6 +189,9 @@ impl Datum {
             DataType::SmallInt => Ok(Datum::SmallInt(i16::decode(bytes, encoding)?)),
             DataType::Oid => Ok(Datum::Oid(Oid::decode(bytes, encoding)?)),
             DataType::Bool => Ok(Datum::Boolean(bool::decode(bytes, encoding)?)),
+            DataType::Money => Ok(Datum::Money(Money::decode(bytes, encoding)?)),
+            DataType::Inet => Ok(Datum::Inet(Inet::decode(bytes, encoding)?)),
+            DataType::Cidr => Ok(Datum::Inet(Inet::decode(bytes, encoding)?.into_cidr())),
             DataType::Array(element_oid) => match Array::decode_typed(bytes, encoding, element_oid)
             {
                 Ok(array) => Ok(Datum::Array(array)),
@@ -250,8 +223,63 @@ impl Datum {
             Datum::Vector(v) => v.encode(format),
             Datum::Oid(o) => o.encode(format),
             Datum::Array(a) => a.encode(format),
+            Datum::Money(m) => m.encode(format),
+            Datum::Inet(i) => i.encode(format),
             Datum::Null => Ok(Bytes::new()),
             Datum::Unknown(bytes) => Ok(bytes.clone()),
+        }
+    }
+
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Datum::Bigint(..) => DataType::Bigint,
+            Datum::Integer(..) => DataType::Integer,
+            Datum::Uuid(..) => DataType::Uuid,
+            Datum::Text(..) => DataType::Text,
+            Datum::Boolean(..) => DataType::Bool,
+            Datum::Float(..) => DataType::Real,
+            Datum::Double(..) => DataType::DoublePrecision,
+            Datum::Numeric(..) => DataType::Numeric,
+            Datum::Timestamp(..) => DataType::Timestamp,
+            Datum::TimestampTz(..) => DataType::TimestampTz,
+            Datum::SmallInt(..) => DataType::SmallInt,
+            Datum::Interval(..) => DataType::Interval,
+            Datum::Vector(..) => DataType::Vector,
+            Datum::Oid(..) => DataType::Oid,
+            Datum::Array(a) => DataType::Array(a.element_oid),
+            Datum::Money(..) => DataType::Money,
+            Datum::Inet(inet) => inet.data_type(),
+            Datum::Null => DataType::Other(0),
+            Datum::Unknown(..) => DataType::Other(0),
+        }
+    }
+
+    pub fn as_i64(&self) -> Result<i64, Error> {
+        match *self {
+            Datum::Bigint(i) => Ok(i),
+            Datum::Integer(i) => Ok(i.into()),
+            Datum::SmallInt(i) => Ok(i.into()),
+            Datum::Float(f) => Ok(f.0 as i64),
+            Datum::Double(f) => Ok(f.0 as i64),
+            _ => Err(Error::InvalidCast {
+                from: self.data_type(),
+                to: DataType::Bigint,
+            }),
+        }
+    }
+
+    /// Orders numeric values of different widths the way PostgreSQL does.
+    /// Returns `None` if either side isn't numeric.
+    pub fn compare_numeric(&self, other: &Datum) -> Option<Ordering> {
+        Some(self.as_i128()?.cmp(&other.as_i128()?))
+    }
+
+    fn as_i128(&self) -> Option<i128> {
+        match self {
+            Datum::Bigint(value) => Some((*value).into()),
+            Datum::Integer(value) => Some((*value).into()),
+            Datum::SmallInt(value) => Some((*value).into()),
+            _ => None,
         }
     }
 }
@@ -277,6 +305,9 @@ pub enum DataType {
     Vector,
     /// Array type, carrying the element type OID.
     Array(i32),
+    Money,
+    Inet,
+    Cidr,
 }
 
 impl DataType {
@@ -289,8 +320,11 @@ impl DataType {
             23 => DataType::Integer,
             25 => DataType::Text,
             26 => DataType::Oid,
+            650 => DataType::Cidr,
             700 => DataType::Real,
             701 => DataType::DoublePrecision,
+            790 => DataType::Money,
+            869 => DataType::Inet,
             1043 => DataType::Text, // varchar
             1114 => DataType::Timestamp,
             1184 => DataType::TimestampTz,
@@ -298,6 +332,8 @@ impl DataType {
             1700 => DataType::Numeric,
             2950 => DataType::Uuid,
             // Array OIDs → Array(element_oid)
+            651 => DataType::Array(650),   // cidr[]
+            791 => DataType::Array(790),   // money[]
             1000 => DataType::Array(16),   // bool[]
             1005 => DataType::Array(21),   // int2[]
             1007 => DataType::Array(23),   // int4[]
@@ -307,6 +343,7 @@ impl DataType {
             1021 => DataType::Array(700),  // float4[]
             1022 => DataType::Array(701),  // float8[]
             1028 => DataType::Array(26),   // oid[]
+            1041 => DataType::Array(869),  // inet[]
             1115 => DataType::Array(1114), // timestamp[]
             1185 => DataType::Array(1184), // timestamptz[]
             1187 => DataType::Array(1186), // interval[]
@@ -317,17 +354,131 @@ impl DataType {
     }
 }
 
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        use DataType::*;
+        match self {
+            Bigint => write!(f, "bigint"),
+            Integer => write!(f, "integer"),
+            Text => write!(f, "text"),
+            Interval => write!(f, "interval"),
+            Timestamp => write!(f, "timestamp"),
+            TimestampTz => write!(f, "timestamptz"),
+            Real => write!(f, "real"),
+            DoublePrecision => write!(f, "double precision"),
+            Bool => write!(f, "boolean"),
+            SmallInt => write!(f, "smallint"),
+            TinyInt => write!(f, "tinyint"),
+            Numeric => write!(f, "numeric"),
+            Other(i) => write!(f, "unknown type {i}"),
+            Uuid => write!(f, "uuid"),
+            Oid => write!(f, "oid"),
+            Vector => write!(f, "vector"),
+            Array(i) => write!(f, "{}[]", Self::from_oid(*i)),
+            Money => write!(f, "money"),
+            Inet => write!(f, "inet"),
+            Cidr => write!(f, "cidr"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::{BufMut, BytesMut};
+    use std::assert_matches;
+
+    #[test]
+    fn test_compare_numeric_across_integer_widths() {
+        for (left, right, expected) in [
+            (Datum::Bigint(2), Datum::Integer(2), Ordering::Equal),
+            (Datum::Integer(2), Datum::SmallInt(3), Ordering::Less),
+            (Datum::SmallInt(3), Datum::Bigint(2), Ordering::Greater),
+            (
+                Datum::Bigint(i64::MAX),
+                Datum::Integer(i32::MAX),
+                Ordering::Greater,
+            ),
+        ] {
+            assert_eq!(left.compare_numeric(&right), Some(expected));
+        }
+
+        assert_eq!(
+            Datum::Text("2".into()).compare_numeric(&Datum::Integer(2)),
+            None
+        );
+        assert_eq!(Datum::Null.compare_numeric(&Datum::Integer(2)), None);
+    }
+
+    fn text_datum(oid: i32, value: &str) -> Datum {
+        Datum::new(
+            value.as_bytes(),
+            DataType::from_oid(oid),
+            Format::Text,
+            false,
+        )
+        .expect(value)
+    }
+
+    #[test]
+    fn test_money_inet_oids_decode_to_typed_datums() {
+        for (oid, value, data_type) in [
+            (790, "$5.00", DataType::Money),
+            (869, "10.0.0.10", DataType::Inet),
+            (650, "10.0.0.0/8", DataType::Cidr),
+            (791, "{$5.00}", DataType::Array(790)),
+            (1041, "{10.0.0.10}", DataType::Array(869)),
+            (651, "{10.0.0.0/8}", DataType::Array(650)),
+        ] {
+            assert_eq!(text_datum(oid, value).data_type(), data_type, "{value}");
+        }
+    }
+
+    #[test]
+    fn test_money_inet_data_row_column_is_original_text() {
+        for (oid, value) in [(790, "₹1,00,000.00"), (869, "10.0.0.1/32")] {
+            let column = text_datum(oid, value).to_data_row_column();
+            assert_eq!(column.data, Bytes::from(value));
+        }
+    }
+
+    #[test]
+    fn test_money_inet_do_not_compare_with_other_types() {
+        let money = text_datum(790, "$5.00");
+        let inet = text_datum(869, "10.0.0.1");
+        assert_eq!(money.partial_cmp(&Datum::Bigint(500)), None);
+        assert_eq!(inet.partial_cmp(&money), None);
+
+        for (data_type, name) in [
+            (DataType::Money, "money"),
+            (DataType::Inet, "inet"),
+            (DataType::Cidr, "cidr"),
+        ] {
+            assert_eq!(data_type.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn test_type_arrays_compare_elements_by_value() {
+        let larger = text_datum(791, r#"{"₹1,000.00"}"#);
+        let smaller = text_datum(791, "{₹5.00}");
+        assert_eq!(larger.partial_cmp(&smaller), Some(Ordering::Greater));
+
+        let larger = text_datum(1041, "{10.0.0.10}");
+        let smaller = text_datum(1041, "{9.0.0.1}");
+        assert_eq!(larger.partial_cmp(&smaller), Some(Ordering::Greater));
+        assert_eq!(
+            larger.encode(Format::Text).unwrap(),
+            Bytes::from_static(b"{10.0.0.10}")
+        );
+    }
 
     #[test]
     fn test_multidimensional_text_array_falls_back_to_unknown() {
         let input = b"{{1,2},{3,4}}";
         let datum = Datum::new(input, DataType::Array(23), Format::Text, false).unwrap();
 
-        assert!(matches!(datum, Datum::Unknown(_)));
+        assert_matches!(datum, Datum::Unknown(_));
         assert_eq!(
             datum.encode(Format::Text).unwrap(),
             Bytes::from_static(input)
@@ -353,7 +504,7 @@ mod tests {
         let input = buf.freeze();
         let datum = Datum::new(&input, DataType::Array(23), Format::Binary, false).unwrap();
 
-        assert!(matches!(datum, Datum::Unknown(_)));
+        assert_matches!(datum, Datum::Unknown(_));
         assert_eq!(datum.encode(Format::Binary).unwrap(), input);
     }
 }

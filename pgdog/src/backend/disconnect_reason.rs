@@ -1,18 +1,19 @@
 use std::fmt::Display;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub enum DisconnectReason {
+pub(crate) enum DisconnectReason {
     Idle,
     Old,
     Error,
     Offline,
     ForceClose,
-    Paused,
     ReplicationMode,
     OutOfSync,
     Unhealthy,
     Healthcheck,
-    PubSub,
+    CredentialsRefresh,
+    CredentialsCheck,
+    ServerClosed,
     #[default]
     Other,
 }
@@ -25,13 +26,14 @@ impl Display for DisconnectReason {
             Self::Error => "error",
             Self::Other => "other",
             Self::ForceClose => "force close",
-            Self::Paused => "pool paused",
             Self::Offline => "pool offline",
             Self::OutOfSync => "out of sync",
             Self::ReplicationMode => "in replication mode",
             Self::Unhealthy => "unhealthy",
             Self::Healthcheck => "standalone healthcheck",
-            Self::PubSub => "pub/sub",
+            Self::CredentialsRefresh => "credentials refresh",
+            Self::ServerClosed => "server closed",
+            Self::CredentialsCheck => "credentials check",
         };
 
         write!(f, "{}", reason)

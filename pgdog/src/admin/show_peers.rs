@@ -17,7 +17,7 @@ use super::prelude::*;
 
 use super::Command;
 
-pub struct ShowPeers;
+pub(crate) struct ShowPeers;
 
 #[async_trait]
 impl Command for ShowPeers {
@@ -33,12 +33,14 @@ impl Command for ShowPeers {
         let listener = Listener::get();
         let peers = listener.peers();
 
-        let mut rows = vec![RowDescription::new(&[
-            Field::text("addr"),
-            Field::text("last_seen"),
-            Field::numeric("clients"),
-        ])
-        .message()?];
+        let mut rows = vec![
+            RowDescription::new(&[
+                Field::text("addr"),
+                Field::text("last_seen"),
+                Field::numeric("clients"),
+            ])
+            .message(),
+        ];
 
         let now = SystemTime::now();
 
@@ -51,7 +53,7 @@ impl Command for ShowPeers {
                         .unwrap_or(Duration::from_secs(0))
                 ))
                 .add(state.clients);
-            rows.push(row.message()?);
+            rows.push(row.message());
         }
 
         Ok(rows)

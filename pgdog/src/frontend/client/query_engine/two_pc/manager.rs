@@ -1,69 +1,106 @@
 //! Global two-phase commit transaction manager.
+
+use arc_swap::ArcSwapOption;
 use fnv::FnvHashMap as HashMap;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
-use tokio::{select, spawn, sync::Notify, time::interval};
-use tracing::{debug, error, info};
+use tokio::{select, sync::Notify};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     backend::{
         databases::User,
         pool::{Connection, Request},
     },
-    frontend::{
-        client::query_engine::{
-            two_pc::{TwoPcGuard, TwoPcTransaction},
-            TwoPcPhase,
-        },
-        router::{
-            parser::{Shard, ShardWithPriority},
-            Route,
-        },
+    frontend::router::{
+        Route,
+        parser::{Shard, ShardWithPriority},
     },
+    tasks,
+    util::{safe_interval, safe_sleep},
 };
 
-use super::Error;
+use super::{
+    Error, TwoPcGuard, TwoPcPhase, TwoPcStats, TwoPcTransaction,
+    wal::{Recovery, TwoPcRecordIdentity, TwoPcRecordPhase, TwoPcRecordRemove, WalWriter},
+};
 
 static MANAGER: Lazy<Manager> = Lazy::new(Manager::init);
 static MAINTENANCE: Duration = Duration::from_millis(333);
 
 /// Two-phase commit transaction manager.
 #[derive(Debug, Clone)]
-pub struct Manager {
+pub(crate) struct Manager {
     inner: Arc<Mutex<Inner>>,
     notify: Arc<InnerNotify>,
+    stats: Arc<TwoPcStats>,
+    wal: Arc<ArcSwapOption<WalWriter>>,
 }
 
 impl Manager {
     /// Get transaction manager instance.
-    pub fn get() -> Self {
+    pub(crate) fn get() -> Self {
         MANAGER.clone()
     }
 
-    fn init() -> Self {
+    pub(super) fn init() -> Self {
         let manager = Self {
             inner: Arc::new(Mutex::new(Inner::default())),
             notify: Arc::new(InnerNotify {
                 notify: Notify::new(),
                 offline: AtomicBool::new(false),
-                done: Notify::new(),
+                done: CancellationToken::new(),
             }),
+            stats: Arc::new(TwoPcStats::default()),
+            wal: Arc::new(ArcSwapOption::empty()),
         };
 
         let monitor = manager.clone();
-        spawn(async move {
+        tasks::spawn("2pc monitor", async move {
             Self::monitor(monitor).await;
         });
 
         manager
+    }
+
+    /// Run recovery and enable the 2pc WAL writer.
+    ///
+    /// # Arguments
+    ///
+    /// - `wal_directory`: WAL directory.
+    /// - `checkpoint_interval`: How frequently to run the checkpointer. If `None`,
+    ///   the checkpointer is disabled.
+    /// - `segment_size`: Maximum size of a WAL segment. Soft limit.
+    ///
+    pub(crate) async fn enable_wal(
+        &self,
+        wal_directory: &PathBuf,
+        checkpoint_interval: Option<Duration>,
+        segment_size: usize,
+        fsync_interval: Duration,
+    ) -> Result<(), Error> {
+        let writer = Recovery::new(wal_directory)
+            .await?
+            .run(self, segment_size, fsync_interval)
+            .await?;
+
+        if let Some(checkpoint_interval) = checkpoint_interval {
+            writer.enable_checkpointer(self.clone(), checkpoint_interval);
+        }
+
+        self.wal.store(Some(Arc::new(writer)));
+
+        Ok(())
     }
 
     #[cfg(test)]
@@ -72,37 +109,150 @@ impl Manager {
     }
 
     /// Get all active two-phase transactions.
-    pub fn transactions(&self) -> HashMap<TwoPcTransaction, TransactionInfo> {
+    pub(crate) fn transactions(&self) -> HashMap<TwoPcTransaction, TransactionInfo> {
         self.inner.lock().transactions.clone()
     }
 
+    /// Process-level 2PC counters.
+    pub(crate) fn stats(&self) -> Arc<TwoPcStats> {
+        Arc::clone(&self.stats)
+    }
+
     /// Two-pc transaction finished.
-    pub(super) async fn done(&self, transaction: &TwoPcTransaction) -> Result<(), Error> {
-        self.remove(transaction).await;
+    pub(crate) async fn done(&self, transaction: TwoPcTransaction) -> Result<(), Error> {
+        if self.remove(transaction).is_some()
+            && let Some(wal) = self.wal.load_full()
+        {
+            wal.add(TwoPcRecordRemove { transaction }).await?;
+        }
 
         Ok(())
     }
 
-    /// Sync transaction state.
-    pub(super) async fn transaction_state(
+    /// Block until the monitor has removed this transaction from the manager.
+    /// The caller decides how long to wait.
+    ///
+    /// No-op if the transaction was never registered or is already gone.
+    pub(crate) async fn wait_until_cleaned_up(&self, transaction: TwoPcTransaction) {
+        while self.inner.lock().transactions.contains_key(&transaction) {
+            select! {
+                _ = self.notify.notify.notified() => {}
+                _ = safe_sleep(MAINTENANCE) => {}
+            }
+        }
+    }
+
+    /// Record a phase transition for a 2PC transaction.
+    ///
+    /// # Arguments
+    ///
+    /// - `transaction`: 2pc transaction.
+    /// - `identifer`: User/database where the transaction is being run.
+    /// - `phase`: Transaction phase, e.g., phase I or phase II.
+    ///
+    pub(crate) async fn transaction_state(
         &self,
-        transaction: &TwoPcTransaction,
+        transaction: TwoPcTransaction,
         identifier: &Arc<User>,
         phase: TwoPcPhase,
     ) -> Result<TwoPcGuard, Error> {
-        {
-            let mut guard = self.inner.lock();
-            let entry = guard.transactions.entry(*transaction).or_default();
-            entry.identifier = identifier.clone();
-            entry.phase = phase;
+        assert_ne!(
+            phase,
+            TwoPcPhase::Rollback,
+            "rollback is derived during recovery and is never written to the WAL"
+        );
+        self.set_transaction_state(transaction, identifier, phase);
+
+        if let Some(wal) = self.wal.load_full() {
+            if phase == TwoPcPhase::Phase1 {
+                wal.add(TwoPcRecordIdentity {
+                    transaction,
+                    identifier: identifier.clone(),
+                })
+                .await
+                .inspect_err(|_| {
+                    // remove from the inner state, since we haven't be able
+                    // to record the transaction anyway and the first phase
+                    // is already failed.
+                    self.remove(transaction);
+                })?;
+            } else {
+                wal.add(TwoPcRecordPhase::new(transaction)).await?;
+            }
         }
 
-        // TODO: Sync to durable backend.
-
         Ok(TwoPcGuard {
-            transaction: *transaction,
+            transaction,
             manager: Self::get(),
         })
+    }
+
+    /// Set the transaction state in memory.
+    ///
+    /// WAL is not updated. Used during recovery
+    /// and before writing the transaction to the WAL during
+    /// normal operations.
+    pub(super) fn set_transaction_state(
+        &self,
+        transaction: TwoPcTransaction,
+        identifier: &Arc<User>,
+        phase: TwoPcPhase,
+    ) {
+        self.inner
+            .lock()
+            .transactions
+            .entry(transaction)
+            .and_modify(|entry| {
+                entry.phase = phase;
+            })
+            .or_insert(TransactionInfo {
+                identifier: identifier.clone(),
+                phase,
+            });
+    }
+
+    /// Restore a transaction identity from the WAL. An identity record
+    /// establishes Phase 1; later records only update the phase.
+    pub(super) fn set_transaction_identity(
+        &self,
+        transaction: TwoPcTransaction,
+        identifier: &Arc<User>,
+    ) {
+        self.inner.lock().transactions.insert(
+            transaction,
+            TransactionInfo {
+                identifier: identifier.clone(),
+                phase: TwoPcPhase::Phase1,
+            },
+        );
+    }
+
+    /// Apply a phase transition restored from the WAL.
+    pub(super) fn set_transaction_phase(&self, transaction: TwoPcTransaction, phase: TwoPcPhase) {
+        if let Some(info) = self.inner.lock().transactions.get_mut(&transaction) {
+            info.phase = phase;
+        } else {
+            // BUG: checkpointer removed required segment!
+            warn!(
+                "[2pc] recovery skipping phase record without identity for transaction {}",
+                transaction
+            );
+        }
+    }
+
+    /// Enqueue all transactions into the cleanup manager.
+    ///
+    /// This is called by recovery only.
+    ///
+    pub(super) fn cleanup_all(&self) {
+        let mut guard = self.inner.lock();
+        for transaction in guard.transactions.keys().cloned().collect::<Vec<_>>() {
+            guard.queue.push_back(transaction);
+        }
+
+        guard.in_recovery = true;
+
+        self.notify.notify.notify_one();
     }
 
     pub(super) fn return_guard(&self, guard: &TwoPcGuard) {
@@ -119,7 +269,7 @@ impl Manager {
     }
 
     async fn monitor(manager: Self) {
-        let mut interval = interval(MAINTENANCE);
+        let mut interval = safe_interval(MAINTENANCE);
         let notify = manager.notify.clone();
 
         debug!("[2pc] monitor started");
@@ -132,45 +282,67 @@ impl Manager {
                 _ = notify.notify.notified() => (),
             }
 
-            let transaction = manager.inner.lock().queue.pop_front();
+            let transaction = {
+                let mut guard = manager.inner.lock();
+                let txn = guard.queue.pop_front();
+
+                if txn.is_none() && guard.in_recovery {
+                    guard.in_recovery = false; // Recovery is done.
+                }
+
+                txn
+            };
+
             if let Some(transaction) = transaction {
                 debug!(
                     r#"[2pc] cleaning up transaction "{}""#,
                     transaction.to_string()
                 );
-                if let Err(err) = manager.cleanup_phase(&transaction).await {
-                    error!(
-                        r#"[2pc] error cleaning up "{}" transaction: {}"#,
-                        transaction.to_string(),
-                        err
-                    );
+                match manager.cleanup_phase(transaction).await {
+                    Err(err) => {
+                        error!(
+                            r#"[2pc] error cleaning up "{}" transaction: {}"#,
+                            transaction.to_string(),
+                            err
+                        );
 
-                    // Retry again later.
-                    manager.inner.lock().queue.push_back(transaction);
-                } else {
-                    manager.remove(&transaction).await;
+                        // Retry again later.
+                        manager.inner.lock().queue.push_back(transaction);
+                    }
+                    _ => {
+                        manager.done(transaction).await.unwrap();
+                    }
                 }
 
                 notify.notify.notify_one();
             } else if notify.offline.load(Ordering::Relaxed) {
                 // No more transactions to cleanup.
-                notify.done.notify_waiters();
+                notify.done.cancel();
+
+                if let Some(wal) = manager.wal.load_full() {
+                    wal.shutdown();
+                }
+
                 break;
             }
         }
     }
 
-    async fn remove(&self, transaction: &TwoPcTransaction) {
-        self.inner.lock().transactions.remove(transaction);
-        // TODO: sync to durable stage manager here.
+    pub(super) fn remove(&self, transaction: TwoPcTransaction) -> Option<TransactionInfo> {
+        self.inner.lock().transactions.remove(&transaction)
     }
 
-    /// Reconnect to cluster if available and rollback the two-phase transaction.
-    async fn cleanup_phase(&self, transaction: &TwoPcTransaction) -> Result<(), Error> {
-        let state = if let Some(state) = self.inner.lock().transactions.get(transaction).cloned() {
-            state
-        } else {
-            return Ok(());
+    /// Reconnect to cluster if available and close the two-phase transaction.
+    async fn cleanup_phase(&self, transaction: TwoPcTransaction) -> Result<(), Error> {
+        let (state, in_recovery) = {
+            let guard = self.inner.lock();
+            let state = guard.transactions.get(&transaction).cloned();
+
+            if let Some(state) = state {
+                (state, guard.in_recovery)
+            } else {
+                return Ok(());
+            }
         };
 
         let phase = match state.phase {
@@ -179,6 +351,17 @@ impl Manager {
             // Phase 2 gets committed.
             phase => phase,
         };
+
+        info!(
+            "[2pc] {} {} transaction {}",
+            if in_recovery { "recovery" } else { "manager" },
+            if phase == TwoPcPhase::Rollback {
+                "rolling back"
+            } else {
+                "committing"
+            },
+            transaction
+        );
 
         let mut connection =
             match Connection::new(&state.identifier.user, &state.identifier.database, false) {
@@ -196,42 +379,51 @@ impl Manager {
         connection
             .connect(
                 &Request::default(),
-                &Route::write(ShardWithPriority::new_override_transaction(Shard::All)),
+                &Route::write(ShardWithPriority::new_override_cross_shard(Shard::All)),
             )
             .await?;
-        connection.two_pc(&transaction.to_string(), phase).await?;
+        connection.two_pc(transaction, phase, true).await?;
         connection.disconnect();
 
         Ok(())
     }
 
     /// Shutdown manager and wait for all transactions to be cleaned up.
-    pub async fn shutdown(&self) {
-        let waiter = self.notify.done.notified();
+    /// Once the monitor has drained the cleanup queue, the WAL is shut
+    /// down too so any final End records make it to disk before exit.
+    pub(crate) async fn shutdown(&self) {
+        if self.notify.done.is_cancelled() {
+            return;
+        }
+
         self.notify.offline.store(true, Ordering::Relaxed);
+        self.notify.notify.notify_one();
         let transactions = self.inner.lock().queue.len();
 
-        info!("cleaning up {} two-phase transactions", transactions);
+        if transactions > 0 {
+            info!("[2pc] finishing {transactions} two-phase transactions");
+        }
 
-        waiter.await;
+        self.notify.done.cancelled().await;
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct TransactionInfo {
-    pub phase: TwoPcPhase,
-    pub identifier: Arc<User>,
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct TransactionInfo {
+    pub(crate) phase: TwoPcPhase,
+    pub(crate) identifier: Arc<User>,
 }
 
 #[derive(Default, Debug)]
 struct Inner {
     transactions: HashMap<TwoPcTransaction, TransactionInfo>,
     queue: VecDeque<TwoPcTransaction>,
+    in_recovery: bool,
 }
 
 #[derive(Debug)]
 struct InnerNotify {
     notify: Notify,
     offline: AtomicBool,
-    done: Notify,
+    done: CancellationToken,
 }

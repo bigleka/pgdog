@@ -15,18 +15,18 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::{config::config, frontend::router::parser::OwnedTable, net::Parameters};
+use crate::{config::config, parameters::ParameterStore, result_cache::tables::OwnedTable};
 
 use super::{
+    CacheableRequest, ResultCacheKey,
     connection::{Connection, Limits, Target},
     entry::Entry,
     singleflight::Singleflight,
-    ttl, xfetch, CacheableRequest, ResultCacheKey,
+    ttl, xfetch,
 };
 
 #[derive(Debug, Clone)]
 pub struct ResultCacheConfig {
-    pub enabled: bool,
     pub target: Target,
     /// How long to skip the cache once Redis is unavailable.
     pub unavailable_backoff: Duration,
@@ -53,7 +53,6 @@ impl ResultCacheConfig {
         }
 
         Some(Self {
-            enabled: rc.enabled,
             target: Target {
                 limits: limits(&rc),
                 ..Target::new(
@@ -205,10 +204,11 @@ impl RedisResultCache {
             {
                 return Some(());
             }
-            if let Some((at, target)) = &shared.failed {
-                if target == &cfg.target && at.elapsed() < cfg.unavailable_backoff {
-                    return None;
-                }
+            if let Some((at, target)) = &shared.failed
+                && target == &cfg.target
+                && at.elapsed() < cfg.unavailable_backoff
+            {
+                return None;
             }
         }
 
@@ -341,7 +341,7 @@ impl RedisResultCache {
         &self,
         db: &str,
         user: &str,
-        params: &Parameters,
+        params: &ParameterStore,
         req: &CacheableRequest,
     ) -> Option<ResultCacheKey> {
         let cfg = ResultCacheConfig::from_global_config()?;
@@ -355,7 +355,7 @@ impl RedisResultCache {
         // Session signature (conservative MVP):
         // include search_path and role-ish identity (user already included).
         let search_path = params
-            .get("search_path")
+            .search_path()
             .map(|v| v.to_string())
             .unwrap_or_default();
         let session_sig = format!("{:x}", md5::compute(format!("search_path={}", search_path)));
@@ -484,12 +484,8 @@ impl RedisResultCache {
 
         let res: redis::RedisResult<()> = match key.ttl {
             Some(ttl) if ttl > Duration::ZERO => {
-                conn.set_ex(
-                    &key.redis_key,
-                    final_payload.as_slice(),
-                    ttl.as_secs() as u64,
-                )
-                .await
+                conn.set_ex(&key.redis_key, final_payload.as_slice(), ttl.as_secs())
+                    .await
             }
             _ => conn.set(&key.redis_key, final_payload.as_slice()).await,
         };
@@ -730,8 +726,8 @@ mod test {
 
     use redis::{ErrorKind, RedisError, ServerErrorKind};
 
-    use super::{decrypt, encrypt, makes_unavailable, ResultCacheConfig};
-    use crate::config::{set, ConfigAndUsers};
+    use super::{ResultCacheConfig, decrypt, encrypt, makes_unavailable};
+    use crate::config::{ConfigAndUsers, set};
 
     #[test]
     fn test_redis_limits_come_from_config() {
@@ -794,9 +790,11 @@ mod test {
     #[test]
     fn test_encrypted_value_hides_the_plaintext() {
         let encrypted = encrypt("key", PLAINTEXT).unwrap();
-        assert!(!encrypted
-            .windows(PLAINTEXT.len())
-            .any(|window| window == PLAINTEXT));
+        assert!(
+            !encrypted
+                .windows(PLAINTEXT.len())
+                .any(|window| window == PLAINTEXT)
+        );
     }
 
     /// A fresh nonce each time: the same value never encrypts the same way twice.

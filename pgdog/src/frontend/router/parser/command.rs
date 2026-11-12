@@ -1,47 +1,64 @@
 use super::*;
 use crate::{
-    frontend::{client::TransactionType, BufferedQuery},
+    frontend::{BufferedQuery, client::TransactionType},
     net::parameter::ParameterValue,
 };
 use lazy_static::lazy_static;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetParam {
-    pub name: String,
-    pub value: ParameterValue,
-    pub local: bool,
-    pub reset: bool,
+pub(crate) struct SetParam {
+    pub(crate) name: String,
+    pub(crate) value: Option<ParameterValue>,
+    pub(crate) local: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscardTarget {
+    All,
+    Plans,
+    Sequences,
+    Temp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnlistenTarget {
+    Channel(String),
+    All,
+}
+
+/// Query parser result.
 #[derive(Debug, Clone)]
-pub enum Command {
+pub(crate) enum Command {
     Query(Route),
-    Copy(Box<CopyParser>),
+    Copy {
+        copy: Box<CopyParser>,
+        route: Route,
+    },
     StartTransaction {
         query: BufferedQuery,
         transaction_type: TransactionType,
-        extended: bool,
         route: Route,
     },
     CommitTransaction {
-        extended: bool,
+        route: Route,
     },
     RollbackTransaction {
-        extended: bool,
+        route: Route,
     },
-    ReplicationMeta,
     Set {
         params: Vec<SetParam>,
         route: Route,
+        set_config: bool,
     },
+    Split(#[allow(unused)] Vec<String>),
     ResetAll,
-    PreparedStatement(Prepare),
     InternalField {
         name: String,
         value: String,
     },
     Deallocate,
     Discard {
+        target: DiscardTarget,
         extended: bool,
     },
     Listen {
@@ -53,12 +70,12 @@ pub enum Command {
         payload: String,
         shard: Shard,
     },
-    Unlisten(String),
+    Unlisten(UnlistenTarget),
     UniqueId,
 }
 
 impl Command {
-    pub fn route(&self) -> &Route {
+    pub(crate) fn route(&self) -> &Route {
         lazy_static! {
             static ref DEFAULT_ROUTE: Route =
                 Route::write(ShardWithPriority::new_default_unset(Shard::All));
@@ -68,6 +85,9 @@ impl Command {
             Self::Query(route) => route,
             Self::Set { route, .. } => route,
             Self::StartTransaction { route, .. } => route,
+            Self::Copy { route, .. } => route,
+            Self::CommitTransaction { route, .. } => route,
+            Self::RollbackTransaction { route, .. } => route,
             _ => &DEFAULT_ROUTE,
         }
     }
@@ -81,50 +101,15 @@ impl Default for Command {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SetVal {
-    Integer(i64),
-    Boolean(bool),
-    String(String),
-}
-
-impl From<String> for SetVal {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<i32> for SetVal {
-    fn from(value: i32) -> Self {
-        Self::Integer(value as i64)
-    }
-}
-
-impl From<bool> for SetVal {
-    fn from(value: bool) -> Self {
-        Self::Boolean(value)
-    }
-}
-
-impl std::fmt::Display for SetVal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SetVal::String(s) => write!(f, "{}", s),
-            SetVal::Integer(i) => write!(f, "{}", i),
-            SetVal::Boolean(b) => write!(f, "{}", b),
-        }
-    }
-}
-
 impl Command {
     pub(crate) fn dry_run(self) -> Self {
         match self {
             Command::Query(mut query) => {
-                query.set_shard_mut(ShardWithPriority::new_override_dry_run(Shard::Direct(0)));
+                query.set_shard(ShardWithPriority::new_override_dry_run(Shard::Direct(0)));
                 Command::Query(query)
             }
 
-            Command::Copy(_) => Command::Query(Route::write(
+            Command::Copy { .. } => Command::Query(Route::write(
                 ShardWithPriority::new_override_dry_run(Shard::Direct(0)),
             )),
             _ => self,

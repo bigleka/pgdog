@@ -4,7 +4,7 @@ use super::{
 };
 use crate::util::instance_id;
 
-pub struct ShowInstanceId;
+pub(crate) struct ShowInstanceId;
 
 #[async_trait]
 impl Command for ShowInstanceId {
@@ -21,8 +21,8 @@ impl Command for ShowInstanceId {
         dr.add(instance_id());
 
         Ok(vec![
-            RowDescription::new(&[Field::text("instance_id")]).message()?,
-            dr.message()?,
+            RowDescription::new(&[Field::text("instance_id")]).message(),
+            dr.message(),
         ])
     }
 }

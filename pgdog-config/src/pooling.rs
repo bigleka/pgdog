@@ -4,10 +4,10 @@ use std::str::FromStr;
 
 /// prepared statement support mode.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#prepared_statements
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#prepared_statements>
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Copy, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PreparedStatements {
+pub enum PreparedStatementsLevel {
     /// Prepared statements are disabled.
     Disabled,
     /// Handles prepared statements sent normally using the extended protocol (default).
@@ -19,21 +19,30 @@ pub enum PreparedStatements {
     Full,
 }
 
-impl PreparedStatements {
+impl PreparedStatementsLevel {
     pub fn full(&self) -> bool {
-        matches!(self, PreparedStatements::Full)
+        matches!(self, PreparedStatementsLevel::Full)
     }
 
     pub fn enabled(&self) -> bool {
-        !matches!(self, PreparedStatements::Disabled)
+        !matches!(self, PreparedStatementsLevel::Disabled)
     }
 
     pub fn rewrite_anonymous(&self) -> bool {
-        matches!(self, PreparedStatements::ExtendedAnonymous)
+        matches!(self, PreparedStatementsLevel::ExtendedAnonymous)
+    }
+
+    pub fn handles_extended(&self) -> bool {
+        matches!(
+            self,
+            PreparedStatementsLevel::Extended
+                | PreparedStatementsLevel::ExtendedAnonymous
+                | PreparedStatementsLevel::Full
+        )
     }
 }
 
-impl FromStr for PreparedStatements {
+impl FromStr for PreparedStatementsLevel {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -49,7 +58,7 @@ impl FromStr for PreparedStatements {
 
 /// connection pooling mode for database pools.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#pooler_mode
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#pooler_mode>
 #[derive(
     Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, Ord, PartialOrd, JsonSchema,
 )]
@@ -92,7 +101,7 @@ impl FromStr for PoolerMode {
 
 /// controls if server connections are recovered or dropped if a client abruptly disconnects.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/general/#connection_recovery
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/general/#connection_recovery>
 #[derive(
     Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, Ord, PartialOrd, JsonSchema,
 )]

@@ -8,6 +8,15 @@ set -euo pipefail
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 REPO_ROOT="$( cd "${SCRIPT_DIR}/../.." && pwd )"
 
+# Update the runner image PostgresSQL version to 18.
+if [[ -z "${PSQL_VERSION:-}" ]] && ! dpkg -s postgresql-18 >/dev/null 2>&1; then
+    for cluster in /etc/postgresql/*/main; do
+        [[ -d "$cluster" ]] || continue
+        sudo pg_dropcluster --stop "$(basename "$(dirname "$cluster")")" main
+    done
+    sudo apt-get install -y --no-install-recommends postgresql-18
+fi
+
 # Use whatever pg cluster is installed on the runner unless overridden.
 if [[ -z "${PSQL_VERSION:-}" ]]; then
     PSQL_VERSION=$(ls -d /etc/postgresql/*/main 2>/dev/null \
@@ -30,7 +39,12 @@ done
 sudo pg_ctlcluster "$PSQL_VERSION" main start
 
 # Result cache tests: standalone Redis, Redis Cluster, Sentinel and twemproxy.
+bash "${SCRIPT_DIR}/apt.sh" redis-server redis-sentinel redis-tools nutcracker
 bash "${REPO_ROOT}/integration/ci/redis-topologies.sh"
+sudo -u postgres psql \
+    -c "ALTER SYSTEM SET fsync TO off" \
+    -c "ALTER SYSTEM SET full_page_writes TO off" \
+    -c "SELECT pg_reload_conf()"
 
 USER_NAME="$(id -un)"
 sudo -u postgres createuser --superuser --login "$USER_NAME"
@@ -38,8 +52,8 @@ sudo -u postgres createdb "$USER_NAME"
 
 # asyncpg's type introspection query costs above jit_above_cost, and JIT
 # makes it about 100x slower on a cold backend (100 ms vs 1 ms locally).
-# On busy 2-vCPU runners that exceeds the 2 s query_timeout. Takes effect
-# on new connections, no restart needed.
+# On busy runners that exceeds the 2 s query_timeout. Takes effect on new
+# connections, no restart needed.
 psql -d postgres -c "ALTER SYSTEM SET jit TO off" -c "SELECT pg_reload_conf()"
 
 bash "${REPO_ROOT}/integration/setup.sh" \

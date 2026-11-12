@@ -3,25 +3,29 @@
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::fmt::Display;
+use std::time::Duration;
 
-use crate::backend::{stats::Counts as BackendCounts, Server};
 use crate::backend::{ConnectReason, DisconnectReason};
-use crate::net::messages::BackendKeyData;
+use crate::backend::{Server, stats::Counts as BackendCounts};
+use crate::net::messages::{BackendKeyData, BackendPid, FrontendPid};
 
+use fnv::FnvHashSet;
+use pgdog_config::Role;
+use pgdog_stats::RoleSpecificConfig;
 use tokio::time::Instant;
 
-use super::{
-    lsn_monitor::ReplicaLag, Config, Error, Mapping, Oids, Pool, Request, Stats, Taken, Waiter,
-};
+use super::{Config, Error, Pool, Request, Stats, Taken, Waiter, lsn_monitor::ReplicaLag};
 
 /// Pool internals protected by a mutex.
 #[derive(Default)]
 pub(super) struct Inner {
     /// Idle server connections.
     #[allow(clippy::vec_box)]
-    idle_connections: Vec<Box<Server>>,
+    idle_connections: VecDeque<Box<Server>>,
     /// Server connections currently checked out.
     taken: Taken,
+    /// Backends being cancelled.
+    cancelled: FnvHashSet<i32>,
     /// Pool configuration.
     pub(super) config: Config,
     /// Number of clients waiting for a connection.
@@ -41,8 +45,6 @@ pub(super) struct Inner {
     pub(super) errors: usize,
     /// Stats
     pub(super) stats: Stats,
-    /// OIDs.
-    pub(super) oids: Option<Oids>,
     /// The pool has been changed and connections should be returned
     /// to the new pool.
     moved: Option<Pool>,
@@ -50,6 +52,11 @@ pub(super) struct Inner {
     id: u64,
     /// Replica lag.
     pub(super) replica_lag: ReplicaLag,
+    /// Bumped each time Vault credentials rotate. Connections stamped with
+    /// an older generation are closed on check-in rather than reused.
+    pub(super) credentials_generation: u64,
+    /// Pool role.
+    pub(super) role: Role,
 }
 
 impl std::fmt::Debug for Inner {
@@ -68,8 +75,9 @@ impl Inner {
     /// New inner structure.
     pub(super) fn new(config: Config, id: u64) -> Self {
         Self {
-            idle_connections: Vec::new(),
+            idle_connections: Default::default(),
             taken: Taken::default(),
+            cancelled: Default::default(),
             config,
             waiting: VecDeque::new(),
             online: false,
@@ -79,57 +87,81 @@ impl Inner {
             re_synced: 0,
             errors: 0,
             stats: Stats::default(),
-            oids: None,
             moved: None,
             id,
             replica_lag: ReplicaLag::default(),
+            credentials_generation: 0,
+            role: Role::Auto,
         }
     }
     /// Total number of connections managed by the pool.
-    #[inline]
     pub(super) fn total(&self) -> usize {
         self.idle() + self.checked_out()
     }
 
     /// The pool is full and will not
     /// create any more connections.
-    #[inline]
     pub(super) fn full(&self) -> bool {
         self.total() >= self.max()
     }
 
     /// Number of idle connections in the pool.
-    #[inline]
     pub(super) fn idle(&self) -> usize {
         self.idle_connections.len()
     }
 
     #[cfg(test)]
-    pub(super) fn idle_conns(&self) -> &[Box<Server>] {
+    pub(super) fn idle_conns(&self) -> &VecDeque<Box<Server>> {
         &self.idle_connections
     }
 
     /// Number of connections checked out of the pool
     /// by clients.
-    #[inline]
     pub(super) fn checked_out(&self) -> usize {
         self.taken.len()
     }
 
-    /// Get backend IDs for all currently checked out servers.
-    pub(super) fn checked_out_server_ids(&self) -> Vec<BackendKeyData> {
-        self.taken.servers()
+    /// Number of checked-out connections currently pinned to their client.
+    pub(super) fn count_locked_connections(&self) -> usize {
+        self.taken.locked_count()
     }
 
-    /// Find the server currently linked to this client, if any.
-    #[inline]
-    pub(super) fn peer(&self, client_id: &BackendKeyData) -> Option<BackendKeyData> {
-        self.taken.server(client_id)
+    /// Mark a checked-out backend as pinned (or release the pin)
+    pub(super) fn set_locked(&mut self, backend: BackendPid, locked: bool) {
+        self.taken.set_locked(backend, locked);
+    }
+
+    /// Cancel key for the server currently assigned to this client.
+    pub(super) fn cancel_key(&mut self, client: FrontendPid) -> Option<&BackendKeyData> {
+        let key = self.taken.cancel_key(client);
+        if let Some(key) = key {
+            // Only allow cancellation if there isn't one running already.
+            let new = self.cancelled.insert(key.pid);
+            if new { Some(key) } else { None }
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn cancel_done(&mut self, pid: &i32) {
+        self.cancelled.remove(pid);
+        let conn = self
+            .idle_connections
+            .iter()
+            .position(|conn| conn.id().pid == *pid);
+        if let Some(conn) = conn {
+            let conn = self.idle_connections.remove(conn).unwrap();
+            self.put(conn, Instant::now());
+        }
+    }
+
+    /// All cancel keys for currently checked-out server connections.
+    pub(super) fn cancel_keys(&self) -> impl Iterator<Item = &BackendKeyData> {
+        self.taken.cancel_keys()
     }
 
     /// How many connections can be removed from the pool
     /// without affecting the minimum connection requirement.
-    #[inline]
     pub(super) fn can_remove(&self) -> usize {
         let total = self.total() as i64;
         let min = self.min() as i64;
@@ -138,19 +170,36 @@ impl Inner {
     }
 
     /// Minimum number of connections the pool should keep open.
-    #[inline]
     pub(super) fn min(&self) -> usize {
-        self.config.min
+        RoleSpecificConfig {
+            value: self.config.min,
+            value_primary: self.config.min_primary,
+            value_replica: self.config.min_replica,
+        }
+        .value(self.role)
     }
 
     /// Maximum number of connections in the pool.
-    #[inline]
     pub(super) fn max(&self) -> usize {
-        self.config.max
+        RoleSpecificConfig {
+            value: self.config.max,
+            value_primary: self.config.max_primary,
+            value_replica: self.config.max_replica,
+        }
+        .value(self.role)
+    }
+
+    /// Close connections that have been idle for longer than this.
+    pub(super) fn idle_timeout(&self) -> Duration {
+        RoleSpecificConfig {
+            value: self.config.idle_timeout,
+            value_primary: self.config.idle_timeout_primary,
+            value_replica: self.config.idle_timeout_replica,
+        }
+        .value(self.role)
     }
 
     /// The pool should create more connections now.
-    #[inline]
     pub(super) fn should_create(&self) -> ShouldCreate {
         let below_min = self.total() < self.min();
         let below_max = self.total() < self.max();
@@ -180,14 +229,13 @@ impl Inner {
     }
 
     /// Close connections that have exceeded the max age.
-    #[inline]
     pub(crate) fn close_old(&mut self, now: Instant) -> usize {
-        let max_age = self.config.max_age;
+        let base_max_age = self.config.max_age;
         let mut removed = 0;
 
         self.idle_connections.retain_mut(|c| {
             let age = c.age(now);
-            let keep = age < max_age;
+            let keep = age < c.effective_max_age(base_max_age);
             if !keep {
                 removed += 1;
             }
@@ -202,10 +250,9 @@ impl Inner {
 
     /// Close connections that have been idle for too long
     /// without affecting the minimum pool size requirement.
-    #[inline]
     pub(crate) fn close_idle(&mut self, now: Instant) -> usize {
         let (mut remove, mut removed) = (self.can_remove(), 0);
-        let idle_timeout = self.config.idle_timeout;
+        let idle_timeout = self.idle_timeout();
 
         self.idle_connections.retain_mut(|c| {
             let idle_for = c.idle_for(now);
@@ -229,59 +276,96 @@ impl Inner {
     }
 
     /// Pool configuration options.
-    #[inline]
     pub(super) fn config(&self) -> &Config {
         &self.config
     }
 
     /// Take connection from the idle pool.
-    #[inline(always)]
     pub(super) fn take(&mut self, request: &Request) -> Result<Option<Box<Server>>, Error> {
-        if let Some(conn) = self.idle_connections.pop() {
-            self.taken.take(&Mapping {
-                client: request.id,
-                server: *(conn.id()),
-            })?;
-
-            Ok(Some(conn))
-        } else {
-            Ok(None)
+        let conn = self.take_idle();
+        if let Some(ref conn) = conn {
+            self.taken.take(request.id, conn.id(), conn.key().clone());
         }
+        Ok(conn)
+    }
+
+    /// Remove an idle connection that is not being cancelled.
+    fn take_idle(&mut self) -> Option<Box<Server>> {
+        let max = self.idle_connections.len();
+
+        for _ in 0..max {
+            match self.idle_connections.pop_back() {
+                Some(conn) => {
+                    if self.cancelled.contains(&conn.id().pid) {
+                        // Push the connection to the front of the queue,
+                        // so it's less likely to be picked by the next client.
+                        self.idle_connections.push_front(conn);
+                        continue;
+                    }
+
+                    return Some(conn);
+                }
+                _ => return None,
+            }
+        }
+
+        None
+    }
+
+    /// Register a waiter and assign available connections under the same lock.
+    pub(super) fn add_waiter(&mut self, waiter: Waiter, now: Instant) -> Result<(), Error> {
+        self.waiting.push_back(waiter);
+        while !self.waiting.is_empty() {
+            let Some(conn) = self.take_idle() else {
+                break;
+            };
+            self.put(conn, now);
+        }
+        Ok(())
     }
 
     /// Place connection back into the pool
     /// or give it to a waiting client.
-    #[inline]
-    pub(super) fn put(&mut self, mut conn: Box<Server>, now: Instant) -> Result<(), Error> {
+    pub(super) fn put(&mut self, mut conn: Box<Server>, now: Instant) {
         // Try to give it to a client that's been waiting, if any.
-        let id = *conn.id();
-        while let Some(waiter) = self.waiting.pop_front() {
-            if let Err(conn_ret) = waiter.tx.send(Ok(conn)) {
-                conn = conn_ret.unwrap(); // SAFETY: We sent Ok(conn), we'll get back Ok(conn) if channel is closed.
-            } else {
-                self.taken.take(&Mapping {
-                    server: id,
-                    client: waiter.request.id,
-                })?;
-                self.stats.counts.server_assignment_count += 1;
-                self.stats.counts.wait_time += now.duration_since(waiter.request.created_at);
-                return Ok(());
+        let cancel_key = conn.key().clone();
+        let server_id = conn.id();
+        let cancelled = self.cancelled.contains(&conn.id().pid);
+
+        while !cancelled && let Some(waiter) = self.waiting.pop_front() {
+            match waiter.tx.send(Ok(conn)) {
+                Err(conn_ret) => {
+                    conn = conn_ret.unwrap(); // SAFETY: We sent Ok(conn), we'll get back Ok(conn) if channel is closed.
+                }
+                _ => {
+                    self.taken.take(waiter.request.id, server_id, cancel_key);
+                    self.stats.counts.server_assignment_count += 1;
+                    self.stats.counts.wait_time += now.duration_since(waiter.request.created_at);
+                    return;
+                }
             }
         }
 
         // No waiters, put connection in idle list.
-        self.idle_connections.push(conn);
-
-        Ok(())
+        self.idle_connections.push_back(conn);
     }
 
-    #[inline]
     pub(super) fn set_taken(&mut self, taken: Taken) {
         self.taken = taken;
     }
 
+    pub(super) fn credentials_generation(&self) -> u64 {
+        self.credentials_generation
+    }
+
+    /// Rotate credentials generation: evict all idle connections and bump the
+    /// counter so checked-out connections are closed on check-in.
+    pub(super) fn bump_credentials_generation(&mut self) {
+        self.credentials_generation += 1;
+        self.dump_idle();
+    }
+
     /// Dump all idle connections.
-    #[inline]
     pub(super) fn dump_idle(&mut self) {
         for conn in &mut self.idle_connections {
             conn.disconnect_reason(DisconnectReason::Offline);
@@ -291,15 +375,15 @@ impl Inner {
 
     /// Take all idle connections and tell active ones to
     /// be returned to a different pool instance.
-    #[inline]
     #[allow(clippy::vec_box)] // Server is a very large struct, reading it when moving between containers is expensive.
-    pub(super) fn move_conns_to(&mut self, destination: &Pool) -> (Vec<Box<Server>>, Taken) {
+    pub(super) fn move_conns_to(&mut self, destination: &Pool) -> (VecDeque<Box<Server>>, Taken) {
         self.moved = Some(destination.clone());
         let mut idle = std::mem::take(&mut self.idle_connections);
         let taken = std::mem::take(&mut self.taken);
 
         for conn in idle.iter_mut() {
             conn.stats_mut().set_pool_id(destination.id());
+            conn.replace_oids(&destination.inner().oids)
         }
 
         (idle, taken)
@@ -309,7 +393,6 @@ impl Inner {
     /// Otherwise, drop the connection and close it.
     ///
     /// Return: true if the pool should be banned, false otherwise.
-    #[inline(always)]
     pub(super) fn maybe_check_in(
         &mut self,
         mut server: Box<Server>,
@@ -328,6 +411,7 @@ impl Inner {
             if moved.id() != self.id {
                 server.stats_mut().set_pool_id(moved.id());
                 server.stats().update();
+                server.replace_oids(&moved.inner().oids);
                 moved.lock().maybe_check_in(server, now, stats, true)?;
                 return Ok(result);
             }
@@ -354,15 +438,22 @@ impl Inner {
         }
 
         // Close connections exceeding max age.
-        if server.age(now) >= self.config.max_age {
+        if server.age(now) >= server.effective_max_age(self.config.max_age) {
             server.disconnect_reason(DisconnectReason::Old);
             return Ok(result);
         }
 
         // Force close the connection.
-        if server.force_close() {
+        if server.is_force_close() {
             self.force_close += 1;
             server.disconnect_reason(DisconnectReason::ForceClose);
+            return Ok(result);
+        }
+
+        // Vault credentials rotated while this connection was checked out.
+        // The old role will be revoked; close rather than reuse.
+        if server.credentials_generation() != self.credentials_generation {
+            server.disconnect_reason(DisconnectReason::CredentialsRefresh);
             return Ok(result);
         }
 
@@ -381,7 +472,7 @@ impl Inner {
         // Finally, if the server is ok,
         // place the connection back into the idle list.
         if server.can_check_in() {
-            self.put(server, now)?;
+            self.put(server, now);
             result.replenish = false;
         } else {
             self.out_of_sync += 1;
@@ -395,30 +486,35 @@ impl Inner {
     ///
     /// This happens if the waiter timed out, e.g. checkout timeout,
     /// or the caller got cancelled.
-    #[inline]
-    pub(super) fn remove_waiter(&mut self, id: &BackendKeyData) {
-        if let Some(waiter) = self.waiting.pop_front() {
-            if waiter.request.id != *id {
-                // Put me back.
-                self.waiting.push_front(waiter);
+    pub(super) fn remove_waiter(&mut self, id: FrontendPid) {
+        if let Some(waiter) = self.waiting.pop_front()
+            && waiter.request.id != id
+        {
+            // Put me back.
+            self.waiting.push_front(waiter);
 
-                // Slow search, but we should be somewhere towards the front
-                // if the runtime is doing scheduling correctly.
-                for (i, waiter) in self.waiting.iter().enumerate() {
-                    if waiter.request.id == *id {
-                        self.waiting.remove(i);
-                        break;
-                    }
+            // Slow search, but we should be somewhere towards the front
+            // if the runtime is doing scheduling correctly.
+            for (i, waiter) in self.waiting.iter().enumerate() {
+                if waiter.request.id == id {
+                    self.waiting.remove(i);
+                    break;
                 }
             }
         }
     }
 
-    #[inline]
     pub(super) fn close_waiters(&mut self, err: Error) {
         for waiter in self.waiting.drain(..) {
             let _ = waiter.tx.send(Err(err));
         }
+    }
+
+    pub(super) fn set_role(&mut self, role: Role) -> bool {
+        let changed = role != self.role;
+        self.role = role;
+
+        changed
     }
 }
 
@@ -476,7 +572,7 @@ mod test {
 
     use tokio::sync::oneshot::channel;
 
-    use crate::net::messages::BackendKeyData;
+    use crate::net::messages::{BackendKeyData, BackendPid, FrontendPid};
 
     use super::*;
 
@@ -496,14 +592,10 @@ mod test {
         let mut inner = Inner::default();
 
         let server = Box::new(Server::default());
-        let server_id = *server.id();
+
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
 
         let result = inner
             .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
@@ -523,14 +615,10 @@ mod test {
         };
 
         let server = Box::new(Server::default());
-        let server_id = *server.id();
+
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
 
         inner
             .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
@@ -548,14 +636,10 @@ mod test {
         };
 
         let server = Box::new(Server::default());
-        let server_id = *server.id();
+
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
 
         let result = inner
             .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
@@ -574,16 +658,11 @@ mod test {
         };
 
         let server = Box::new(Server::new_error());
-        let server_id = *server.id();
 
         // Simulate server being checked out
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
         assert_eq!(inner.checked_out(), 1);
 
         let result = inner
@@ -591,7 +670,7 @@ mod test {
             .unwrap();
         assert!(result.server_error);
 
-        assert!(inner.taken.is_empty()); // Error server removed from taken
+        assert_eq!(inner.checked_out(), 0); // Error server removed from taken
         assert_eq!(inner.idle(), 0); // Error server not added to idle
     }
 
@@ -648,6 +727,32 @@ mod test {
     }
 
     #[test]
+    fn test_role_specific_min_and_idle_timeout() {
+        let mut inner = Inner {
+            role: Role::Auto,
+            ..Default::default()
+        };
+        inner.config.min = 1;
+        inner.config.min_primary = Some(2);
+        inner.config.min_replica = Some(3);
+        inner.config.idle_timeout = Duration::from_millis(10);
+        inner.config.idle_timeout_primary = Some(Duration::from_millis(20));
+        inner.config.idle_timeout_replica = Some(Duration::from_millis(30));
+
+        // Auto targets use replica settings until role detection completes.
+        assert_eq!(inner.min(), 3);
+        assert_eq!(inner.idle_timeout(), Duration::from_millis(30));
+
+        inner.set_role(Role::Primary);
+        assert_eq!(inner.min(), 2);
+        assert_eq!(inner.idle_timeout(), Duration::from_millis(20));
+
+        inner.set_role(Role::Replica);
+        assert_eq!(inner.min(), 3);
+        assert_eq!(inner.idle_timeout(), Duration::from_millis(30));
+    }
+
+    #[test]
     fn test_should_not_create_at_max() {
         let mut inner = Inner {
             online: true,
@@ -658,15 +763,17 @@ mod test {
         assert!(!inner.full());
 
         // Add 2 idle connections and 1 checked out connection to reach max
-        inner.idle_connections.push(Box::new(Server::default()));
-        inner.idle_connections.push(Box::new(Server::default()));
         inner
-            .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: BackendKeyData::new(),
-            })
-            .unwrap();
+            .idle_connections
+            .push_back(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
+        inner.taken.take(
+            FrontendPid::new(),
+            BackendPid::for_test(1),
+            BackendKeyData::random_legacy(),
+        );
 
         assert_eq!(inner.idle(), 2);
         assert_eq!(inner.checked_out(), 1);
@@ -683,9 +790,15 @@ mod test {
         inner.config.idle_timeout = Duration::from_millis(5_000);
 
         // Add connections to max
-        inner.idle_connections.push(Box::new(Server::default()));
-        inner.idle_connections.push(Box::new(Server::default()));
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
 
         // Close idle connections - shouldn't close any initially
         inner.close_idle(Instant::now());
@@ -714,14 +827,10 @@ mod test {
 
         // Add a connection
         let server = Box::new(Server::default());
-        let server_id = *server.id();
+
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
 
         inner
             .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
@@ -744,7 +853,11 @@ mod test {
         assert_eq!(inner.total(), 0);
 
         // Simulate taking a connection
-        inner.taken.take(&Mapping::default()).unwrap();
+        inner.taken.take(
+            FrontendPid::new(),
+            BackendPid::for_test(1),
+            BackendKeyData::random_legacy(),
+        );
         assert_eq!(inner.total(), 1);
         assert_eq!(inner.checked_out(), 1);
 
@@ -763,14 +876,10 @@ mod test {
         inner.config.max_age = Duration::from_millis(60_000);
 
         let server = Box::new(Server::default());
-        let server_id = *server.id();
+
         inner
             .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: server_id,
-            })
-            .unwrap();
+            .take(FrontendPid::new(), server.id(), server.key().clone());
 
         inner
             .maybe_check_in(
@@ -787,45 +896,38 @@ mod test {
     #[test]
     fn test_peer_lookup() {
         let mut inner = Inner::default();
-        let client_id = BackendKeyData::new();
-        let server_id = BackendKeyData::new();
+        let client_id = FrontendPid::new();
+        let server_id = BackendPid::for_test(1);
+        let cancel_key = BackendKeyData::legacy(server_id.pid, 0);
 
-        assert_eq!(inner.peer(&client_id), None);
+        assert_eq!(inner.cancel_key(client_id), None);
 
-        inner
-            .taken
-            .take(&Mapping {
-                client: client_id,
-                server: server_id,
-            })
-            .unwrap();
+        inner.taken.take(client_id, server_id, cancel_key.clone());
 
-        assert_eq!(inner.peer(&client_id), Some(server_id));
+        assert_eq!(inner.cancel_key(client_id), Some(&cancel_key));
     }
 
     #[test]
     fn test_taken_server_returns_server_when_mapped() {
         let mut taken = Taken::default();
-        let client_id = BackendKeyData::new();
-        let server_id = BackendKeyData::new();
+        let client_id = FrontendPid::new();
+        let server_id = BackendPid::for_test(1);
+        let cancel_key = BackendKeyData::legacy(server_id.pid, 0);
 
         // No mapping yet
-        assert_eq!(taken.server(&client_id), None);
+        assert_eq!(taken.cancel_key(client_id), None);
 
         // Add mapping
-        taken
-            .take(&Mapping {
-                client: client_id,
-                server: server_id,
-            })
-            .unwrap();
+        taken.take(client_id, server_id, cancel_key.clone());
 
-        // Server should be returned for mapped client
-        assert_eq!(taken.server(&client_id), Some(server_id));
+        // Cancel key should be returned for mapped client, pid matches server_id
+        let stored = taken.cancel_key(client_id).unwrap();
+        assert_eq!(stored.pid(), server_id.pid);
+        assert_eq!(stored, &cancel_key);
 
         // Different client should return None
-        let other_client = BackendKeyData::new();
-        assert_eq!(taken.server(&other_client), None);
+        let other_client = FrontendPid::new();
+        assert_eq!(taken.cancel_key(other_client), None);
     }
 
     #[test]
@@ -836,13 +938,19 @@ mod test {
 
         assert_eq!(inner.can_remove(), 0); // total=0, min=2
 
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
         assert_eq!(inner.can_remove(), 0); // total=1, min=2
 
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
         assert_eq!(inner.can_remove(), 0); // total=2, min=2
 
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
         assert_eq!(inner.can_remove(), 1); // total=3, min=2
     }
 
@@ -853,7 +961,9 @@ mod test {
 
         assert!(inner.take(&request).unwrap().is_none());
 
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
         let server = inner.take(&request);
         assert!(server.unwrap().is_some());
         assert_eq!(inner.idle(), 0);
@@ -872,7 +982,7 @@ mod test {
         });
 
         let server = Box::new(Server::default());
-        inner.put(server, Instant::now()).unwrap();
+        inner.put(server, Instant::now());
 
         assert_eq!(inner.idle(), 0); // Connection given to waiter, not idle
         assert_eq!(inner.checked_out(), 1); // Connection now checked out to waiter
@@ -887,7 +997,7 @@ mod test {
         let mut inner = Inner::default();
         let server = Box::new(Server::default());
 
-        inner.put(server, Instant::now()).unwrap();
+        inner.put(server, Instant::now());
 
         assert_eq!(inner.idle(), 1); // Connection added to idle pool
         assert_eq!(inner.checked_out(), 0);
@@ -897,8 +1007,12 @@ mod test {
     #[test]
     fn test_dump_idle() {
         let mut inner = Inner::default();
-        inner.idle_connections.push(Box::new(Server::default()));
-        inner.idle_connections.push(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
+        inner
+            .idle_connections
+            .push_back(Box::new(Server::default()));
 
         assert_eq!(inner.idle(), 2);
         inner.dump_idle();
@@ -931,7 +1045,7 @@ mod test {
         });
 
         assert_eq!(inner.waiting.len(), 3);
-        inner.remove_waiter(&target_id);
+        inner.remove_waiter(target_id);
         assert_eq!(inner.waiting.len(), 2);
     }
 
@@ -969,20 +1083,16 @@ mod test {
         inner.config.max = 5;
 
         // Add connections above minimum but all are checked out (no idle)
-        inner
-            .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: BackendKeyData::new(),
-            })
-            .unwrap();
-        inner
-            .taken
-            .take(&Mapping {
-                client: BackendKeyData::new(),
-                server: BackendKeyData::new(),
-            })
-            .unwrap();
+        inner.taken.take(
+            FrontendPid::new(),
+            BackendPid::for_test(1),
+            BackendKeyData::random_legacy(),
+        );
+        inner.taken.take(
+            FrontendPid::new(),
+            BackendPid::for_test(2),
+            BackendKeyData::random_legacy(),
+        );
 
         // Add a waiting client
         inner.waiting.push_back(Waiter {
@@ -1022,15 +1132,13 @@ mod test {
     #[test]
     fn test_set_taken() {
         let mut inner = Inner::default();
-        let mapping = Mapping {
-            client: BackendKeyData::new(),
-            server: BackendKeyData::new(),
-        };
+        let client = FrontendPid::new();
+        let server = BackendPid::for_test(1);
 
         assert_eq!(inner.checked_out(), 0);
 
         let mut taken = Taken::default();
-        taken.take(&mapping).unwrap();
+        taken.take(client, server, BackendKeyData::legacy(server.pid, 0));
 
         inner.set_taken(taken);
         assert_eq!(inner.checked_out(), 1);
@@ -1068,7 +1176,7 @@ mod test {
         assert_eq!(inner.waiting.len(), 3);
 
         let server = Box::new(Server::default());
-        inner.put(server, Instant::now()).unwrap();
+        inner.put(server, Instant::now());
 
         // All waiters should be removed from queue since we tried each one
         assert_eq!(inner.waiting.len(), 0);
@@ -1105,7 +1213,7 @@ mod test {
         assert_eq!(inner.waiting.len(), 2);
 
         let server = Box::new(Server::default());
-        inner.put(server, Instant::now()).unwrap();
+        inner.put(server, Instant::now());
 
         // All waiters should be removed since they were all dropped
         assert_eq!(inner.waiting.len(), 0);
@@ -1125,18 +1233,18 @@ mod test {
 
         // Add two idle connections to the pool
         let server1 = Box::new(Server::default());
-        let server1_id = *server1.id();
+        let server1_id = server1.id();
         let server2 = Box::new(Server::default());
-        let server2_id = *server2.id();
-        inner.idle_connections.push(server1);
-        inner.idle_connections.push(server2);
+        let server2_id = server2.id();
+        inner.idle_connections.push_back(server1);
+        inner.idle_connections.push_back(server2);
 
         assert_eq!(inner.idle(), 2);
         assert_eq!(inner.checked_out(), 0);
         assert_eq!(inner.total(), 2);
 
         // Same client ID for both requests
-        let client_id = BackendKeyData::new();
+        let client_id = FrontendPid::new();
         let request = Request::unrouted(client_id);
 
         // Check out first connection
@@ -1177,7 +1285,7 @@ mod test {
         assert_eq!(inner.total(), 2);
 
         // Verify the specific servers are back in the idle pool
-        let idle_ids: Vec<_> = inner.idle_conns().iter().map(|s| *s.id()).collect();
+        let idle_ids: Vec<_> = inner.idle_conns().iter().map(|s| s.id()).collect();
         assert!(idle_ids.contains(&server1_id));
         assert!(idle_ids.contains(&server2_id));
     }

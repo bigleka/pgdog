@@ -2,21 +2,21 @@
 
 use std::ops::{Deref, DerefMut};
 
-use pgdog_config::pooling::ConnectionRecovery;
-use tokio::time::timeout;
-use tokio::{spawn, time::Instant};
-use tracing::{debug, error};
+use tokio::time::Instant;
 
-use crate::backend::{Error, Server};
-use crate::state::State;
+use crate::backend::Server;
 
-use super::{cleanup::Cleanup, Pool};
+use super::{Pool, cleanup::Cleanup, recovery::Recovery};
 
 /// Connection guard.
-pub struct Guard {
+pub(crate) struct Guard {
     server: Option<Box<Server>>,
     pub(super) pool: Pool,
     pub(super) reset: bool,
+
+    /// Frontend has pinned this guard to its client
+    // NOTE: We cache this value seperately to minimize pool lock contention
+    locked: bool,
 }
 
 impl std::fmt::Debug for Guard {
@@ -36,157 +36,43 @@ impl std::fmt::Debug for Guard {
 
 impl Guard {
     /// Create new connection guard.
-    pub fn new(pool: Pool, mut server: Box<Server>, granted_at: Instant) -> Self {
+    pub(crate) fn new(pool: Pool, mut server: Box<Server>, granted_at: Instant) -> Self {
         server.stats_mut().set_timers(granted_at);
 
         Self {
             server: Some(server),
             pool,
             reset: false,
+            locked: false,
         }
+    }
+
+    /// Mark or unmark this checkout as pinned to its client. Propagates to
+    /// the pool so `sv_locked` reflects reality per pool.
+    pub(crate) fn set_locked(&mut self, locked: bool) {
+        if self.locked == locked {
+            // No-op, don't bother aquiring a lock
+            return;
+        }
+
+        self.locked = locked;
+        if let Some(server) = self.server.as_deref() {
+            self.pool.set_locked(server.id(), locked);
+        }
+    }
+
+    /// Whether this guard is currently pinned to its client.
+    pub(crate) fn is_locked(&self) -> bool {
+        self.locked
     }
 
     /// Rollback any unfinished transactions and check the connection
     /// back into the pool.
     fn cleanup(&mut self) {
-        let server = self.server.take();
-        let pool = self.pool.clone();
-
-        if let Some(mut server) = server {
-            let rollback = server.in_transaction();
+        if let Some(mut server) = self.server.take() {
             let cleanup = Cleanup::new(self, &mut server);
-            let reset = cleanup.needed();
-            let sync_prepared = server.sync_prepared();
-            let needs_drain = server.needs_drain();
-            let force_close = server.force_close();
-            let needs_cleanup = rollback || reset || sync_prepared || needs_drain;
-
-            server.reset_changed_params();
-
-            // No need to delay checkin unless we have to.
-            if needs_cleanup && !force_close {
-                let rollback_timeout = pool.inner().config.rollback_timeout;
-                let conn_recovery = pool.inner().config.connection_recovery;
-                let addr = self.pool.addr().clone();
-
-                spawn(async move {
-                    match timeout(
-                        rollback_timeout,
-                        Self::cleanup_internal(&mut server, cleanup, conn_recovery),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => (),
-                        Err(_) => {
-                            error!("server cleanup timed out [{}]", server.addr());
-                            server.stats_mut().state(State::ForceClose);
-                        }
-                        Ok(Err(err)) => {
-                            error!("server cleanup failed: {} [{}]", err, server.addr());
-                            if !server.error() {
-                                server.stats_mut().state(State::ForceClose);
-                            }
-                        }
-                    }
-
-                    if let Err(err) = pool.checkin(server) {
-                        error!("pool checkin error: {} [{}]", err, addr);
-                    }
-                });
-            } else {
-                debug!(
-                    "[cleanup] no cleanup needed, server in \"{}\" state [{}]",
-                    server.stats().get_state(),
-                    server.addr(),
-                );
-                if let Err(err) = pool.checkin(server) {
-                    error!("pool checkin error: {} [{}]", err, self.pool.addr());
-                }
-            }
+            Recovery::new(server, self.pool.clone(), cleanup).recover();
         }
-    }
-
-    async fn cleanup_internal(
-        server: &mut Box<Server>,
-        cleanup: Cleanup,
-        conn_recovery: ConnectionRecovery,
-    ) -> Result<(), Error> {
-        let schema_changed = server.schema_changed();
-        let sync_prepared = server.sync_prepared();
-        let needs_drain = server.needs_drain();
-
-        if needs_drain {
-            if conn_recovery.can_recover() && !server.sending_request() {
-                // Receive whatever data the client left before disconnecting.
-                debug!(
-                    "[cleanup] draining data from \"{}\" server [{}]",
-                    server.stats().get_state(),
-                    server.addr()
-                );
-                server.drain().await?;
-            } else {
-                server.stats_mut().state(State::ForceClose);
-                return Ok(());
-            }
-        }
-
-        let rollback = server.in_transaction();
-
-        // Rollback any unfinished transactions,
-        // but only if the server is in sync (protocol-wise).
-        if rollback {
-            if conn_recovery.can_rollback() {
-                debug!(
-                    "[cleanup] rolling back server transaction, in \"{}\" state [{}]",
-                    server.stats().get_state(),
-                    server.addr(),
-                );
-                server.rollback().await?;
-            } else {
-                server.stats_mut().state(State::ForceClose);
-                return Ok(());
-            }
-        }
-
-        if cleanup.needed() {
-            debug!(
-                "[cleanup] running {} cleanup queries, server in \"{}\" state [{}]",
-                cleanup.len(),
-                server.stats().get_state(),
-                server.addr()
-            );
-            server.execute_batch(cleanup.queries()).await?;
-
-            if cleanup.is_deallocate() {
-                server.prepared_statements_mut().clear();
-            }
-            server.cleaned();
-
-            debug!(
-                "[cleanup] closing {} prepared statements",
-                cleanup.close().len()
-            );
-            server.close_many(cleanup.close()).await?;
-        }
-
-        if schema_changed {
-            server.reset_schema_changed();
-        }
-
-        if cleanup.is_reset_params() {
-            server.reset_params();
-        }
-
-        if sync_prepared {
-            debug!(
-                "[cleanup] syncing prepared statements, server in \"{}\" state [{}]",
-                server.stats().get_state(),
-                server.addr()
-            );
-            server.sync_prepared_statements().await?;
-        }
-
-        Ok(())
     }
 }
 
@@ -215,12 +101,17 @@ mod test {
     use std::time::Duration;
 
     use pgdog_config::pooling::ConnectionRecovery;
-    use tokio::time::{sleep, timeout, Instant};
+    use pgdog_config::prepared_statements::PreparedStatementsConfig;
+    use tokio::time::Instant;
 
+    use crate::net::{FrontendPid, Parameters};
+    use crate::parameters::ParameterStore;
+    use crate::util::{safe_sleep, safe_timeout};
     use crate::{
         backend::{
             pool::{
-                cleanup::Cleanup, test::pool, Address, Config, Guard, Pool, PoolConfig, Request,
+                Address, Config, Guard, Pool, PoolConfig, Request, cleanup::Cleanup,
+                recovery::Recovery, test::pool,
             },
             server::test::test_server,
         },
@@ -306,7 +197,7 @@ mod test {
         drop(guard);
 
         let guard = pool.get(&Request::default()).await.unwrap();
-        assert!(guard.prepared_statements().is_empty());
+        assert_eq!(guard.prepared_statements().len(), 0);
     }
 
     #[tokio::test]
@@ -314,12 +205,10 @@ mod test {
         crate::logger();
 
         let config = Config {
-            inner: pgdog_stats::Config {
-                max: 1,
-                min: 0,
-                rollback_timeout: Duration::from_millis(100),
-                ..Config::default().inner
-            },
+            max: 1,
+            min: 0,
+            rollback_timeout: Duration::from_millis(100),
+            ..Config::default()
         };
 
         let pool = Pool::new(&PoolConfig {
@@ -340,7 +229,7 @@ mod test {
                 .unwrap();
         }
 
-        sleep(Duration::from_millis(500)).await;
+        safe_sleep(Duration::from_millis(500)).await;
 
         {
             let state = pool.lock();
@@ -365,7 +254,12 @@ mod test {
             Box::new(test_server().await),
             Instant::now(),
         );
-        server.prepared_statements_mut().set_capacity(1);
+        server
+            .prepared_statements_mut()
+            .configure(PreparedStatementsConfig {
+                limit: 1,
+                ..Default::default()
+            });
 
         for i in 0..5 {
             server
@@ -394,7 +288,7 @@ mod test {
         assert_eq!(cleanup.close().len(), 4);
         assert!(server.needs_drain());
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
             .await
             .unwrap();
 
@@ -410,13 +304,13 @@ mod test {
         let mut server = test_server().await;
         let select = (0..50_000_000).map(|_| 'b').collect::<String>();
         let select = Query::new(format!("SELECT '{}'", select));
-        let res = timeout(
+        let res = safe_timeout(
             Duration::from_millis(1),
             server.send(&vec![select.into()].into()),
         )
         .await;
         assert!(res.is_err());
-        assert!(server.force_close());
+        assert!(server.is_force_close());
         assert!(server.io_in_progress())
     }
 
@@ -429,7 +323,12 @@ mod test {
             Box::new(test_server().await),
             Instant::now(),
         );
-        server.prepared_statements_mut().set_capacity(1);
+        server
+            .prepared_statements_mut()
+            .configure(PreparedStatementsConfig {
+                limit: 1,
+                ..Default::default()
+            });
 
         server
             .send(
@@ -457,7 +356,7 @@ mod test {
 
         assert!(server.needs_drain());
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
             .await
             .unwrap();
 
@@ -477,7 +376,12 @@ mod test {
             Box::new(test_server().await),
             Instant::now(),
         );
-        server.prepared_statements_mut().set_capacity(1);
+        server
+            .prepared_statements_mut()
+            .configure(PreparedStatementsConfig {
+                limit: 1,
+                ..Default::default()
+            });
 
         server
             .send(
@@ -505,7 +409,7 @@ mod test {
 
         assert!(server.needs_drain());
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::RollbackOnly)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::RollbackOnly)
             .await
             .unwrap();
 
@@ -523,7 +427,12 @@ mod test {
             Box::new(test_server().await),
             Instant::now(),
         );
-        server.prepared_statements_mut().set_capacity(1);
+        server
+            .prepared_statements_mut()
+            .configure(PreparedStatementsConfig {
+                limit: 1,
+                ..Default::default()
+            });
 
         server
             .send(
@@ -551,7 +460,7 @@ mod test {
 
         assert!(server.needs_drain());
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
             .await
             .unwrap();
 
@@ -588,7 +497,7 @@ mod test {
         let mut server = guard.server.take().unwrap();
         let cleanup = Cleanup::new(&guard, &mut server);
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
             .await
             .unwrap();
 
@@ -626,7 +535,7 @@ mod test {
         let mut server = guard.server.take().unwrap();
         let cleanup = Cleanup::new(&guard, &mut server);
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::RollbackOnly)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::RollbackOnly)
             .await
             .unwrap();
 
@@ -664,7 +573,7 @@ mod test {
         let mut server = guard.server.take().unwrap();
         let cleanup = Cleanup::new(&guard, &mut server);
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
             .await
             .unwrap();
 
@@ -682,7 +591,12 @@ mod test {
             Box::new(test_server().await),
             Instant::now(),
         );
-        server.prepared_statements_mut().set_capacity(1);
+        server
+            .prepared_statements_mut()
+            .configure(PreparedStatementsConfig {
+                limit: 1,
+                ..Default::default()
+            });
 
         server
             .send(
@@ -725,7 +639,7 @@ mod test {
         assert!(server.needs_drain());
         assert!(server.in_transaction());
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Drop)
             .await
             .unwrap();
 
@@ -766,7 +680,7 @@ mod test {
         let mut server = guard.server.take().unwrap();
         let cleanup = Cleanup::new(&guard, &mut server);
 
-        Guard::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
+        Recovery::cleanup_internal(&mut server, cleanup, ConnectionRecovery::Recover)
             .await
             .unwrap();
 
@@ -791,7 +705,7 @@ mod test {
         let server = test_server().await;
 
         assert!(
-            !server.sending_request(),
+            !server.is_sending_request(),
             "sending_request should be false initially"
         );
     }
@@ -808,7 +722,7 @@ mod test {
             .unwrap();
 
         assert!(
-            !server.sending_request(),
+            !server.is_sending_request(),
             "sending_request should be false after successful send"
         );
     }
@@ -820,7 +734,7 @@ mod test {
         let pool = pool();
 
         {
-            let mut guard = timeout(Duration::from_secs(5), pool.get(&Request::default()))
+            let mut guard = safe_timeout(Duration::from_secs(5), pool.get(&Request::default()))
                 .await
                 .expect("timed out getting connection")
                 .unwrap();
@@ -829,7 +743,7 @@ mod test {
             let large_query = (0..50_000_000).map(|_| 'b').collect::<String>();
             let large_query = Query::new(format!("SELECT '{}'", large_query));
 
-            let res = timeout(
+            let res = safe_timeout(
                 Duration::from_millis(1),
                 guard.send(&vec![large_query.into()].into()),
             )
@@ -837,17 +751,51 @@ mod test {
 
             assert!(res.is_err(), "send should timeout");
             assert!(
-                guard.sending_request(),
+                guard.is_sending_request(),
                 "sending_request should be true after interrupted send"
             );
         }
 
-        sleep(Duration::from_millis(100)).await;
+        safe_sleep(Duration::from_millis(100)).await;
 
         let state = pool.state();
         assert_eq!(
             state.force_close, 1,
             "force_close should be incremented when connection has interrupted send"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bad_param_sync() {
+        let pool = pool();
+        let mut server = pool.get_test().await.unwrap();
+
+        let store = ParameterStore::new(Parameters::from(
+            [("application_name", "random"), ("statement_timeout", "sff")].as_slice(),
+        ));
+
+        server
+            .link_client(FrontendPid::new(), &store, None)
+            .await
+            .expect_err("statement_timeout has an invalid value");
+
+        drop(server);
+
+        let mut server = pool.get_test().await.unwrap();
+        // Default, should revert application_name change.
+        let application_name: Vec<String> =
+            server.fetch_all("SHOW application_name").await.unwrap();
+        assert_eq!(application_name[0], "PgDog");
+
+        assert!(server.params().get("statement_timeout").is_none());
+        assert_eq!(
+            server
+                .params()
+                .get("application_name")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "PgDog"
         );
     }
 }

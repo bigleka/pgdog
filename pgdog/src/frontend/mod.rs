@@ -1,31 +1,27 @@
 //! pgDog frontend manages connections to clients.
 
-pub mod buffered_query;
-pub mod client;
-pub mod client_request;
-pub mod comms;
-pub mod connected_client;
-pub mod error;
-pub mod listener;
-pub mod logical_session;
-pub mod logical_transaction;
-pub mod prepared_statements;
-#[cfg(debug_assertions)]
-pub mod query_logger;
-pub mod regex_parser;
-pub mod router;
-pub mod stats;
+pub(crate) mod buffered_query;
+pub(crate) mod client;
+pub(crate) mod client_request;
+pub(crate) mod comms;
+pub(crate) mod connected_client;
+pub(crate) mod ee;
+pub(crate) mod error;
+pub(crate) mod listener;
+pub(crate) mod prepared_statements;
+pub(crate) mod regex_parser;
+pub(crate) mod router;
+pub(crate) mod stats;
 
-pub use buffered_query::BufferedQuery;
-pub use client::Client;
-pub use client_request::ClientRequest;
-pub use comms::{ClientComms, Comms};
-pub use connected_client::ConnectedClient;
+pub(crate) use buffered_query::BufferedQuery;
+pub(crate) use client::Client;
+pub(crate) use client_request::ClientRequest;
+pub(crate) use comms::ClientComms;
+pub(crate) use connected_client::ConnectedClient;
 pub(crate) use error::Error;
-pub use prepared_statements::{PreparedStatements, Rewrite};
-#[cfg(debug_assertions)]
-pub use query_logger::QueryLogger;
+pub(crate) use prepared_statements::PreparedStatements;
 pub(crate) use regex_parser::RegexParser;
-pub use router::{Command, Router, SetParam};
-pub use router::{RouterContext, SearchPath};
-pub use stats::Stats;
+pub(in crate::frontend) use router::RoutingComment;
+pub(crate) use router::{Command, DiscardTarget, Router, SetParam, UnlistenTarget};
+pub(crate) use router::{RouterContext, SearchPath};
+pub(crate) use stats::Stats;

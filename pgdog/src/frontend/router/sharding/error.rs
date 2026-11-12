@@ -3,7 +3,7 @@ use std::{array::TryFromSliceError, ffi::NulError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("{0}")]
     ParseInt(String),
 
@@ -19,6 +19,12 @@ pub enum Error {
     #[error("context incomplete")]
     IncompleteContext,
 
+    #[error("sharding key lookup returned \"{0}\", which is not a shard number")]
+    LookupShardInvalid(String),
+
+    #[error("sharding key lookup returned shard {shard}, but the cluster has {shards} shards")]
+    LookupShardOutOfRange { shard: usize, shards: usize },
+
     #[error("{0}")]
     Utf8(#[from] std::str::Utf8Error),
 
@@ -27,12 +33,6 @@ pub enum Error {
 
     #[error("{0}")]
     NullError(#[from] NulError),
-
-    #[error("btree node error")]
-    BtreeNodeError,
-
-    #[error("range is overlapping or incorrect")]
-    IncorrectRange,
 
     #[error("config has more than one sharding function")]
     MultipleShardingFunctions,

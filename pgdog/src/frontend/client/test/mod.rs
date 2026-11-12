@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
-use pgdog_config::PoolerMode;
+use pgdog_config::{PoolerMode, QuerySizeLimitAction};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -12,12 +13,13 @@ use bytes::{BufMut, BytesMut};
 use crate::{
     backend::databases::databases,
     config::{
-        config, load_test, load_test_replicas, load_test_sharded, load_test_with_pooler_mode, set,
-        PreparedStatements,
+        PreparedStatementsLevel, config, load_test, load_test_replicas, load_test_sharded,
+        load_test_with_pooler_mode, set,
     },
     frontend::{
+        Client,
         client::{BufferEvent, QueryEngine},
-        prepared_statements, Client,
+        prepared_statements,
     },
     net::{
         Bind, Close, CommandComplete, DataRow, Describe, ErrorResponse, Execute, Field, Flush,
@@ -29,16 +31,17 @@ use crate::{
 
 use super::Stream;
 
-pub mod target_session_attrs;
-pub mod test_client;
-pub use test_client::{SpawnedClient, TestClient};
+pub(crate) mod auth;
+pub(crate) mod target_session_attrs;
+pub(crate) mod test_client;
+pub(crate) use test_client::{SpawnedClient, TestClient};
 
 //
 // cargo nextest runs these in separate processes.
 // That's important otherwise I'm not sure what would happen.
 //
 
-pub async fn test_client(replicas: bool) -> (TcpStream, Client) {
+pub(crate) async fn test_client(replicas: bool) -> (TcpStream, Client) {
     if replicas {
         load_test_replicas();
     } else {
@@ -49,27 +52,17 @@ pub async fn test_client(replicas: bool) -> (TcpStream, Client) {
 }
 
 /// Load test client with 4 databases (2 shards, 1 replica each).
-pub async fn test_client_sharded() -> (TcpStream, Client) {
+pub(crate) async fn test_client_sharded() -> (TcpStream, Client) {
     load_test_sharded();
 
     parallel_test_client().await
 }
 
-pub async fn test_client_with_params(params: Parameters, replicas: bool) -> (TcpStream, Client) {
-    if replicas {
-        load_test_replicas();
-    } else {
-        load_test();
-    }
-
-    parallel_test_client_with_params(params).await
-}
-
-pub async fn parallel_test_client() -> (TcpStream, Client) {
+pub(crate) async fn parallel_test_client() -> (TcpStream, Client) {
     parallel_test_client_with_params(Parameters::default()).await
 }
 
-pub async fn parallel_test_client_with_params(params: Parameters) -> (TcpStream, Client) {
+pub(crate) async fn parallel_test_client_with_params(params: Parameters) -> (TcpStream, Client) {
     let addr = "127.0.0.1:0".to_string();
     let conn_addr = addr.clone();
     let stream = TcpListener::bind(&conn_addr).await.unwrap();
@@ -90,7 +83,7 @@ pub async fn parallel_test_client_with_params(params: Parameters) -> (TcpStream,
 }
 
 macro_rules! new_client {
-    ($replicas:expr) => {{
+    ($replicas:expr_2021) => {{
         crate::logger();
         let (conn, client) = test_client($replicas).await;
         let engine = QueryEngine::from_client(&client).unwrap();
@@ -99,17 +92,12 @@ macro_rules! new_client {
     }};
 }
 
-pub fn buffer(messages: &[impl ToBytes]) -> BytesMut {
-    let mut buf = BytesMut::new();
-    for message in messages {
-        buf.put(message.to_bytes().unwrap());
-    }
-    buf
-}
-
 /// Read a series of messages from the stream and make sure
 /// they arrive in the right order.
-pub async fn read_messages(stream: &mut (impl AsyncRead + Unpin), codes: &[char]) -> Vec<Message> {
+pub(crate) async fn read_messages(
+    stream: &mut (impl AsyncRead + Unpin),
+    codes: &[char],
+) -> Vec<Message> {
     let mut result = vec![];
     let mut error = false;
 
@@ -138,7 +126,7 @@ pub async fn read_messages(stream: &mut (impl AsyncRead + Unpin), codes: &[char]
         if error {
             panic!(
                 "{:#}",
-                ErrorResponse::from_bytes(message.to_bytes().unwrap()).unwrap()
+                ErrorResponse::from_bytes(message.to_bytes()).unwrap()
             );
         } else {
             result.push(message);
@@ -153,7 +141,7 @@ macro_rules! buffer {
         let mut buf = BytesMut::new();
 
         $(
-           buf.put($msg.to_bytes().unwrap());
+           buf.put($msg.to_bytes());
         )*
 
         buf
@@ -161,7 +149,7 @@ macro_rules! buffer {
 }
 
 macro_rules! read_one {
-    ($conn:expr) => {{
+    ($conn:expr_2021) => {{
         let mut buf = BytesMut::new();
         let code = $conn.read_u8().await.unwrap();
         buf.put_u8(code);
@@ -175,7 +163,7 @@ macro_rules! read_one {
 }
 
 macro_rules! read {
-    ($conn:expr, $codes:expr) => {{
+    ($conn:expr_2021, $codes:expr_2021) => {{
         let mut result = vec![];
         for c in $codes {
             let buf = read_one!($conn);
@@ -198,7 +186,7 @@ async fn test_multiple_async() {
     let mut buf = vec![];
     for i in 0..50 {
         let q = Query::new(format!("SELECT {}::bigint AS one", i));
-        buf.extend(&q.to_bytes().unwrap())
+        buf.extend(&q.to_bytes())
     }
 
     conn.write_all(&buf).await.unwrap();
@@ -250,9 +238,7 @@ async fn test_multiple_async() {
         assert_eq!(codes, ['T', 'D', 'C', 'Z']);
     }
 
-    conn.write_all(&Terminate.to_bytes().unwrap())
-        .await
-        .unwrap();
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
     handle.await.unwrap();
 
     let dbs = databases();
@@ -268,7 +254,10 @@ async fn test_abrupt_disconnect() {
 
     drop(conn);
 
-    let event = client.buffer(State::Idle).await.unwrap();
+    let event = client
+        .buffer(State::Idle, &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(event, BufferEvent::DisconnectAbrupt);
     assert!(client.client_request.messages.is_empty());
 
@@ -287,7 +276,10 @@ async fn test_client_idle_timeout() {
     set(config).unwrap();
 
     let start = Instant::now();
-    let res = client.buffer(State::Idle).await.unwrap();
+    let res = client
+        .buffer(State::Idle, &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(res, BufferEvent::DisconnectAbrupt);
 
     let err = read_one!(conn);
@@ -295,12 +287,14 @@ async fn test_client_idle_timeout() {
     let err = ErrorResponse::from_bytes(err.freeze()).unwrap();
     assert_eq!(err.code, "57P05");
 
-    assert!(timeout(
-        Duration::from_millis(50),
-        client.buffer(State::IdleInTransaction)
-    )
-    .await
-    .is_err());
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            client.buffer(State::IdleInTransaction, &CancellationToken::new())
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -313,29 +307,161 @@ async fn test_parse_describe_flush_bind_execute_close_sync() {
 
     let mut buf = BytesMut::new();
 
-    buf.put(Parse::new_anonymous("SELECT 1").to_bytes().unwrap());
-    buf.put(Describe::new_statement("").to_bytes().unwrap());
-    buf.put(Flush.to_bytes().unwrap());
+    buf.put(Parse::new_anonymous("SELECT 1").to_bytes());
+    buf.put(Describe::new_statement("").to_bytes());
+    buf.put(Flush.to_bytes());
 
     conn.write_all(&buf).await.unwrap();
 
     let _ = read!(conn, ['1', 't', 'T']);
 
     let mut buf = BytesMut::new();
-    buf.put(Bind::new_statement("").to_bytes().unwrap());
-    buf.put(Execute::new().to_bytes().unwrap());
-    buf.put(Close::named("").to_bytes().unwrap());
-    buf.put(Sync.to_bytes().unwrap());
+    buf.put(Bind::new_statement("").to_bytes());
+    buf.put(Execute::new().to_bytes());
+    buf.put(Close::named("").to_bytes());
+    buf.put(Sync.to_bytes());
 
     conn.write_all(&buf).await.unwrap();
 
     let _ = read!(conn, ['2', 'D', 'C', '3', 'Z']);
 
-    conn.write_all(&Terminate.to_bytes().unwrap())
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
+
+    handle.await.unwrap();
+
+    // No portal yet, so no pin: second batch takes a fresh server.
+    let dbs = databases();
+    let cluster = dbs.cluster(("pgdog", "pgdog")).unwrap();
+    let shard = cluster.shards()[0].pools()[0].state();
+    assert_eq!(shard.stats.counts.server_assignment_count, 2);
+}
+
+/// https://github.com/pgdogdev/pgdog/issues/1330
+///
+/// Bind creates a portal that lives on one connection until Sync.
+#[tokio::test]
+async fn test_flush_after_bind_keeps_portal() {
+    let (mut conn, mut client, _) = new_client!(false);
+
+    let handle = tokio::spawn(async move {
+        client.run().await.unwrap();
+    });
+
+    // What pg-cursor opens with: no Execute in this batch.
+    conn.write_all(&buffer!(
+        { Parse::new_anonymous("SELECT 1") },
+        { Bind::new_statement("") },
+        { Describe::new_portal("") },
+        { Flush }
+    ))
+    .await
+    .unwrap();
+
+    let _ = read!(conn, ['1', '2', 'T']);
+
+    conn.write_all(&buffer!({ Execute::new() }, { Sync::new() }))
         .await
         .unwrap();
 
+    let _ = read!(conn, ['D', 'C', 'Z']);
+
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
     handle.await.unwrap();
+
+    let dbs = databases();
+    let cluster = dbs.cluster(("pgdog", "pgdog")).unwrap();
+    let shard = cluster.shards()[0].pools()[0].state();
+    assert_eq!(shard.stats.counts.server_assignment_count, 1);
+}
+
+/// Paging: pin survives several Flush batches, only Sync releases.
+#[tokio::test]
+async fn test_flush_portal_paging_stays_pinned() {
+    let (mut conn, mut client, _) = new_client!(false);
+
+    let handle = tokio::spawn(async move {
+        client.run().await.unwrap();
+    });
+
+    conn.write_all(&buffer!(
+        { Parse::new_anonymous("SELECT * FROM generate_series(1, 3)") },
+        { Bind::new_statement("") },
+        { Describe::new_portal("") },
+        { Flush }
+    ))
+    .await
+    .unwrap();
+
+    let _ = read!(conn, ['1', '2', 'T']);
+
+    // 's' is PortalSuspended.
+    for _ in 0..2 {
+        conn.write_all(&buffer!({ Execute::new_portal_limit("", 1) }, { Flush }))
+            .await
+            .unwrap();
+        let _ = read!(conn, ['D', 's']);
+    }
+
+    conn.write_all(&buffer!({ Execute::new() }, { Sync::new() }))
+        .await
+        .unwrap();
+    let _ = read!(conn, ['D', 'C', 'Z']);
+
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
+    handle.await.unwrap();
+
+    let dbs = databases();
+    let cluster = dbs.cluster(("pgdog", "pgdog")).unwrap();
+    let shard = cluster.shards()[0].pools()[0].state();
+    assert_eq!(shard.stats.counts.server_assignment_count, 1);
+}
+
+/// Pin must not outlive the client.
+#[tokio::test]
+async fn test_flush_portal_released_on_terminate() {
+    let (mut conn, mut client, _) = new_client!(false);
+
+    let handle = tokio::spawn(async move {
+        client.run().await.unwrap();
+    });
+
+    conn.write_all(&buffer!(
+        { Parse::new_anonymous("SELECT 1") },
+        { Bind::new_statement("") },
+        { Describe::new_portal("") },
+        { Flush }
+    ))
+    .await
+    .unwrap();
+
+    let _ = read!(conn, ['1', '2', 'T']);
+
+    // Walk away, never send Sync.
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
+
+    timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("client did not shut down while holding a portal")
+        .unwrap();
+
+    let dbs = databases();
+    let cluster = dbs.cluster(("pgdog", "pgdog")).unwrap();
+    let pool = &cluster.shards()[0].pools()[0];
+
+    // Check-in cleans the connection first, so it completes asynchronously.
+    timeout(Duration::from_secs(5), async {
+        while pool.state().checked_out != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("backend leaked");
+
+    let state = pool.state();
+    assert_eq!(state.stats.counts.server_assignment_count, 1);
+    // Cleanup succeeded: the connection was reused, not discarded.
+    assert_eq!(state.force_close, 0, "cleanup failed, connection discarded");
+    assert_eq!(state.stats.counts.errors, 0);
 }
 
 #[tokio::test]
@@ -358,7 +484,7 @@ async fn test_client_login_timeout() {
         let (stream, addr) = stream.accept().await.unwrap();
         let stream = Stream::plain(stream, 4096);
 
-        let mut params = crate::net::parameter::Parameters::default();
+        let mut params = crate::net::Parameters::default();
         params.insert("user", "pgdog");
         params.insert("database", "pgdog");
 
@@ -438,7 +564,7 @@ async fn test_anon_prepared_statements() {
     let (mut conn, mut client, _) = new_client!(false);
 
     let mut c = (*config()).clone();
-    c.config.general.prepared_statements = PreparedStatements::ExtendedAnonymous;
+    c.config.general.prepared_statements = PreparedStatementsLevel::ExtendedAnonymous;
     set(c).unwrap();
 
     let handle = tokio::spawn(async move {
@@ -474,7 +600,7 @@ async fn test_anon_prepared_statements_extended() {
     let (mut conn, mut client, _) = new_client!(false);
 
     let mut c = (*config()).clone();
-    c.config.general.prepared_statements = PreparedStatements::Extended;
+    c.config.general.prepared_statements = PreparedStatementsLevel::Extended;
     set(c).unwrap();
 
     let handle = tokio::spawn(async move {
@@ -516,7 +642,10 @@ async fn test_query_timeout() {
     let buf = buffer!({ Query::new("SELECT pg_sleep(0.2)") });
     conn.write_all(&buf).await.unwrap();
 
-    client.buffer(State::Idle).await.unwrap();
+    client
+        .buffer(State::Idle, &CancellationToken::new())
+        .await
+        .unwrap();
     let result = client.client_messages(&mut engine).await;
 
     assert!(result.is_err());
@@ -524,4 +653,74 @@ async fn test_query_timeout() {
     let pools = databases().cluster(("pgdog", "pgdog")).unwrap().shards()[0].pools();
     let state = pools[0].state();
     assert_eq!(state.force_close, 1);
+}
+
+#[tokio::test]
+async fn test_query_size_limit_block() {
+    crate::logger();
+    load_test();
+    let (mut conn, mut client) = parallel_test_client_with_params(Parameters::default()).await;
+
+    let mut c = (*config()).clone();
+    c.config.general.query_size_limit = Some(1024);
+    c.config.general.query_size_limit_action = QuerySizeLimitAction::Block;
+    set(c).unwrap();
+
+    let handle = tokio::spawn(async move { client.run().await.unwrap() });
+
+    // 100 distinct columns — readable in logs, clearly exceeds the 1024-byte limit.
+    let big_query = format!(
+        "SELECT {}",
+        (1..=100)
+            .map(|i| format!("{i} AS col_{i:03}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let msg_size = Query::new(&big_query).to_bytes().len();
+    conn.write_all(&Query::new(&big_query).to_bytes())
+        .await
+        .unwrap();
+
+    let err = read_one!(conn);
+    let err = ErrorResponse::from_bytes(err.freeze()).unwrap();
+    assert_eq!(err.severity, "FATAL");
+    assert_eq!(err.code, "54000");
+    assert_eq!(err.message, "query size exceeds query_size_limit");
+    assert_eq!(
+        err.detail,
+        Some(format!(
+            "message is {} bytes, query_size_limit is 1024 bytes",
+            msg_size
+        ))
+    );
+
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_size_limit_warn() {
+    let (mut conn, mut client, _) = new_client!(false);
+
+    let mut c = (*config()).clone();
+    c.config.general.query_size_limit = Some(1024);
+    c.config.general.query_size_limit_action = QuerySizeLimitAction::Warn;
+    set(c).unwrap();
+
+    let handle = tokio::spawn(async move { client.run().await.unwrap() });
+
+    // 100 distinct columns — readable in logs, exceeds the 1024-byte warn limit.
+    let big_query = format!(
+        "SELECT {}",
+        (1..=100)
+            .map(|i| format!("{i} AS col_{i:03}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    conn.write_all(&Query::new(&big_query).to_bytes())
+        .await
+        .unwrap();
+    read_messages(&mut conn, &['T', 'D', 'C', 'Z']).await;
+
+    conn.write_all(&Terminate.to_bytes()).await.unwrap();
+    handle.await.unwrap();
 }

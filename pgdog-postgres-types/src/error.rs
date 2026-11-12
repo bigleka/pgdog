@@ -1,5 +1,6 @@
 //! Network errors.
 
+use crate::datum::DataType;
 use std::array::TryFromSliceError;
 
 use thiserror::Error;
@@ -47,4 +48,19 @@ pub enum Error {
 
     #[error("lsn decode error")]
     LsnDecode,
+
+    #[error("expected {0}, got {1}")]
+    IncompatibleTypes(DataType, DataType),
+
+    #[error("invalid operation {op} for {ty}")]
+    InvalidOperation { op: &'static str, ty: DataType },
+
+    #[error("cannot cast from {from} to {to}")]
+    InvalidCast { from: DataType, to: DataType },
+
+    #[error("value out of range for {0}")]
+    NumericOutOfRange(DataType),
+
+    #[error("{0} text output depends on server settings")]
+    SessionDependentText(DataType),
 }

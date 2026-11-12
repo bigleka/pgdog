@@ -1,122 +1,178 @@
 //! A collection of replicas and a primary.
 
 use futures::future::try_join_all;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use pgdog_config::AuthType;
 use pgdog_config::{
-    users::PasswordKind, LoadSchema, PreparedStatements, QueryParserEngine, QueryParserLevel,
-    Rewrite, RewriteMode,
+    LoadSchema, PreparedStatementsLevel, QueryParser, QueryParserLevel, Rewrite, RewriteMode,
+    users::PasswordKind,
 };
-use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
-use tokio::{spawn, sync::Notify};
-use tracing::{error, info};
+use std::{sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 
+use crate::backend::schema::SchemaCache;
+use crate::backend::server::ServerRequest;
 use crate::{
     backend::{
-        databases::{databases, User as DatabaseUser},
-        pool::ee::schema_changed_hook,
-        replication::{ReplicationConfig, ShardedSchemas},
-        Schema, ShardedTables,
+        Schema, ShardedTables, databases::User as DatabaseUser, replication::ShardedSchemas,
     },
     config::{
-        ConnectionRecovery, MultiTenant, PoolerMode, ReadWriteSplit, ReadWriteStrategy,
-        ShardedTable, User,
+        ConnectionRecovery, MultiTenant, PoolerMode, ReadWriteSplit, ReadWriteStrategy, User,
     },
-    frontend::{ClientRequest, RegexParser},
-    net::{messages::BackendKeyData, Query},
+    frontend::{ClientRequest, RegexParser, router::round_robin},
+    net::{
+        bind::Parameter as BindParameter, messages::DataRow, messages::FrontendPid,
+        parameter::ParameterValue,
+    },
 };
 
-use super::{Address, Config, Error, Guard, MirrorStats, Request, Shard, ShardConfig};
+use super::{
+    Address, CanonicalOids, ClusterFailoverSignalWatcher, ClusterMetrics, Config, Error, Guard,
+    Request, Shard, ShardConfig,
+};
 use crate::config::LoadBalancingStrategy;
+use launch::Readiness;
+
+pub(crate) mod launch;
+pub(crate) mod schema_loader;
+
+pub(crate) use schema_loader::SchemaLoader;
 
 #[derive(Clone, Debug, Default)]
 /// Database configuration.
-pub struct PoolConfig {
+pub(crate) struct PoolConfig {
     /// Database address.
     pub(crate) address: Address,
     /// Pool settings.
     pub(crate) config: Config,
 }
 
-#[derive(Default, Debug)]
-struct Readiness {
-    online: AtomicBool,
-    schema_loading_started: AtomicBool,
-    schemas_loaded: AtomicUsize,
-    schemas_ready: Notify,
-}
-
 /// A collection of sharded replicas and primaries
 /// belonging to the same database cluster.
-#[derive(Clone, Default, Debug)]
-pub struct Cluster {
+/// Mapped to a singular `User`, see "databases: HashMap<User, Cluster>" in backend/databases.rs
+#[derive(Clone, Debug)]
+pub(crate) struct Cluster {
     identifier: Arc<DatabaseUser>,
     shards: Vec<Shard>,
     passwords: Vec<PasswordKind>,
     pooler_mode: PoolerMode,
-    sharded_tables: ShardedTables,
-    sharded_schemas: ShardedSchemas,
-    replication_sharding: Option<String>,
+    sharding_schema: ShardingSchema,
     multi_tenant: Option<MultiTenant>,
     rw_strategy: ReadWriteStrategy,
+    rw_split: ReadWriteSplit,
     schema_admin: bool,
-    stats: Arc<Mutex<MirrorStats>>,
+    stats: Arc<Mutex<ClusterMetrics>>,
     cross_shard_disabled: bool,
     two_phase_commit: bool,
     two_phase_commit_auto: bool,
     readiness: Arc<Readiness>,
-    rewrite: Rewrite,
-    prepared_statements: PreparedStatements,
+    prepared_statements: PreparedStatementsLevel,
     dry_run: bool,
     expanded_explain: bool,
-    pub_sub_channel_size: usize,
     query_parser: QueryParserLevel,
-    connection_recovery: ConnectionRecovery,
     client_connection_recovery: ConnectionRecovery,
-    query_parser_engine: QueryParserEngine,
     reload_schema_on_ddl: bool,
     load_schema: LoadSchema,
     resharding_parallel_copies: usize,
     resharding_copy_retry_max_attempts: usize,
     resharding_copy_retry_min_delay: Duration,
+    resharding_replication_retry_max_attempts: usize,
+    resharding_replication_retry_min_delay: Duration,
+    sharding_lookup_timeout: Duration,
     regex_parser: RegexParser,
+    /// Result cache enabled: needs the query parser.
     result_cache: bool,
+    identity: Option<String>,
+    tls_client_certificate_required: bool,
+    #[debug(skip)]
+    schema_loader: Box<dyn SchemaLoader>,
+    canonical_oids: Option<Arc<CanonicalOids>>,
+    read_only: bool,
+    failover_signal: ClusterFailoverSignalWatcher,
+    cancellation_token: CancellationToken,
+    auth_type: AuthType,
+}
+
+/// Bare test clusters carry the same defaults the config would apply,
+/// so settings like the lookup timeout come from `pgdog-config` in
+/// tests too, not from a zeroed field.
+#[cfg(test)]
+impl Default for Cluster {
+    fn default() -> Self {
+        use pgdog_config::General;
+
+        Self {
+            identifier: Default::default(),
+            shards: Default::default(),
+            passwords: Default::default(),
+            pooler_mode: Default::default(),
+            sharding_schema: Default::default(),
+            multi_tenant: Default::default(),
+            rw_strategy: Default::default(),
+            rw_split: Default::default(),
+            schema_admin: Default::default(),
+            stats: Default::default(),
+            cross_shard_disabled: Default::default(),
+            two_phase_commit: Default::default(),
+            two_phase_commit_auto: Default::default(),
+            readiness: Default::default(),
+            prepared_statements: Default::default(),
+            dry_run: Default::default(),
+            expanded_explain: Default::default(),
+            query_parser: Default::default(),
+            client_connection_recovery: Default::default(),
+            reload_schema_on_ddl: Default::default(),
+            load_schema: Default::default(),
+            resharding_parallel_copies: Default::default(),
+            resharding_copy_retry_max_attempts: Default::default(),
+            resharding_copy_retry_min_delay: Default::default(),
+            resharding_replication_retry_max_attempts: Default::default(),
+            resharding_replication_retry_min_delay: Default::default(),
+            sharding_lookup_timeout: Duration::from_millis(General::sharding_lookup_timeout()),
+            regex_parser: Default::default(),
+            result_cache: false,
+            identity: Default::default(),
+            tls_client_certificate_required: Default::default(),
+            schema_loader: Default::default(),
+            canonical_oids: Default::default(),
+            read_only: Default::default(),
+            failover_signal: ClusterFailoverSignalWatcher::default(),
+            cancellation_token: Default::default(),
+            auth_type: AuthType::default(),
+        }
+    }
 }
 
 /// Sharding configuration from the cluster.
 #[derive(Debug, Clone, Default)]
-pub struct ShardingSchema {
+pub(crate) struct ShardingSchema {
     /// Number of shards.
-    pub shards: usize,
+    pub(crate) shards: usize,
     /// Sharded tables.
-    pub tables: ShardedTables,
-    /// Scemas.
-    pub schemas: ShardedSchemas,
+    pub(crate) tables: ShardedTables,
+    /// Schemas.
+    pub(crate) schemas: ShardedSchemas,
     /// Rewrite config.
-    pub rewrite: Rewrite,
-    /// Query parser engine.
-    pub query_parser_engine: QueryParserEngine,
+    pub(crate) rewrite: Rewrite,
+    pub(crate) log_min_duration_parse: Option<Duration>,
+    pub(crate) log_query_sample_length: usize,
 }
 
 impl ShardingSchema {
-    pub fn tables(&self) -> &ShardedTables {
+    pub(crate) fn tables(&self) -> &ShardedTables {
         &self.tables
     }
 }
 
 #[derive(Debug)]
-pub struct ClusterShardConfig {
-    pub primary: Option<PoolConfig>,
-    pub replicas: Vec<PoolConfig>,
+pub(crate) struct ClusterShardConfig {
+    pub(crate) primary: Option<PoolConfig>,
+    pub(crate) replicas: Vec<PoolConfig>,
 }
 
 impl ClusterShardConfig {
-    pub fn pooler_mode(&self) -> PoolerMode {
+    pub(crate) fn pooler_mode(&self) -> PoolerMode {
         // One of these will exist.
 
         if let Some(ref primary) = self.primary {
@@ -132,50 +188,63 @@ impl ClusterShardConfig {
 
 /// Cluster creation config.
 #[derive(Debug)]
-pub struct ClusterConfig<'a> {
-    pub name: &'a str,
-    pub shards: &'a [ClusterShardConfig],
-    pub lb_strategy: LoadBalancingStrategy,
-    pub user: &'a str,
-    pub passwords: Vec<PasswordKind>,
-    pub pooler_mode: PoolerMode,
-    pub sharded_tables: ShardedTables,
-    pub replication_sharding: Option<String>,
-    pub multi_tenant: &'a Option<MultiTenant>,
-    pub rw_strategy: ReadWriteStrategy,
-    pub rw_split: ReadWriteSplit,
-    pub schema_admin: bool,
-    pub cross_shard_disabled: bool,
-    pub two_pc: bool,
-    pub two_pc_auto: bool,
-    pub sharded_schemas: ShardedSchemas,
-    pub rewrite: &'a Rewrite,
-    pub prepared_statements: &'a PreparedStatements,
-    pub dry_run: bool,
-    pub expanded_explain: bool,
-    pub pub_sub_channel_size: usize,
-    pub query_parser: QueryParserLevel,
-    pub query_parser_engine: QueryParserEngine,
-    pub connection_recovery: ConnectionRecovery,
-    pub client_connection_recovery: ConnectionRecovery,
-    pub lsn_check_interval: Duration,
-    pub reload_schema_on_ddl: bool,
-    pub load_schema: LoadSchema,
-    pub resharding_parallel_copies: usize,
-    pub resharding_copy_retry_max_attempts: usize,
-    pub resharding_copy_retry_min_delay: u64,
-    pub regex_parser_limit: usize,
-    pub pub_sub_enabled: bool,
-    pub result_cache: bool,
+pub(crate) struct ClusterConfig<'a> {
+    name: &'a str,
+    shards: &'a [ClusterShardConfig],
+    lb_strategy: LoadBalancingStrategy,
+    user: &'a str,
+    passwords: Vec<PasswordKind>,
+    pooler_mode: PoolerMode,
+    sharded_tables: ShardedTables,
+    multi_tenant: &'a Option<MultiTenant>,
+    rw_strategy: ReadWriteStrategy,
+    rw_split: ReadWriteSplit,
+    schema_admin: bool,
+    cross_shard_disabled: bool,
+    two_pc: bool,
+    two_pc_auto: bool,
+    sharded_schemas: ShardedSchemas,
+    rewrite: &'a Rewrite,
+    prepared_statements: &'a PreparedStatementsLevel,
+    dry_run: bool,
+    expanded_explain: bool,
+    query_parser: QueryParserLevel,
+    log_min_duration_parse: Option<Duration>,
+    log_query_sample_length: usize,
+    client_connection_recovery: ConnectionRecovery,
+    lsn_check_interval: Duration,
+    reload_schema_on_ddl: bool,
+    load_schema: LoadSchema,
+    resharding_parallel_copies: usize,
+    resharding_copy_retry_max_attempts: usize,
+    resharding_copy_retry_min_delay: u64,
+    resharding_replication_retry_max_attempts: usize,
+    resharding_replication_retry_min_delay: u64,
+    sharding_lookup_timeout: u64,
+    regex_parser_limit: usize,
+    pub_sub_enabled: bool,
+    result_cache: bool,
+    identity: &'a Option<String>,
+    tls_client_certificate_required: bool,
+    schema_cache: SchemaCache,
+    canonicalize_oids: bool,
+    read_only: bool,
+    auth_type: AuthType,
 }
 
 impl<'a> ClusterConfig<'a> {
+    /// Dependencies for creating a Cluster.
+    ///
+    /// TODO(lev): This is getting unruly. We may need a struct for a struct :)
+    ///
     pub(crate) fn new(
         config: &'a crate::config::Config,
         user: &'a User,
         shards: &'a [ClusterShardConfig],
         sharded_tables: ShardedTables,
         sharded_schemas: ShardedSchemas,
+        query_parser: QueryParser,
+        schema_cache: SchemaCache,
     ) -> Self {
         let general = &config.general;
         let multi_tenant = config.multi_tenant();
@@ -190,14 +259,13 @@ impl<'a> ClusterConfig<'a> {
             name: &user.database,
             passwords: user.passwords(),
             user: &user.name,
-            replication_sharding: user.replication_sharding.clone(),
             pooler_mode,
             lb_strategy: general.load_balancing_strategy,
             shards,
             sharded_tables,
             multi_tenant,
             rw_strategy: general.read_write_strategy,
-            rw_split: general.read_write_split,
+            rw_split: user.read_write_split.unwrap_or(general.read_write_split),
             schema_admin: user.schema_admin,
             cross_shard_disabled: user
                 .cross_shard_disabled
@@ -211,30 +279,39 @@ impl<'a> ClusterConfig<'a> {
             prepared_statements: &general.prepared_statements,
             dry_run: general.dry_run,
             expanded_explain: general.expanded_explain,
-            pub_sub_channel_size: general.pub_sub_channel_size,
-            query_parser: general.query_parser,
-            query_parser_engine: general.query_parser_engine,
-            connection_recovery: general.connection_recovery,
+            query_parser: query_parser.level,
+            log_min_duration_parse: general.log_min_duration_parse(),
+            log_query_sample_length: general.log_query_sample_length,
             client_connection_recovery: general.client_connection_recovery,
             lsn_check_interval: Duration::from_millis(general.lsn_check_interval),
             reload_schema_on_ddl: general.reload_schema_on_ddl,
             load_schema: general.load_schema,
             resharding_parallel_copies: general.resharding_parallel_copies,
             resharding_copy_retry_max_attempts: general.resharding_copy_retry_max_attempts,
+            sharding_lookup_timeout: general.sharding_lookup_timeout,
             resharding_copy_retry_min_delay: general.resharding_copy_retry_min_delay,
+            resharding_replication_retry_max_attempts: general
+                .resharding_replication_retry_max_attempts,
+            resharding_replication_retry_min_delay: general.resharding_replication_retry_min_delay,
             regex_parser_limit: general.regex_parser_limit,
             pub_sub_enabled: general.pub_sub_enabled(),
             result_cache: config
                 .result_cache
                 .as_ref()
                 .is_some_and(|result_cache| result_cache.enabled),
+            identity: &user.identity,
+            tls_client_certificate_required: user.tls_client_certificate_required.unwrap_or(true),
+            schema_cache,
+            canonicalize_oids: general.canonicalize_type_information,
+            read_only: user.read_only.unwrap_or(false),
+            auth_type: user.auth_type.unwrap_or(general.auth_type),
         }
     }
 }
 
 impl Cluster {
     /// Create new cluster of shards.
-    pub fn new(config: ClusterConfig) -> Self {
+    pub(crate) fn new(config: ClusterConfig) -> Self {
         let ClusterConfig {
             name,
             shards,
@@ -243,7 +320,6 @@ impl Cluster {
             passwords,
             pooler_mode,
             sharded_tables,
-            replication_sharding,
             multi_tenant,
             rw_strategy,
             rw_split,
@@ -256,95 +332,146 @@ impl Cluster {
             prepared_statements,
             dry_run,
             expanded_explain,
-            pub_sub_channel_size,
             query_parser,
-            connection_recovery,
             client_connection_recovery,
             lsn_check_interval,
-            query_parser_engine,
+            log_min_duration_parse,
+            log_query_sample_length,
             reload_schema_on_ddl,
             load_schema,
             resharding_parallel_copies,
             resharding_copy_retry_max_attempts,
             resharding_copy_retry_min_delay,
+            resharding_replication_retry_max_attempts,
+            resharding_replication_retry_min_delay,
+            sharding_lookup_timeout,
             regex_parser_limit,
             pub_sub_enabled,
             result_cache,
+            identity,
+            tls_client_certificate_required,
+            schema_cache,
+            canonicalize_oids,
+            read_only,
+            auth_type,
         } = config;
 
         let identifier = Arc::new(DatabaseUser {
             user: user.to_owned(),
             database: name.to_owned(),
         });
+        let canonical_oids = canonicalize_oids.then(|| schema_cache.canonical_oids(name));
+
+        let stats = Arc::new(Mutex::new(ClusterMetrics {
+            lookup: sharded_tables.lookup_cache().stats().clone(),
+            ..Default::default()
+        }));
+
+        let shard_pools = shards
+            .iter()
+            .enumerate()
+            .map(|(number, config)| {
+                Shard::new(ShardConfig {
+                    number,
+                    primary: config.primary.as_ref(),
+                    replicas: &config.replicas,
+                    lb_strategy,
+                    rw_split,
+                    identifier: identifier.clone(),
+                    lsn_check_interval,
+                    pub_sub_enabled,
+                    schema_cache: schema_cache.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let failover_signal = ClusterFailoverSignalWatcher::new(&shard_pools);
 
         Self {
             identifier: identifier.clone(),
-            shards: shards
-                .iter()
-                .enumerate()
-                .map(|(number, config)| {
-                    Shard::new(ShardConfig {
-                        number,
-                        primary: &config.primary,
-                        replicas: &config.replicas,
-                        lb_strategy,
-                        rw_split,
-                        identifier: identifier.clone(),
-                        lsn_check_interval,
-                        pub_sub_enabled,
-                    })
-                })
-                .collect(),
+            shards: shard_pools,
             passwords,
             pooler_mode,
-            sharded_tables,
-            sharded_schemas,
-            replication_sharding,
+            sharding_schema: ShardingSchema {
+                shards: shards.len(),
+                tables: sharded_tables,
+                schemas: sharded_schemas,
+                rewrite: rewrite.clone(),
+                log_min_duration_parse,
+                log_query_sample_length,
+            },
             multi_tenant: multi_tenant.clone(),
             rw_strategy,
+            rw_split,
             schema_admin,
-            stats: Arc::new(Mutex::new(MirrorStats::default())),
+            stats,
             cross_shard_disabled,
             two_phase_commit: two_pc && shards.len() > 1,
             two_phase_commit_auto: two_pc_auto && shards.len() > 1,
             readiness: Arc::new(Readiness::default()),
-            rewrite: rewrite.clone(),
             prepared_statements: *prepared_statements,
             dry_run,
             expanded_explain,
-            pub_sub_channel_size,
             query_parser,
-            connection_recovery,
             client_connection_recovery,
-            query_parser_engine,
             reload_schema_on_ddl,
             load_schema,
             resharding_parallel_copies,
             resharding_copy_retry_max_attempts,
             resharding_copy_retry_min_delay: Duration::from_millis(resharding_copy_retry_min_delay),
+            resharding_replication_retry_max_attempts,
+            resharding_replication_retry_min_delay: Duration::from_millis(
+                resharding_replication_retry_min_delay,
+            ),
+            sharding_lookup_timeout: Duration::from_millis(sharding_lookup_timeout),
             regex_parser: RegexParser::new(regex_parser_limit, query_parser),
             result_cache,
+            identity: identity.clone(),
+            tls_client_certificate_required,
+            schema_loader: Box::new(schema_loader::FromServer),
+            canonical_oids,
+            read_only,
+            failover_signal,
+            cancellation_token: Default::default(),
+            auth_type,
         }
     }
 
+    pub(crate) fn get_cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
+    /// Terminates all active connections for the `Cluster`
+    /// and marks all `Pool`s as offline to refuse future connections.
+    pub(crate) fn terminate_active_connections(&self) {
+        for shard in self.shards() {
+            for pool in shard.pools() {
+                pool.set_offline();
+            }
+        }
+        self.cancellation_token.cancel();
+    }
+
     /// Change config to work with logical replication streaming.
-    pub fn logical_stream(&self) -> Self {
+    pub(crate) fn logical_stream(&self) -> Self {
         let mut cluster = self.clone();
         // Disable rewrites, we are only sending valid statements.
-        cluster.rewrite.enabled = false;
-        cluster.rewrite.shard_key = RewriteMode::Ignore;
-        cluster.rewrite.split_inserts = RewriteMode::Ignore;
+        let rewrite = &mut cluster.sharding_schema.rewrite;
+        rewrite.enabled = false;
+        rewrite.shard_key = RewriteMode::Ignore;
+        rewrite.split_inserts = RewriteMode::Ignore;
+        rewrite.non_deterministic_functions = RewriteMode::Ignore;
         cluster
     }
 
     /// Get a connection to a primary of the given shard.
-    pub async fn primary(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
+    pub(crate) async fn primary(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
         let shard = self.shards.get(shard).ok_or(Error::NoShard(shard))?;
         shard.primary(request).await
     }
 
     /// Get a connection to a replica of the given shard.
-    pub async fn replica(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
+    pub(crate) async fn replica(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
         let shard = self.shards.get(shard).ok_or(Error::NoShard(shard))?;
         shard.replica(request).await
     }
@@ -352,24 +479,22 @@ impl Cluster {
     /// The two clusters have the same databases.
     pub(crate) fn can_move_conns_to(&self, other: &Cluster) -> bool {
         self.shards.len() == other.shards.len()
-            && self
-                .shards
-                .iter()
-                .zip(other.shards.iter())
-                .all(|(a, b)| a.can_move_conns_to(b))
     }
 
     /// Move connections from cluster to another, saving them.
-    pub(crate) fn move_conns_to(&self, other: &Cluster) -> Result<(), Error> {
+    /// Returns true if any `Pool`s were moved.
+    pub(crate) fn move_conns_to(&self, other: &Cluster) -> Result<bool, Error> {
+        let mut moved = false;
+
         for (from, to) in self.shards.iter().zip(other.shards.iter()) {
-            from.move_conns_to(to)?;
+            moved |= from.move_conns_to(to)?;
         }
 
-        Ok(())
+        Ok(moved)
     }
 
     /// Cancel a query executed by one of the shards.
-    pub async fn cancel(&self, id: &BackendKeyData) -> Result<(), super::super::Error> {
+    pub(crate) async fn cancel(&self, id: FrontendPid) -> Result<(), super::super::Error> {
         for shard in &self.shards {
             shard.cancel(id).await?;
         }
@@ -378,74 +503,90 @@ impl Cluster {
     }
 
     /// Get all shards.
-    pub fn shards(&self) -> &[Shard] {
+    pub(crate) fn shards(&self) -> &[Shard] {
         &self.shards
     }
 
-    pub fn passwords(&self) -> &[PasswordKind] {
+    /// The database's default `TimeZone`
+    pub(crate) fn default_timezone(&self) -> Option<&ParameterValue> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.pool_iter())
+            .find_map(|pool| pool.cached_params()?.get("TimeZone"))
+    }
+
+    pub(crate) fn passwords(&self) -> &[PasswordKind] {
         &self.passwords
     }
 
+    /// Get user identity which should match the TLS certificate it provided
+    /// when connecting.
+    pub(crate) fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// This user must present a client TLS certificate when connecting over TLS.
+    pub(crate) fn tls_client_certificate_required(&self) -> bool {
+        self.tls_client_certificate_required
+    }
+
     /// User name.
-    pub fn user(&self) -> &str {
+    pub(crate) fn user(&self) -> &str {
         &self.identifier.user
     }
 
     /// Cluster name (database name).
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.identifier.database
     }
 
     /// Get unique cluster identifier.
-    pub fn identifier(&self) -> Arc<DatabaseUser> {
+    pub(crate) fn identifier(&self) -> Arc<DatabaseUser> {
         self.identifier.clone()
     }
 
     /// Get pooler mode.
-    pub fn pooler_mode(&self) -> PoolerMode {
+    pub(crate) fn pooler_mode(&self) -> PoolerMode {
         self.pooler_mode
     }
 
     // Get sharded tables if any.
-    pub fn sharded_tables(&self) -> &[ShardedTable] {
-        self.sharded_tables.tables()
+    pub(crate) fn sharded_tables(&self) -> &ShardedTables {
+        &self.sharding_schema.tables
     }
 
     /// Get query rewrite config.
-    pub fn rewrite(&self) -> &Rewrite {
-        &self.rewrite
+    pub(crate) fn rewrite(&self) -> &Rewrite {
+        &self.sharding_schema.rewrite
     }
 
-    pub fn query_parser(&self) -> QueryParserLevel {
+    pub(crate) fn query_parser(&self) -> QueryParserLevel {
         self.query_parser
     }
 
-    pub fn prepared_statements(&self) -> &PreparedStatements {
+    pub(crate) fn prepared_statements(&self) -> &PreparedStatementsLevel {
         &self.prepared_statements
     }
 
-    pub fn connection_recovery(&self) -> &ConnectionRecovery {
-        &self.connection_recovery
-    }
-
-    pub fn client_connection_recovery(&self) -> &ConnectionRecovery {
+    pub(crate) fn client_connection_recovery(&self) -> &ConnectionRecovery {
         &self.client_connection_recovery
     }
 
-    pub fn dry_run(&self) -> bool {
+    pub(crate) fn dry_run(&self) -> bool {
         self.dry_run
     }
 
-    pub fn expanded_explain(&self) -> bool {
+    pub(crate) fn expanded_explain(&self) -> bool {
         self.expanded_explain
     }
 
-    pub fn pub_sub_enabled(&self) -> bool {
-        self.pub_sub_channel_size > 0
-    }
+    /// A cluster is read_only if zero shards have a primary,
+    /// or if `read_only` for the corresponding `User` is set to true.
+    pub(crate) fn read_only(&self) -> bool {
+        if self.read_only {
+            return true;
+        }
 
-    /// A cluster is read_only if zero shards have a primary.
-    pub fn read_only(&self) -> bool {
         for shard in &self.shards {
             if shard.has_primary() {
                 return false;
@@ -456,7 +597,7 @@ impl Cluster {
     }
 
     /// This cluster is write_only if zero shards have a replica.
-    pub fn write_only(&self) -> bool {
+    pub(crate) fn write_only(&self) -> bool {
         for shard in &self.shards {
             if shard.has_replicas() {
                 return false;
@@ -467,22 +608,22 @@ impl Cluster {
     }
 
     /// This database/user pair is responsible for schema management.
-    pub fn schema_admin(&self) -> bool {
+    pub(crate) fn schema_admin(&self) -> bool {
         self.schema_admin
     }
 
     /// Change schema owner attribute.
-    pub fn toggle_schema_admin(&mut self, owner: bool) {
+    pub(crate) fn toggle_schema_admin(&mut self, owner: bool) {
         self.schema_admin = owner;
     }
 
-    pub fn stats(&self) -> Arc<Mutex<MirrorStats>> {
+    pub(crate) fn stats(&self) -> Arc<Mutex<ClusterMetrics>> {
         self.stats.clone()
     }
 
     /// We'll need the query router to figure out
     /// where a query should go.
-    pub fn router_needed(&self) -> bool {
+    pub(crate) fn router_needed(&self) -> bool {
         !(self.shards().len() == 1 && (self.read_only() || self.write_only()))
     }
 
@@ -498,8 +639,7 @@ impl Cluster {
                 self.multi_tenant().is_some()
                     || self.router_needed()
                     || self.dry_run()
-                    || self.prepared_statements() == &PreparedStatements::Full
-                    || self.pub_sub_enabled()
+                    || self.prepared_statements() == &PreparedStatementsLevel::Full
                     || self.result_cache
                     || self.regex_parser.use_parser(request)
             }
@@ -507,33 +647,20 @@ impl Cluster {
     }
 
     /// Multi-tenant config.
-    pub fn multi_tenant(&self) -> &Option<MultiTenant> {
+    pub(crate) fn multi_tenant(&self) -> &Option<MultiTenant> {
         &self.multi_tenant
     }
 
-    /// Get replication configuration for this cluster.
-    pub fn replication_sharding_config(&self) -> Option<ReplicationConfig> {
-        self.replication_sharding
-            .as_ref()
-            .and_then(|database| databases().replication(database))
-    }
-
     /// Get all data required for sharding.
-    pub fn sharding_schema(&self) -> ShardingSchema {
-        ShardingSchema {
-            shards: self.shards.len(),
-            tables: self.sharded_tables.clone(),
-            schemas: self.sharded_schemas.clone(),
-            rewrite: self.rewrite.clone(),
-            query_parser_engine: self.query_parser_engine,
-        }
+    pub(crate) fn sharding_schema(&self) -> &ShardingSchema {
+        &self.sharding_schema
     }
 
-    pub fn reload_schema(&self) -> bool {
+    pub(crate) fn reload_schema(&self) -> bool {
         self.reload_schema_on_ddl && self.load_schema()
     }
 
-    fn load_schema(&self) -> bool {
+    pub(super) fn load_schema(&self) -> bool {
         match self.load_schema {
             LoadSchema::On => true,
             LoadSchema::Off => false,
@@ -542,106 +669,86 @@ impl Cluster {
     }
 
     /// Get currently loaded schema from shard 0.
-    pub fn schema(&self) -> Schema {
+    pub(crate) fn schema(&self) -> Schema {
+        self.loaded_schema().clone()
+    }
+
+    pub(crate) fn loaded_schema(&self) -> &Schema {
+        static EMPTY: Lazy<Schema> = Lazy::new(Schema::default);
+
         self.shards
             .first()
-            .map(|shard| shard.schema())
-            .unwrap_or_default()
+            .and_then(|shard| shard.loaded_schema())
+            .unwrap_or(&EMPTY)
     }
 
     /// Read/write strategy
-    pub fn read_write_strategy(&self) -> &ReadWriteStrategy {
+    pub(crate) fn read_write_strategy(&self) -> &ReadWriteStrategy {
         &self.rw_strategy
     }
 
+    /// Route queries to the primary by default unless an explicit role hint says otherwise.
+    pub(crate) fn prefer_primary(&self) -> bool {
+        self.rw_split == ReadWriteSplit::PreferPrimary
+    }
+
+    /// Route qeuries to the replicas by default unless an explicit role hint says otherwise.
+    pub(crate) fn prefer_replica(&self) -> bool {
+        self.rw_split == ReadWriteSplit::ExcludePrimary
+    }
+
     /// Cross-shard queries disabled for this cluster.
-    pub fn cross_shard_disabled(&self) -> bool {
+    pub(crate) fn cross_shard_disabled(&self) -> bool {
         self.cross_shard_disabled
     }
 
     /// Two-phase commit enabled.
-    pub fn two_pc_enabled(&self) -> bool {
+    pub(crate) fn two_pc_enabled(&self) -> bool {
         self.two_phase_commit
     }
 
     /// Two-phase commit transactions started automatically
     /// for single-statement cross-shard writes.
-    pub fn two_pc_auto_enabled(&self) -> bool {
+    pub(crate) fn two_pc_auto_enabled(&self) -> bool {
         self.two_phase_commit_auto && self.two_pc_enabled()
     }
 
     /// How many parallel COPY commands can we
     /// run to re-shard this cluster.
-    pub fn resharding_parallel_copies(&self) -> usize {
+    pub(crate) fn resharding_parallel_copies(&self) -> usize {
         self.resharding_parallel_copies
     }
 
     /// Maximum retries for a per-table copy during resharding.
-    pub fn resharding_copy_retry_max_attempts(&self) -> usize {
+    pub(crate) fn resharding_copy_retry_max_attempts(&self) -> usize {
         self.resharding_copy_retry_max_attempts
     }
 
+    /// How long a sharding key lookup query can run before the
+    /// statement waiting on it fails.
+    pub(crate) fn sharding_lookup_timeout(&self) -> Duration {
+        self.sharding_lookup_timeout
+    }
+
     /// Base delay between table copy retry attempts. Doubles each attempt, capped at 32×.
-    pub fn resharding_copy_retry_min_delay(&self) -> &Duration {
+    pub(crate) fn resharding_copy_retry_min_delay(&self) -> &Duration {
         &self.resharding_copy_retry_min_delay
     }
 
-    /// Launch the connection pools.
-    pub(crate) fn launch(&self) {
-        for shard in self.shards() {
-            shard.launch();
-        }
-
-        // Only spawn schema loading once per cluster, even if launch() is called multiple times.
-        let already_started = self
-            .readiness
-            .schema_loading_started
-            .swap(true, Ordering::SeqCst);
-
-        if self.load_schema() && !already_started {
-            for shard in self.shards() {
-                let identifier = self.identifier();
-                let readiness = self.readiness.clone();
-                let shard = shard.clone();
-                let shards = self.shards.len();
-
-                spawn(async move {
-                    use tokio::time::sleep;
-
-                    while let Err(err) = shard.update_schema().await {
-                        // Retry.
-                        if shard.online() {
-                            error!("error loading schema for shard {}: {}", shard.number(), err);
-                            sleep(Duration::from_millis(100)).await;
-                        } else {
-                            return;
-                        }
-                    }
-
-                    let done = readiness.schemas_loaded.fetch_add(1, Ordering::SeqCst);
-
-                    info!("loaded schema from {}/{} shards", done + 1, shards);
-
-                    schema_changed_hook(&shard.schema(), &identifier, &shard);
-
-                    // Loaded schema on all shards.
-                    if done >= shards - 1 {
-                        readiness.schemas_ready.notify_waiters();
-                    }
-                });
-            }
-        }
-
-        self.readiness.online.store(true, Ordering::Relaxed);
+    /// Maximum consecutive replication-subscriber errors before the error is propagated.
+    /// `0` means retry indefinitely.
+    pub(crate) fn resharding_replication_retry_max_attempts(&self) -> usize {
+        self.resharding_replication_retry_max_attempts
     }
 
-    /// Shutdown the connection pools.
-    pub(crate) fn shutdown(&self) {
-        for shard in self.shards() {
-            shard.shutdown();
-        }
+    /// Base delay between replication-subscriber retry attempts.
+    pub(crate) fn resharding_replication_retry_min_delay(&self) -> Duration {
+        self.resharding_replication_retry_min_delay
+    }
 
-        self.readiness.online.store(false, Ordering::Relaxed);
+    /// Get auth algorithm used by clients to connect.
+    pub(crate) fn auth_type(&self) -> &AuthType {
+        &self.auth_type
     }
 
     /// Send a cancellation request for all running queries.
@@ -659,65 +766,55 @@ impl Cluster {
         Ok(())
     }
 
-    /// Is the cluster online?
-    pub(crate) fn online(&self) -> bool {
-        self.readiness.online.load(Ordering::Relaxed)
-    }
-
-    /// Schema loaded for all shards?
-    pub(crate) async fn wait_schema_loaded(&self) {
-        if !self.load_schema() {
-            return;
-        }
-
-        fn check_loaded(cluster: &Cluster) -> bool {
-            cluster.readiness.schemas_loaded.load(Ordering::Acquire) == cluster.shards.len()
-        }
-
-        // Fast path.
-        if check_loaded(self) {
-            return;
-        }
-
-        // Queue up.
-        let notified = self.readiness.schemas_ready.notified();
-        // Race condition check.
-        if check_loaded(self) {
-            return;
-        }
-        notified.await;
-    }
-
-    /// Execute a query on every primary in the cluster.
-    pub async fn execute(
+    /// Run a parameterized query on one shard, picked round-robin, and
+    /// return all rows. The answer is only authoritative if every shard
+    /// has the same data, e.g. an omnisharded table.
+    pub(crate) async fn fetch_all_round_robin<T: From<DataRow>>(
         &self,
-        query: impl Into<Query> + Clone,
-    ) -> Result<(), crate::backend::Error> {
-        for shard in 0..self.shards.len() {
-            let mut server = self.primary(shard, &Request::default()).await?;
-            server.execute(query.clone()).await?;
-        }
+        query: &str,
+        params: &[BindParameter],
+    ) -> Result<Vec<T>, crate::backend::Error> {
+        let shard = self
+            .shards
+            .get(round_robin::next(self.shards.len().max(1)))
+            .ok_or(crate::backend::pool::Error::NoDatabases)?;
+        let mut server = shard.primary_or_replica(&Request::default()).await?;
 
-        Ok(())
+        server
+            .fetch_all(ServerRequest::parameterized(query, params))
+            .await
+    }
+
+    pub(crate) fn is_canonicalizing_oids(&self) -> bool {
+        self.canonical_oids.is_some()
+    }
+
+    /// Listen for failover signal from one or more shards.
+    #[allow(unused)]
+    pub(crate) fn failover_signal(&mut self) -> &mut ClusterFailoverSignalWatcher {
+        &mut self.failover_signal
     }
 }
 
 #[cfg(test)]
 mod test {
+    use parking_lot::Mutex;
     use std::{sync::Arc, time::Duration};
 
-    use pgdog_config::{ConfigAndUsers, OmnishardedTable, QueryParserLevel, ShardedSchema};
+    use super::{ClusterMetrics, ShardingSchema};
+    use pgdog_config::{
+        ConfigAndUsers, OmnishardedTable, PoolerMode, QueryParserLevel, ShardedSchema,
+    };
 
+    use crate::backend::pool::cluster::SchemaLoader;
+    use crate::frontend::router::sharding::ShardedTable;
     use crate::{
         backend::{
+            Shard, ShardedTables,
             pool::{Address, Config, PoolConfig, ShardConfig},
             replication::ShardedSchemas,
-            Shard, ShardedTables,
         },
-        config::{
-            config, DataType, Hasher, LoadBalancingStrategy, MultiTenant, ReadWriteSplit,
-            ReadWriteStrategy, ShardedTable,
-        },
+        config::{DataType, Hasher, MultiTenant, ReadWriteSplit, ReadWriteStrategy, Role, config},
         frontend::ClientRequest,
         net::Query,
     };
@@ -725,17 +822,20 @@ mod test {
     use super::{Cluster, DatabaseUser};
 
     impl Cluster {
-        pub fn new_test(config: &ConfigAndUsers) -> Self {
+        pub(crate) fn new_test(config: &ConfigAndUsers) -> Self {
             let identifier = Arc::new(DatabaseUser {
                 user: "pgdog".into(),
                 database: "pgdog".into(),
             });
-            let primary = &Some(PoolConfig {
+            let primary = Some(&PoolConfig {
                 address: Address::new_test(),
                 config: Config::default(),
             });
             let replicas = &[PoolConfig {
-                address: Address::new_test(),
+                address: Address {
+                    configured_role: Role::Replica,
+                    ..Address::new_test()
+                },
                 config: Config::default(),
             }];
 
@@ -745,56 +845,91 @@ mod test {
                         number,
                         primary,
                         replicas,
-                        lb_strategy: LoadBalancingStrategy::Random,
-                        rw_split: ReadWriteSplit::IncludePrimary,
                         identifier: identifier.clone(),
                         lsn_check_interval: Duration::MAX,
-                        pub_sub_enabled: false,
+                        ..Default::default()
                     })
                 })
                 .collect::<Vec<_>>();
 
-            Cluster {
-                sharded_tables: ShardedTables::new(
-                    vec![ShardedTable {
+            let sharded_tables = ShardedTables::new(
+                vec![
+                    ShardedTable {
                         database: "pgdog".into(),
                         name: Some("sharded".into()),
                         column: "id".into(),
                         primary: true,
                         centroids: vec![],
                         data_type: DataType::Bigint,
-                        centroids_path: None,
                         centroid_probes: 1,
                         hasher: Hasher::Postgres,
                         ..Default::default()
-                    }],
-                    vec![
-                        OmnishardedTable {
-                            name: "sharded_omni".into(),
-                            sticky_routing: false,
-                        },
-                        OmnishardedTable {
-                            name: "sharded_omni_sticky".into(),
-                            sticky_routing: true,
-                        },
-                    ],
-                    config.config.general.omnisharded_sticky,
-                    config.config.general.system_catalogs,
-                ),
-                sharded_schemas: ShardedSchemas::new(vec![
-                    ShardedSchema {
+                    },
+                    ShardedTable {
                         database: "pgdog".into(),
-                        name: Some("shard_0".into()),
-                        shard: 0,
+                        name: Some("posts".into()),
+                        column: "id".into(),
+                        primary: true,
+                        centroids: vec![],
+                        data_type: DataType::Bigint,
+                        centroid_probes: 1,
+                        hasher: Hasher::Postgres,
                         ..Default::default()
                     },
-                    ShardedSchema {
+                    // Duplicate-row table for FULL identity ctid-targeting tests.
+                    // No primary key on destination — allows identical rows.
+                    ShardedTable {
                         database: "pgdog".into(),
-                        name: Some("shard_1".into()),
-                        shard: 1,
+                        name: Some("full_dup_rows".into()),
+                        column: "id".into(),
+                        primary: true,
+                        centroids: vec![],
+                        data_type: DataType::Bigint,
+                        centroid_probes: 1,
+                        hasher: Hasher::Postgres,
                         ..Default::default()
                     },
-                ]),
+                ],
+                vec![
+                    OmnishardedTable {
+                        name: "sharded_omni".into(),
+                        sticky_routing: false,
+                    },
+                    OmnishardedTable {
+                        name: "sharded_omni_sticky".into(),
+                        sticky_routing: true,
+                    },
+                ],
+                config.config.general.omnisharded_sticky,
+                config.config.general.system_catalogs,
+            );
+            let stats = Arc::new(Mutex::new(ClusterMetrics {
+                lookup: sharded_tables.lookup_cache().stats().clone(),
+                ..Default::default()
+            }));
+
+            Cluster {
+                sharding_schema: ShardingSchema {
+                    shards: shards.len(),
+                    tables: sharded_tables,
+                    schemas: ShardedSchemas::new(vec![
+                        ShardedSchema {
+                            database: "pgdog".into(),
+                            name: Some("shard_0".into()),
+                            shard: 0,
+                            ..Default::default()
+                        },
+                        ShardedSchema {
+                            database: "pgdog".into(),
+                            name: Some("shard_1".into()),
+                            shard: 1,
+                            ..Default::default()
+                        },
+                    ]),
+                    rewrite: config.config.rewrite.clone(),
+                    ..Default::default()
+                },
+                stats,
                 shards,
                 identifier,
                 prepared_statements: config.config.general.prepared_statements,
@@ -805,21 +940,35 @@ mod test {
                     config.config.general.regex_parser_limit,
                     config.config.general.query_parser,
                 ),
-                rewrite: config.config.rewrite.clone(),
                 two_phase_commit: config.config.general.two_phase_commit,
+                sharding_lookup_timeout: Duration::from_millis(
+                    config.config.general.sharding_lookup_timeout,
+                ),
                 two_phase_commit_auto: config.config.general.two_phase_commit_auto.unwrap_or(false),
+                canonical_oids: config
+                    .config
+                    .general
+                    .canonicalize_type_information
+                    .then(Default::default),
                 ..Default::default()
             }
         }
 
-        pub fn new_test_single_shard(config: &ConfigAndUsers) -> Cluster {
+        pub(crate) fn new_test_single_shard(config: &ConfigAndUsers) -> Cluster {
             let mut cluster = Self::new_test(config);
             cluster.shards.pop();
+            cluster.sharding_schema.shards = cluster.shards.len();
 
             cluster
         }
 
-        pub fn new_test_single_primary(config: &ConfigAndUsers) -> Cluster {
+        pub(crate) fn new_test_session_mode(config: &ConfigAndUsers) -> Cluster {
+            let mut cluster = Self::new_test(config);
+            cluster.pooler_mode = PoolerMode::Session;
+            cluster
+        }
+
+        pub(crate) fn new_test_single_primary(config: &ConfigAndUsers) -> Cluster {
             let identifier = Arc::new(DatabaseUser {
                 user: "pgdog".into(),
                 database: "pgdog".into(),
@@ -827,17 +976,12 @@ mod test {
 
             Cluster {
                 shards: vec![Shard::new(ShardConfig {
-                    number: 0,
-                    primary: &Some(PoolConfig {
+                    primary: Some(&PoolConfig {
                         address: Address::new_test(),
                         config: Config::default(),
                     }),
-                    replicas: &[],
-                    lb_strategy: LoadBalancingStrategy::default(),
-                    rw_split: ReadWriteSplit::default(),
                     identifier: identifier.clone(),
-                    lsn_check_interval: Duration::default(),
-                    pub_sub_enabled: false,
+                    ..Default::default()
                 })],
                 prepared_statements: config.config.general.prepared_statements,
                 dry_run: config.config.general.dry_run,
@@ -847,15 +991,53 @@ mod test {
                     config.config.general.regex_parser_limit,
                     config.config.general.query_parser,
                 ),
-                rewrite: config.config.rewrite.clone(),
+                sharding_schema: ShardingSchema {
+                    shards: 1,
+                    rewrite: config.config.rewrite.clone(),
+                    ..Default::default()
+                },
                 two_phase_commit: config.config.general.two_phase_commit,
+                sharding_lookup_timeout: Duration::from_millis(
+                    config.config.general.sharding_lookup_timeout,
+                ),
                 two_phase_commit_auto: config.config.general.two_phase_commit_auto.unwrap_or(false),
                 ..Default::default()
             }
         }
 
-        pub fn set_read_write_strategy(&mut self, rw_strategy: ReadWriteStrategy) {
+        pub(crate) fn new_test_single_replica(config: &ConfigAndUsers) -> Cluster {
+            let mut cluster = Self::new_test_single_shard(config);
+            let identifier = cluster.identifier.clone();
+            cluster.shards[0] = Shard::new(ShardConfig {
+                replicas: &[PoolConfig {
+                    address: Address {
+                        configured_role: Role::Replica,
+                        ..Address::new_test()
+                    },
+                    config: Config::default(),
+                }],
+                identifier,
+                ..Default::default()
+            });
+
+            cluster
+        }
+
+        pub(crate) fn set_read_write_strategy(&mut self, rw_strategy: ReadWriteStrategy) {
             self.rw_strategy = rw_strategy;
+        }
+
+        pub(crate) fn set_sharded_tables(&mut self, sharded_tables: ShardedTables) {
+            self.stats.lock().lookup = sharded_tables.lookup_cache().stats().clone();
+            self.sharding_schema.tables = sharded_tables;
+        }
+
+        pub(crate) fn set_sharded_schemas(&mut self, sharded_schemas: ShardedSchemas) {
+            self.sharding_schema.schemas = sharded_schemas;
+        }
+
+        pub(crate) fn set_rw_split(&mut self, rw_split: ReadWriteSplit) {
+            self.rw_split = rw_split;
         }
     }
 
@@ -863,7 +1045,7 @@ mod test {
     fn test_load_schema_multiple_shards_empty_schemas_with_tables() {
         let config = ConfigAndUsers::default();
         let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
+        cluster.sharding_schema.schemas = ShardedSchemas::default();
 
         assert!(cluster.load_schema());
     }
@@ -881,8 +1063,8 @@ mod test {
     fn test_load_schema_multiple_shards_empty_tables() {
         let config = ConfigAndUsers::default();
         let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
-        cluster.sharded_tables = ShardedTables::default();
+        cluster.sharding_schema.schemas = ShardedSchemas::default();
+        cluster.sharding_schema.tables = ShardedTables::default();
 
         // In Auto mode with multiple shards, load_schema returns true
         // (sharded_schemas and sharded_tables no longer affect this decision)
@@ -893,7 +1075,7 @@ mod test {
     fn test_load_schema_single_shard() {
         let config = ConfigAndUsers::default();
         let mut cluster = Cluster::new_test_single_shard(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
+        cluster.sharding_schema.schemas = ShardedSchemas::default();
 
         assert!(!cluster.load_schema());
     }
@@ -913,7 +1095,7 @@ mod test {
     fn test_load_schema_multi_tenant_overrides_other_conditions() {
         let config = ConfigAndUsers::default();
         let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_tables = ShardedTables::default();
+        cluster.sharding_schema.tables = ShardedTables::default();
         cluster.multi_tenant = Some(MultiTenant {
             column: "tenant_id".into(),
         });
@@ -943,88 +1125,107 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_launch_marks_ready() {
+        let config = ConfigAndUsers::default();
+        let cluster = Cluster::new_test(&config);
+
+        assert!(!cluster.ready());
+        cluster.launch();
+        cluster.wait_ready().await;
+        assert!(cluster.ready());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_releases_readiness_waiters() {
+        use tokio::time::{Duration, timeout};
+
+        let config = ConfigAndUsers::default();
+        let cluster = Cluster::new_test(&config);
+
+        assert!(!cluster.ready());
+
+        let waiter = cluster.clone();
+        let handle = tokio::spawn(async move {
+            waiter.wait_ready().await;
+        });
+
+        cluster.shutdown();
+
+        let result = timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_launch_schema_loading_idempotent() {
-        use std::sync::atomic::Ordering;
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
 
         let config = ConfigAndUsers::default();
         let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
+        cluster.sharding_schema.schemas = ShardedSchemas::default();
 
         assert!(cluster.load_schema());
 
         cluster.launch();
-        cluster.wait_schema_loaded().await;
+        cluster.wait_ready().await;
 
-        let count_after_first = cluster.readiness.schemas_loaded.load(Ordering::SeqCst);
-        assert_eq!(count_after_first, cluster.shards.len());
-
-        // Second launch should not spawn additional schema loading tasks
+        // Second launch must be safe: per-shard OnceCell prevents any reload.
         cluster.launch();
         sleep(Duration::from_millis(50)).await;
-
-        let count_after_second = cluster.readiness.schemas_loaded.load(Ordering::SeqCst);
-        assert_eq!(count_after_second, count_after_first);
+        cluster.wait_ready().await;
     }
 
     #[tokio::test]
-    async fn test_wait_schema_loaded_returns_immediately_when_not_needed() {
+    async fn test_wait_ready_waits_for_schema_notification() {
+        use futures::poll;
+
+        #[derive(Clone)]
+        struct ManuallyLoad;
+
+        impl SchemaLoader for ManuallyLoad {
+            fn launch_schema_sync(&self, _: &Cluster) {}
+        }
+
+        let config = ConfigAndUsers::default();
+        let cluster = Cluster {
+            schema_loader: Box::new(ManuallyLoad),
+            ..Cluster::new_test(&config)
+        };
+
+        cluster.launch();
+
+        // Schemas not loaded yet, readiness is pending.
+        assert!(!cluster.ready());
+
+        let mut cluster_ready = std::pin::pin!(cluster.wait_ready());
+
+        // Finish loading on all but one shard
+        for shard in &cluster.shards[1..] {
+            shard.schema_not_needed();
+        }
+
+        tokio::task::yield_now().await;
+        assert!(poll!(cluster_ready.as_mut()).is_pending());
+
+        cluster.shards[0].schema_not_needed();
+
+        tokio::task::yield_now().await;
+        assert!(poll!(cluster_ready.as_mut()).is_ready());
+        assert!(cluster.ready());
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_returns_immediately_when_schema_not_needed() {
         let config = ConfigAndUsers::default();
         let cluster = Cluster::new_test_single_shard(&config);
 
         // load_schema() returns false for single shard without multi_tenant
         assert!(!cluster.load_schema());
 
-        // Should return immediately without waiting
-        cluster.wait_schema_loaded().await;
-    }
+        cluster.launch();
 
-    #[tokio::test]
-    async fn test_wait_schema_loaded_fast_path_when_already_loaded() {
-        use std::sync::atomic::Ordering;
-
-        let config = ConfigAndUsers::default();
-        let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
-
-        assert!(cluster.load_schema());
-
-        // Simulate that all schemas have been loaded
-        cluster
-            .readiness
-            .schemas_loaded
-            .store(cluster.shards.len(), Ordering::SeqCst);
-
-        // Should return immediately via fast path
-        cluster.wait_schema_loaded().await;
-    }
-
-    #[tokio::test]
-    async fn test_wait_schema_loaded_waits_for_notification() {
-        use std::sync::atomic::Ordering;
-        use tokio::time::{timeout, Duration};
-
-        let config = ConfigAndUsers::default();
-        let mut cluster = Cluster::new_test(&config);
-        cluster.sharded_schemas = ShardedSchemas::default();
-
-        assert!(cluster.load_schema());
-
-        let readiness = cluster.readiness.clone();
-        let shards_count = cluster.shards.len();
-
-        // Spawn a task that will complete schema loading after a short delay
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            readiness
-                .schemas_loaded
-                .store(shards_count, Ordering::SeqCst);
-            readiness.schemas_ready.notify_waiters();
-        });
-
-        // Should wait for notification and complete within timeout
-        let result = timeout(Duration::from_millis(100), cluster.wait_schema_loaded()).await;
-        assert!(result.is_ok());
+        // Should return without waiting: no schema to load.
+        cluster.wait_ready().await;
+        assert!(cluster.ready());
     }
 
     #[test]

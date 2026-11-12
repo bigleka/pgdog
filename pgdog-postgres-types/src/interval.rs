@@ -1,11 +1,16 @@
-use std::{num::ParseIntError, ops::Add};
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+    num::ParseIntError,
+    ops::{Add, AddAssign},
+};
 
 use crate::Data;
 
 use super::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-#[derive(Eq, PartialEq, Ord, PartialOrd, Default, Debug, Clone, Hash)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct Interval {
     years: i64,
     months: i32,
@@ -14,6 +19,45 @@ pub struct Interval {
     minutes: i64,
     seconds: i64,
     micros: i32,
+}
+
+impl Interval {
+    /// PostgreSQL compares intervals using 30-day months and 24-hour days.
+    /// The full interval range exceeds i64 microseconds.
+    fn comparison_value(&self) -> i128 {
+        let months = i128::from(self.years) * 12 + i128::from(self.months);
+        let days = months * 30 + i128::from(self.days);
+        let hours = days * 24 + i128::from(self.hours);
+        let minutes = hours * 60 + i128::from(self.minutes);
+        let seconds = minutes * 60 + i128::from(self.seconds);
+        seconds * 1_000_000 + i128::from(self.micros)
+    }
+}
+
+impl PartialEq for Interval {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Interval {}
+
+impl PartialOrd for Interval {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Interval {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.comparison_value().cmp(&other.comparison_value())
+    }
+}
+
+impl Hash for Interval {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.comparison_value().hash(state);
+    }
 }
 
 impl Add for Interval {
@@ -30,6 +74,12 @@ impl Add for Interval {
             seconds: self.seconds.saturating_add(rhs.seconds),
             micros: self.micros.saturating_add(rhs.micros),
         }
+    }
+}
+
+impl AddAssign for Interval {
+    fn add_assign(&mut self, rhs: Interval) {
+        *self = *self + rhs
     }
 }
 
@@ -135,7 +185,14 @@ impl FromDataType for Interval {
                             _ => (),
                         }
                     } else {
-                        let mut value = value.split(":");
+                        // Postgres writes one sign for the whole time-of-day
+                        // group: "-01:02:03" is -(1h 2m 3s)
+                        // Parse the components as magnitudes and apply the sign
+                        // to all of them
+                        let negative = value.starts_with('-');
+                        let time = value.strip_prefix(['-', '+']).unwrap_or(value);
+
+                        let mut value = time.split(":");
                         let hours = value.next();
                         if let Some(hours) = hours {
                             result.hours = bigint(hours)?;
@@ -157,6 +214,13 @@ impl FromDataType for Interval {
                             if let Some(millis) = millis {
                                 result.micros = parse_fractional_micros(millis)?;
                             }
+                        }
+
+                        if negative {
+                            result.hours = -result.hours;
+                            result.minutes = -result.minutes;
+                            result.seconds = -result.seconds;
+                            result.micros = -result.micros;
                         }
                     }
                 }
@@ -226,6 +290,66 @@ impl FromDataType for Interval {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn equivalent_intervals_compare_and_hash_equally() {
+        for (left, right) in [
+            ("1 day", "24:00:00"),
+            ("1 mon", "30 days"),
+            ("1 year", "12 mons"),
+            ("1 mon -30 days", "00:00:00"),
+            ("-1 day", "-24:00:00"),
+            ("1 day -00:00:00.000001", "23:59:59.999999"),
+        ] {
+            let left = Interval::decode(left.as_bytes(), Format::Text).expect(left);
+            let right = Interval::decode(right.as_bytes(), Format::Text).expect(right);
+            for format in [Format::Text, Format::Binary] {
+                let encoded = right.encode(format).expect("encode interval");
+                let decoded = Interval::decode(&encoded, format).expect("decode interval");
+                assert_eq!(left, decoded);
+                assert_eq!(left.cmp(&decoded), Ordering::Equal);
+                assert_eq!(HashSet::from([left, decoded]).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn interval_order_uses_the_combined_duration() {
+        for (shorter, longer) in [
+            ("1 mon", "31 days"),
+            ("24:00:00", "2 days"),
+            ("1 year -1 mon", "340 days"),
+            ("-31 days", "-1 mon"),
+            ("1 day -25:00:00", "00:00:00"),
+        ] {
+            let shorter = Interval::decode(shorter.as_bytes(), Format::Text).expect(shorter);
+            let longer = Interval::decode(longer.as_bytes(), Format::Text).expect(longer);
+            assert!(shorter < longer, "{shorter:?} should precede {longer:?}");
+        }
+    }
+
+    #[test]
+    fn interval_comparison_does_not_overflow() {
+        for months in [i32::MIN, i32::MAX] {
+            let interval = Interval {
+                years: i64::from(months / 12),
+                months: months % 12,
+                ..Default::default()
+            };
+            // A PostgreSQL interval can span more than i64 microseconds.
+            let shorter = Interval {
+                micros: -1,
+                ..interval
+            };
+            let longer = Interval {
+                micros: 1,
+                ..interval
+            };
+            assert!(shorter < interval);
+            assert!(interval < longer);
+        }
+    }
 
     #[test]
     fn test_interval_ord() {
@@ -261,6 +385,46 @@ mod test {
         assert_eq!(interval.minutes, 46);
         assert_eq!(interval.seconds, 12);
         assert_eq!(interval.years, 0);
+    }
+
+    #[test]
+    fn test_interval_decode_negative_text() {
+        // Sub-hour: the sign has no non-zero component to attach to, and
+        // "-00" parses to 0
+        let interval = Interval::decode(b"-00:45:00", Format::Text).unwrap();
+        assert_eq!(interval.hours, 0);
+        assert_eq!(interval.minutes, -45);
+        assert_eq!(interval.seconds, 0);
+
+        // With non-zero hours, the sign applies to every component, not just
+        // hours: this is -(1h 30m)
+        let interval = Interval::decode(b"-01:30:00", Format::Text).unwrap();
+        assert_eq!(interval.hours, -1);
+        assert_eq!(interval.minutes, -30);
+        assert_eq!(interval.seconds, 0);
+
+        // Fractional seconds are negated too
+        let interval = Interval::decode(b"-00:00:01.5", Format::Text).unwrap();
+        assert_eq!(interval.seconds, -1);
+        assert_eq!(interval.micros, -500_000);
+
+        // years/mons/days carry their own signs and are independent
+        let interval = Interval::decode(b"1 mon -3 days -04:05:06", Format::Text).unwrap();
+        assert_eq!(interval.months, 1);
+        assert_eq!(interval.days, -3);
+        assert_eq!(interval.hours, -4);
+        assert_eq!(interval.minutes, -5);
+        assert_eq!(interval.seconds, -6);
+
+        // Postgres marks a positive clock group explicitly when months or
+        // days are negative, since the sign is not inherited.
+        let interval = Interval::decode(b"-1 mons +02:00:00", Format::Text).unwrap();
+        assert_eq!(interval.months, -1);
+        assert_eq!(interval.hours, 2);
+
+        // Positive values are unchanged.
+        let interval = Interval::decode(b"00:45:00", Format::Text).unwrap();
+        assert_eq!(interval.minutes, 45);
     }
 
     #[test]

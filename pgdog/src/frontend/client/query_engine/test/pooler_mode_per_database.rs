@@ -5,7 +5,7 @@ use pgdog_config::{Database, PoolerMode, User};
 
 use crate::{
     backend::databases::init,
-    config::{set, ConfigAndUsers},
+    config::{ConfigAndUsers, set},
     net::{DataRow, Message},
 };
 

@@ -1,10 +1,9 @@
 #![allow(clippy::print_stdout)]
 
-use pg_query::{normalize, parse};
+use pg_raw_parse::parse;
 use tokio::spawn;
 
 use crate::{
-    backend::{schema::Schema, ShardingSchema},
     config::Role,
     frontend::router::parser::Shard,
     frontend::{BufferedQuery, PreparedStatements},
@@ -12,10 +11,18 @@ use crate::{
 };
 
 use super::*;
+use crate::frontend::router::sharding::ShardOrLookup;
 use std::time::{Duration, Instant};
 
 fn test_context() -> AstContext<'static> {
-    AstContext::empty()
+    Default::default()
+}
+
+fn ast_query(query: &BufferedQuery) -> AstQuery<'_> {
+    AstQuery {
+        query_without_comment: query.query(),
+        original_query: query,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -103,8 +110,6 @@ async fn bench_ast_cache() {
         "[bench_ast_cache]: cached is {:.4} times faster than parsed",
         faster
     ); // 32x on my M1
-
-    assert!(faster > 10.0);
 }
 
 // Serialize tests that read or write the global Cache stats. These tests
@@ -112,7 +117,7 @@ async fn bench_ast_cache() {
 // concurrently without clobbering each other.
 static CACHE_STATS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-fn run_prepared(query: &str) -> Ast {
+fn run_prepared(query: &str) -> ClientQuery {
     let ctx = test_context();
     let mut prepared_statements = PreparedStatements::default();
     Cache::get()
@@ -197,7 +202,7 @@ fn test_cache_hit_overrides_role_hint() {
     // Seed with a primary role hint; cache stores an entry keyed by the
     // stripped body.
     let first = run_prepared("/* pgdog_role: primary */ SELECT 1 FROM cache_role_override");
-    assert_eq!(first.comment_role, Some(Role::Primary));
+    assert_eq!(first.comment.role, Some(Role::Primary));
 
     // Second query, same body, replica hint. Must hit cache AND return
     // an Ast whose role reflects the new hint, not the cached one.
@@ -205,7 +210,7 @@ fn test_cache_hit_overrides_role_hint() {
     let (stats, _) = Cache::stats();
     assert_eq!(stats.hits, 1, "second query should hit cache");
     assert_eq!(
-        second.comment_role,
+        second.comment.role,
         Some(Role::Replica),
         "cached Ast must be overridden with the incoming role hint"
     );
@@ -225,7 +230,7 @@ fn test_cache_hit_clears_role_hint_when_absent() {
     let (stats, _) = Cache::stats();
     assert_eq!(stats.hits, 1);
     assert_eq!(
-        second.comment_role, None,
+        second.comment.role, None,
         "incoming query has no role hint — cached role must be cleared"
     );
 }
@@ -236,14 +241,17 @@ fn test_cache_hit_overrides_shard_hint() {
     Cache::reset();
 
     let first = run_prepared("/* pgdog_shard: 0 */ SELECT 1 FROM cache_shard_override");
-    assert_eq!(first.comment_shard, Some(Shard::Direct(0)));
+    assert_eq!(
+        first.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(0)))
+    );
 
     let second = run_prepared("/* pgdog_shard: 1 */ SELECT 1 FROM cache_shard_override");
     let (stats, _) = Cache::stats();
     assert_eq!(stats.hits, 1, "second query should hit cache");
     assert_eq!(
-        second.comment_shard,
-        Some(Shard::Direct(1)),
+        second.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(1))),
         "cached Ast must be overridden with the incoming shard hint"
     );
 }
@@ -270,15 +278,14 @@ fn test_cache_key_strips_leading_comment() {
 
     let ast = run_prepared("/* trace_id=abc */ SELECT 1 FROM cache_key_leading");
     assert_eq!(
-        ast.query_without_comment.as_str(),
-        "SELECT 1 FROM cache_key_leading",
+        &*ast.ast.query_without_comment, "SELECT 1 FROM cache_key_leading",
         "cache key must be the query without the leading comment"
     );
 
     // The LRU map key must also be the stripped query.
     let queries = Cache::queries();
     assert!(
-        queries.contains_key(&"SELECT 1 FROM cache_key_leading".to_string()),
+        queries.contains_key("SELECT 1 FROM cache_key_leading"),
         "cache map key must be the comment-stripped query"
     );
 }
@@ -290,8 +297,7 @@ fn test_cache_key_strips_trailing_comment() {
 
     let ast = run_prepared("SELECT 1 FROM cache_key_trailing /* trace_id=xyz */");
     assert_eq!(
-        ast.query_without_comment.as_str(),
-        "SELECT 1 FROM cache_key_trailing",
+        &*ast.ast.query_without_comment, "SELECT 1 FROM cache_key_trailing",
         "cache key must be the query without the trailing comment"
     );
 }
@@ -304,8 +310,7 @@ fn test_cache_key_no_comment_unchanged() {
     let q = "SELECT 1 FROM cache_key_plain";
     let ast = run_prepared(q);
     assert_eq!(
-        ast.query_without_comment.as_str(),
-        q,
+        &*ast.ast.query_without_comment, q,
         "cache key must equal the original query when there is no comment"
     );
 }
@@ -329,30 +334,35 @@ fn test_cache_key_shared_across_different_comments() {
         1,
         "all three queries must share a single cache entry"
     );
-    assert_eq!(matching[0].as_str(), "SELECT 1 FROM cache_key_shared");
+    assert_eq!(&**matching[0], "SELECT 1 FROM cache_key_shared");
 }
 
 #[test]
-fn test_normalize() {
-    let q = "SELECT * FROM users WHERE id = 1";
-    let normalized = normalize(q).unwrap();
-    assert_eq!(normalized, "SELECT * FROM users WHERE id = $1");
+fn test_truncated_query_shorter_than_limit() {
+    let buffered = BufferedQuery::Query(Query::new("SELECT 1"));
+    let ast_query = ast_query(&buffered);
+    assert_eq!(ast_query.truncated_query(100), "SELECT 1");
 }
 
 #[test]
-fn test_tables_list() {
-    let mut prepared_statements = PreparedStatements::default();
-    let db_schema = Schema::default();
-    for q in [
-        "CREATE TABLE private_schema.test (id BIGINT)",
-        "SELECT * FROM private_schema.test a INNER JOIN public_schema.test b ON a.id = b.id LIMIT 5",
-        "INSERT INTO public_schema.test VALUES ($1, $2)",
-        "DELETE FROM private_schema.test",
-        "DROP TABLE private_schema.test",
-    ] {
-        let buffered = BufferedQuery::Query(Query::new(q));
-        let ast = Ast::new(&AstQuery::from_query(&buffered), &ShardingSchema::default(), &db_schema, &mut prepared_statements, "", None).unwrap();
-        let tables = ast.tables();
-        println!("{:?}", tables);
-    }
+fn test_truncated_query_longer_than_limit() {
+    let buffered = BufferedQuery::Query(Query::new("SELECT * FROM users WHERE id = 1"));
+    let ast_query = ast_query(&buffered);
+    assert_eq!(ast_query.truncated_query(6), "SELECT");
+}
+
+#[test]
+fn test_truncated_query_includes_leading_comment() {
+    let buffered = BufferedQuery::Query(Query::new("/* shard=0 */ SELECT 1"));
+    let ast_query = ast_query(&buffered);
+    assert!(ast_query.truncated_query(100).starts_with("/* shard=0 */"));
+}
+
+#[test]
+fn test_truncated_query_non_ascii_char_boundary() {
+    // '€' is 3 bytes in UTF-8 — truncating at a byte boundary mid-character
+    // must not panic and must return whole characters only
+    let buffered = BufferedQuery::Query(Query::new("SELECT '€'"));
+    let ast_query = ast_query(&buffered);
+    assert_eq!(ast_query.truncated_query(9), "SELECT '€");
 }

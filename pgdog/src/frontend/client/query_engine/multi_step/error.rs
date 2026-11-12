@@ -3,9 +3,12 @@ use thiserror::Error;
 use crate::net::ErrorResponse;
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("{0}")]
     Update(#[from] UpdateError),
+
+    #[error("parser: {0}")]
+    Parser(Box<crate::frontend::router::parser::Error>),
 
     #[error("frontend: {0}")]
     Frontend(Box<crate::frontend::Error>),
@@ -27,7 +30,7 @@ pub enum Error {
 }
 
 #[derive(Debug, Error)]
-pub enum UpdateError {
+pub(crate) enum UpdateError {
     #[error("sharding key updates are forbidden")]
     Disabled,
 
@@ -39,11 +42,20 @@ pub enum UpdateError {
 
     #[error("sharding key update changes more than one row ({0})")]
     TooManyRows(usize),
+
+    #[error("sharding key update would move a row referenced by an ON DELETE foreign key")]
+    ForeignKeyOnDelete,
 }
 
 impl From<crate::frontend::Error> for Error {
     fn from(value: crate::frontend::Error) -> Self {
         Self::Frontend(Box::new(value))
+    }
+}
+
+impl From<crate::frontend::router::parser::Error> for Error {
+    fn from(value: crate::frontend::router::parser::Error) -> Self {
+        Self::Parser(Box::new(value))
     }
 }
 

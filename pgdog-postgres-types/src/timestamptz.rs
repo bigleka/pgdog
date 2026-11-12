@@ -1,12 +1,24 @@
 use std::ops::{Deref, DerefMut};
 
 use bytes::Bytes;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
 #[derive(
-    Debug, Copy, Clone, PartialEq, Ord, PartialOrd, Eq, Default, Hash, Serialize, Deserialize,
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Eq,
+    Default,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
 pub struct TimestampTz {
     timestamp: Timestamp,
@@ -51,6 +63,20 @@ mod test {
     use chrono::{Datelike, Timelike};
 
     use super::*;
+
+    #[test]
+    fn test_timestamptz_infinity_roundtrip() {
+        for text in [b"infinity".as_slice(), b"-infinity".as_slice()] {
+            let timestamp = TimestampTz::decode(text, Format::Text)
+                .expect("valid PostgreSQL timestamp with time zone");
+            assert_eq!(timestamp.encode(Format::Text).expect("text encoding"), text);
+            let binary = timestamp.encode(Format::Binary).expect("binary encoding");
+            let decoded = TimestampTz::decode(&binary, Format::Binary).expect("binary decoding");
+            assert_eq!(timestamp, decoded);
+            assert_eq!(timestamp.cmp(&decoded), std::cmp::Ordering::Equal);
+            assert_eq!(decoded.encode(Format::Text).expect("text encoding"), text);
+        }
+    }
 
     #[test]
     fn test_timestamptz() {

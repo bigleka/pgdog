@@ -1,20 +1,23 @@
 use bytes::Bytes;
-use pgdog_config::QueryParserEngine;
+use pgdog_config::User;
 use pgdog_postgres_types::Oid;
 use rand::Rng;
 
 use crate::{
     backend::{
-        pool::cluster::Cluster,
+        Error as BackendError, Server,
+        pool::{Address, ClusterConfig, ClusterShardConfig, PoolConfig, cluster::Cluster},
         replication::logical::publisher::{
-            Lsn, PublicationTable, PublicationTableColumn, ReplicaIdentity, Table,
+            Lsn, PublicationTable, PublicationTableColumn, ReplicaIdentity, ReplicationData,
+            ReplicationSlot, Table,
         },
         server::test::test_server,
-        Server,
     },
     config::config,
     net::{
+        CopyData, ToBytes,
         replication::{
+            XLogData,
             logical::{
                 begin::Begin,
                 commit::Commit,
@@ -22,14 +25,115 @@ use crate::{
                 insert::Insert as XLogInsert,
                 relation::{Column as RelColumn, Relation},
                 tuple_data::{Column as TupleColumn, Identifier, TupleData},
+                update::{Update as XLogUpdate, UpdateIdentity},
             },
-            XLogData,
+            xlog_data::XLogPayload,
         },
-        CopyData, ToBytes,
     },
 };
 
-use super::stream::StreamSubscriber;
+use super::{
+    Error, connect_primary, primary, replication_origin::ReplicationOrigin,
+    stream::StreamSubscriber,
+};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+fn resharding_test_cluster(user: &str) -> Cluster {
+    let user = User::new(user, "pgdog", "pgdog");
+    let shards = [ClusterShardConfig {
+        primary: Some(PoolConfig {
+            address: Address {
+                user: user.name.clone(),
+                passwords: vec!["pgdog".into()],
+                ..Address::new_test()
+            },
+            config: Default::default(),
+        }),
+        replicas: vec![],
+    }];
+    Cluster::new(ClusterConfig::new(
+        &config().config,
+        &user,
+        &shards,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    ))
+}
+
+#[tokio::test]
+async fn resharding_connection_rejects_unprivileged_user() -> Result<(), Box<dyn std::error::Error>>
+{
+    let user = format!("resharding_denied_{}", random_id());
+    let mut admin = test_server().await;
+    admin
+        .execute_checked(format!(
+            "CREATE ROLE {user} LOGIN NOSUPERUSER NOINHERIT PASSWORD 'pgdog'"
+        ))
+        .await?;
+    let result = async {
+        admin
+            .execute_checked(format!("GRANT CONNECT ON DATABASE pgdog TO {user}"))
+            .await?;
+        let cluster = resharding_test_cluster(&user);
+        let result = connect_primary(cluster.shards().first().ok_or(Error::MissingData)?)
+            .await
+            .map(drop);
+        Ok::<_, Box<dyn std::error::Error>>(result)
+    }
+    .await;
+    admin
+        .execute_checked(format!(
+            "REVOKE CONNECT ON DATABASE pgdog FROM {user}; DROP ROLE {user}"
+        ))
+        .await?;
+    let error = result?.expect_err("unprivileged user must not connect for resharding");
+    assert!(!error.is_retryable());
+    assert!(matches!(
+        error,
+        Error::ReshardingPermissionDenied { source, .. }
+            if matches!(source.as_ref(), BackendError::ExecutionError(response) if response.code == "42501")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resharding_connection_accepts_privileged_user() -> Result<(), Box<dyn std::error::Error>> {
+    let user = format!("resharding_allowed_{}", random_id());
+    let mut admin = test_server().await;
+    admin
+        .execute_checked(format!(
+            "CREATE ROLE {user} LOGIN NOSUPERUSER NOINHERIT PASSWORD 'pgdog'"
+        ))
+        .await?;
+    let result = async {
+        admin
+            .execute_checked(format!(
+                "GRANT CONNECT ON DATABASE pgdog TO {user}; \
+                 GRANT SET ON PARAMETER session_replication_role TO {user}"
+            ))
+            .await?;
+        let cluster = resharding_test_cluster(&user);
+        let mut server =
+            connect_primary(cluster.shards().first().ok_or(Error::MissingData)?).await?;
+        let users: Vec<String> = server.fetch_all("SELECT current_user").await?;
+        let roles: Vec<String> = server.fetch_all("SHOW session_replication_role").await?;
+        Ok::<_, Box<dyn std::error::Error>>((users, roles))
+    }
+    .await;
+    admin
+        .execute_checked(format!(
+            "REVOKE SET ON PARAMETER session_replication_role FROM {user}; \
+             REVOKE CONNECT ON DATABASE pgdog FROM {user}; DROP ROLE {user}"
+        ))
+        .await?;
+    let (users, roles) = result?;
+    assert_eq!(users, [user]);
+    assert_eq!(roles, ["replica"]);
+    Ok(())
+}
 
 fn random_id() -> String {
     rand::rng()
@@ -44,7 +148,7 @@ fn xlog_copy_data(payload: Bytes) -> CopyData {
         system_clock: 0,
         bytes: payload,
     };
-    CopyData::bytes(xlog.to_bytes().unwrap())
+    CopyData::new(&xlog.to_bytes())
 }
 
 fn make_sharded_table() -> Table {
@@ -77,7 +181,6 @@ fn make_sharded_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
-        query_parser_engine: QueryParserEngine::default(),
     }
 }
 
@@ -111,7 +214,6 @@ fn make_sharded_test_b_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
-        query_parser_engine: QueryParserEngine::default(),
     }
 }
 
@@ -169,19 +271,18 @@ fn text_column(data: &str) -> TupleColumn {
     }
 }
 
-fn begin_copy_data(lsn: i64) -> CopyData {
+pub(super) fn begin_copy_data(lsn: u64) -> CopyData {
     xlog_copy_data(
         Begin {
             final_transaction_lsn: lsn,
             commit_timestamp: 0,
             xid: 1,
         }
-        .to_bytes()
-        .unwrap(),
+        .to_bytes(),
     )
 }
 
-fn commit_copy_data(end_lsn: i64) -> CopyData {
+pub(super) fn commit_copy_data(end_lsn: u64) -> CopyData {
     xlog_copy_data(
         Commit {
             flags: 0,
@@ -189,30 +290,27 @@ fn commit_copy_data(end_lsn: i64) -> CopyData {
             end_lsn,
             commit_timestamp: 0,
         }
-        .to_bytes()
-        .unwrap(),
+        .to_bytes(),
     )
 }
 
 fn relation_copy_data(oid: Oid) -> CopyData {
-    xlog_copy_data(sharded_relation(oid).to_bytes().unwrap())
+    xlog_copy_data(sharded_relation(oid).to_bytes())
 }
 
 fn sharded_test_b_relation_copy_data(oid: Oid) -> CopyData {
-    xlog_copy_data(sharded_test_b_relation(oid).to_bytes().unwrap())
+    xlog_copy_data(sharded_test_b_relation(oid).to_bytes())
 }
 
 fn insert_copy_data(oid: Oid, id: &str, value: &str) -> CopyData {
     xlog_copy_data(
         XLogInsert {
-            xid: None,
             oid,
             tuple_data: TupleData {
                 columns: vec![text_column(id), text_column(value)],
             },
         }
-        .to_bytes()
-        .unwrap(),
+        .to_bytes(),
     )
 }
 
@@ -225,31 +323,76 @@ fn delete_copy_data(oid: Oid, id: &str) -> CopyData {
             }),
             old: None,
         }
-        .to_bytes()
-        .unwrap(),
+        .to_bytes(),
     )
 }
 
-fn make_subscriber() -> StreamSubscriber {
+fn toasted_column() -> TupleColumn {
+    TupleColumn {
+        identifier: Identifier::Toasted,
+        len: 0,
+        data: Bytes::new(),
+    }
+}
+
+fn null_column() -> TupleColumn {
+    TupleColumn {
+        identifier: Identifier::Null,
+        len: 0,
+        data: Bytes::new(),
+    }
+}
+
+fn x_update(u: XLogUpdate) -> CopyData {
+    xlog_copy_data(u.to_bytes())
+}
+
+pub(super) async fn test_origins(cluster: &Cluster) -> Vec<ReplicationOrigin> {
+    let mut origins = vec![];
+    for (shard, pools) in cluster.shards().iter().enumerate() {
+        let origin = ReplicationOrigin::builder()
+            .name("test")
+            .address(primary(pools).unwrap().addr())
+            .shard(shard)
+            .build();
+        origin.recreate_origin().await.unwrap();
+        origins.push(origin);
+    }
+    origins
+}
+
+async fn make_subscriber() -> StreamSubscriber {
     let cluster = Cluster::new_test(&config());
     let tables = vec![make_sharded_table(), make_sharded_test_b_table()];
-    StreamSubscriber::new(&cluster, &tables, QueryParserEngine::default())
+    StreamSubscriber::new(&cluster, tables, test_origins(&cluster).await)
 }
 
-fn make_subscriber_with_tables(tables: Vec<Table>) -> StreamSubscriber {
+async fn make_subscriber_with_tables(tables: Vec<Table>) -> StreamSubscriber {
     let cluster = Cluster::new_test(&config());
-    StreamSubscriber::new(&cluster, &tables, QueryParserEngine::default())
+    StreamSubscriber::new(&cluster, tables, test_origins(&cluster).await)
 }
 
-fn make_subscriber_single_shard() -> StreamSubscriber {
+async fn make_subscriber_single_shard() -> StreamSubscriber {
     let cluster = Cluster::new_test_single_shard(&config());
     let tables = vec![make_sharded_table(), make_sharded_test_b_table()];
-    StreamSubscriber::new(&cluster, &tables, QueryParserEngine::default())
+    StreamSubscriber::new(&cluster, tables, test_origins(&cluster).await)
 }
 
-/// Count rows matching the given id using a separate connection.
-async fn count_row(server: &mut Server, table: &str, id: &str) -> i64 {
-    let query = format!("SELECT COUNT(*) FROM {} WHERE id = {}", table, id);
+async fn wait_for_commit(sub: &mut StreamSubscriber, lsn: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        sub.check_confirmed_sent_lsn().await.unwrap();
+        if sub.status_update().last_flushed >= lsn {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("transaction {lsn} never completed");
+}
+
+/// Count rows matching the given `WHERE` predicate using a separate connection.
+async fn count_where(server: &mut Server, table: &str, predicate: &str) -> i64 {
+    let query = format!("SELECT COUNT(*) FROM {} WHERE {}", table, predicate);
     let rows: Vec<crate::net::DataRow> = server.fetch_all(query).await.unwrap();
     rows.first()
         .and_then(|row: &crate::net::DataRow| row.column(0))
@@ -260,6 +403,22 @@ async fn count_row(server: &mut Server, table: &str, id: &str) -> i64 {
                 .unwrap()
         })
         .unwrap_or(0)
+}
+
+/// Count rows matching the given id using a separate connection.
+async fn count_row(server: &mut Server, table: &str, id: &str) -> i64 {
+    count_where(server, table, &format!("id = {}", id)).await
+}
+
+/// Read `value` for a single row, or `None` if absent. Useful when a count check would
+/// silently pass under SET-clause regressions.
+async fn fetch_value(server: &mut Server, table: &str, id: &str) -> Option<String> {
+    let query = format!("SELECT value FROM {} WHERE id = {}", table, id);
+    let rows: Vec<crate::net::DataRow> = server.fetch_all(query).await.unwrap();
+    rows.first().and_then(|row: &crate::net::DataRow| {
+        row.column(0)
+            .map(|col| std::str::from_utf8(&col[..]).unwrap().to_string())
+    })
 }
 
 async fn ensure_table(server: &mut Server, table: &str) {
@@ -282,6 +441,62 @@ async fn ensure_table(server: &mut Server, table: &str) {
                 .await
                 .unwrap();
         }
+        "public.posts" => {
+            server
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS public.posts (\
+                     id BIGINT PRIMARY KEY, title TEXT, body TEXT)",
+                )
+                .await
+                .unwrap();
+        }
+        // Duplicate-row table: no PK, no unique index.
+        // Allows inserting identical rows to test ctid-based single-row targeting.
+        "public.full_dup_rows" => {
+            server
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS public.full_dup_rows \
+                     (id BIGINT, value TEXT)",
+                )
+                .await
+                .unwrap();
+        }
+        // Omni dedup table for ON CONFLICT DO NOTHING coverage.
+        // Requires a unique index so relation() accepts the omni FULL table.
+        "public.full_omni_dedup" => {
+            server
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS public.full_omni_dedup \
+                     (a TEXT NOT NULL, b TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
+            // Idempotently set NOT NULL: tables_missing_unique_index() requires all key columns to be NOT NULL.
+            // A stale nullable schema from a prior test run would silently fail the omni dedup test.
+            for col in ["a", "b"] {
+                let _ = server
+                    .execute(format!(
+                        "ALTER TABLE public.full_omni_dedup ALTER COLUMN {col} SET NOT NULL"
+                    ))
+                    .await;
+            }
+            server
+                .execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS full_omni_dedup_ab_idx \
+                     ON public.full_omni_dedup (a, b)",
+                )
+                .await
+                .unwrap();
+        }
+        "public.settings" => {
+            server
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS public.settings (\
+                     id BIGINT PRIMARY KEY, name TEXT, value TEXT)",
+                )
+                .await
+                .unwrap();
+        }
         _ => (),
     }
 }
@@ -300,35 +515,23 @@ async fn cleanup(server: &mut Server, table: &str, ids: &[&str]) {
 
 // ── State machine tests ─────────────────────────────────────────────
 
-/// Begin message sets in_transaction and records the LSN.
-#[tokio::test]
-async fn begin_sets_transaction_state() {
-    let mut sub = make_subscriber();
-    assert!(!sub.in_transaction());
-    assert_eq!(sub.lsn(), 0);
-
-    sub.connect().await.unwrap();
-    sub.handle(begin_copy_data(100)).await.unwrap();
-
-    assert!(sub.in_transaction());
-    assert_eq!(sub.lsn(), 100);
-    assert!(sub.lsn_changed());
-}
-
 /// Commit clears in_transaction, advances LSN, and returns a StatusUpdate.
 #[tokio::test]
 async fn commit_returns_status_and_clears_transaction() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     sub.connect().await.unwrap();
 
     sub.handle(begin_copy_data(100)).await.unwrap();
     assert!(sub.in_transaction());
 
     let result = sub.handle(commit_copy_data(200)).await.unwrap();
+
+    wait_for_commit(&mut sub, 200).await;
     assert!(!sub.in_transaction());
     assert_eq!(sub.lsn(), 200);
 
-    let status = result.expect("commit should return a StatusUpdate");
+    assert!(result.is_some());
+    let status = sub.status_update();
     assert_eq!(status.last_applied, 200);
     assert_eq!(status.last_flushed, 200);
     assert_eq!(status.last_written, 200);
@@ -337,7 +540,7 @@ async fn commit_returns_status_and_clears_transaction() {
 /// handle() returns None for non-commit messages.
 #[tokio::test]
 async fn begin_returns_no_status_update() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     sub.connect().await.unwrap();
 
     let result = sub.handle(begin_copy_data(100)).await.unwrap();
@@ -347,7 +550,7 @@ async fn begin_returns_no_status_update() {
 /// bytes_sharded accumulates across messages.
 #[tokio::test]
 async fn bytes_sharded_accumulates() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     sub.connect().await.unwrap();
 
     assert_eq!(sub.bytes_sharded(), 0);
@@ -357,22 +560,43 @@ async fn bytes_sharded_accumulates() {
 
     let after_begin = sub.bytes_sharded();
     sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
     assert!(sub.bytes_sharded() > after_begin);
 }
 
-/// set_current_lsn returns true only when the LSN changes.
-#[test]
-fn lsn_changed_tracking() {
-    let mut sub = make_subscriber();
+/// status_update() must always reflect the last *committed* LSN, never the
+/// working LSN set by Begin. A KeepAlive reply during an open transaction must
+/// not advance the ack pointer to the future commit LSN — doing so would cause
+/// reconnect to skip the in-flight transaction and lose data.
+#[tokio::test]
+async fn status_update_stays_at_committed_lsn_during_transaction() {
+    let mut sub = make_subscriber().await;
+    sub.connect().await.unwrap();
 
-    assert!(sub.set_current_lsn(100));
-    assert!(sub.lsn_changed());
+    // Nothing committed yet: ack pointer is at 0.
+    assert_eq!(sub.status_update().last_flushed, 0);
 
-    assert!(!sub.set_current_lsn(100));
-    assert!(!sub.lsn_changed());
+    // Commit a first transaction (begin LSN 50, end LSN 100).
+    sub.handle(begin_copy_data(50)).await.unwrap();
+    sub.handle(commit_copy_data(100)).await.unwrap();
+    wait_for_commit(&mut sub, 100).await;
+    assert_eq!(sub.status_update().last_flushed, 100);
 
-    assert!(sub.set_current_lsn(200));
-    assert!(sub.lsn_changed());
+    // Open a second transaction: Begin advances lsn to 200 (future commit LSN).
+    sub.handle(begin_copy_data(200)).await.unwrap();
+    assert_eq!(sub.lsn(), 200, "working lsn follows Begin");
+    // KeepAlive mid-transaction must still report 100, not 200.
+    assert_eq!(
+        sub.status_update().last_flushed,
+        100,
+        "committed_lsn must not advance before commit"
+    );
+
+    assert!(sub.in_transaction());
+    sub.handle(commit_copy_data(250)).await.unwrap();
+    assert!(!sub.in_transaction());
+    wait_for_commit(&mut sub, 250).await;
+    assert_eq!(sub.status_update().last_flushed, 250);
 }
 
 // ── Relation handling tests ─────────────────────────────────────────
@@ -380,7 +604,7 @@ fn lsn_changed_tracking() {
 /// Relation inside a transaction uses Flush — stays in transaction.
 #[tokio::test]
 async fn relation_inside_transaction() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     sub.connect().await.unwrap();
 
     sub.handle(begin_copy_data(100)).await.unwrap();
@@ -393,7 +617,7 @@ async fn relation_inside_transaction() {
 /// Relation outside a transaction uses Sync.
 #[tokio::test]
 async fn relation_outside_transaction() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     sub.connect().await.unwrap();
 
     assert!(!sub.in_transaction());
@@ -407,7 +631,7 @@ async fn relation_outside_transaction() {
 /// subsequent inserts to both tables must succeed within the same commit.
 #[tokio::test]
 async fn relation_after_insert_inside_transaction() {
-    let mut sub = make_subscriber_single_shard();
+    let mut sub = make_subscriber_single_shard().await;
     let mut verify = test_server().await;
 
     // Ensure the second table exists (CI only creates sharded/sharded_omni).
@@ -451,6 +675,7 @@ async fn relation_after_insert_inside_transaction() {
 
     // Commit both tables atomically.
     let status = sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
     assert!(!sub.in_transaction());
     assert!(status.is_some());
     assert_eq!(sub.lsn(), 200);
@@ -484,7 +709,8 @@ async fn partition_leaves_share_destination() {
     leaf_b.table.parent_name = "sharded".to_string();
 
     let cluster = Cluster::new_test_single_shard(&config());
-    let mut sub = StreamSubscriber::new(&cluster, &[leaf_a, leaf_b], QueryParserEngine::default());
+    let mut sub =
+        StreamSubscriber::new(&cluster, vec![leaf_a, leaf_b], test_origins(&cluster).await);
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -503,10 +729,10 @@ async fn partition_leaves_share_destination() {
     relation_b.name = "sharded_p2".to_string();
 
     sub.handle(begin_copy_data(100)).await.unwrap();
-    sub.handle(xlog_copy_data(relation_a.to_bytes().unwrap()))
+    sub.handle(xlog_copy_data(relation_a.to_bytes()))
         .await
         .unwrap();
-    sub.handle(xlog_copy_data(relation_b.to_bytes().unwrap()))
+    sub.handle(xlog_copy_data(relation_b.to_bytes()))
         .await
         .unwrap();
 
@@ -518,6 +744,8 @@ async fn partition_leaves_share_destination() {
         .unwrap();
 
     sub.handle(commit_copy_data(200)).await.unwrap();
+
+    wait_for_commit(&mut sub, 200).await;
 
     // Both inserts must land in the shared destination table. Before the fix,
     // leaf_b's row would be silently dropped.
@@ -532,7 +760,7 @@ async fn partition_leaves_share_destination() {
 /// Full transaction: Begin → Relation → Insert → Commit, verified in Postgres.
 #[tokio::test]
 async fn full_insert_transaction() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -548,6 +776,8 @@ async fn full_insert_transaction() {
         .unwrap();
 
     let status = sub.handle(commit_copy_data(200)).await.unwrap();
+
+    wait_for_commit(&mut sub, 200).await;
     assert!(!sub.in_transaction());
     assert!(status.is_some());
     assert_eq!(sub.lsn(), 200);
@@ -561,7 +791,7 @@ async fn full_insert_transaction() {
 /// Insert then delete within two transactions, verify Postgres state after each.
 #[tokio::test]
 async fn full_delete_transaction() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -577,6 +807,7 @@ async fn full_delete_transaction() {
         .await
         .unwrap();
     sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
 
     assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
 
@@ -584,6 +815,7 @@ async fn full_delete_transaction() {
     sub.handle(begin_copy_data(300)).await.unwrap();
     sub.handle(delete_copy_data(oid, &id)).await.unwrap();
     let status = sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
     assert!(status.is_some());
     assert!(!sub.in_transaction());
 
@@ -593,7 +825,7 @@ async fn full_delete_transaction() {
 /// Multiple transactions reuse prepared statements, both rows persisted.
 #[tokio::test]
 async fn multiple_transactions() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -610,6 +842,7 @@ async fn multiple_transactions() {
         .await
         .unwrap();
     let status = sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
     assert!(status.is_some());
     assert_eq!(sub.lsn(), 200);
 
@@ -620,6 +853,7 @@ async fn multiple_transactions() {
         .await
         .unwrap();
     let status = sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
     assert!(status.is_some());
     assert_eq!(sub.lsn(), 400);
 
@@ -632,7 +866,7 @@ async fn multiple_transactions() {
 /// LSN gating: inserts with already-applied LSN are skipped.
 #[tokio::test]
 async fn lsn_gating_skips_old_inserts() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -642,21 +876,23 @@ async fn lsn_gating_skips_old_inserts() {
 
     cleanup(&mut verify, "public.sharded", &[&id, &id2]).await;
 
-    // First transaction sets table LSN to 100.
+    // First transaction is confirmed at 200.
     sub.handle(begin_copy_data(100)).await.unwrap();
     sub.handle(relation_copy_data(oid)).await.unwrap();
     sub.handle(insert_copy_data(oid, &id, "first"))
         .await
         .unwrap();
     sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
 
-    // Second transaction at LSN 50 (behind table LSN 100) — insert skipped.
+    // Second transaction at LSN 50 (before the confirmed 200) — insert skipped.
     sub.handle(begin_copy_data(50)).await.unwrap();
     assert!(sub.lsn_applied(&oid));
     sub.handle(insert_copy_data(oid, &id2, "replayed"))
         .await
         .unwrap();
     sub.handle(commit_copy_data(60)).await.unwrap();
+    wait_for_commit(&mut sub, 60).await;
 
     assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
     assert_eq!(count_row(&mut verify, "public.sharded", &id2).await, 0);
@@ -664,35 +900,218 @@ async fn lsn_gating_skips_old_inserts() {
     cleanup(&mut verify, "public.sharded", &[&id]).await;
 }
 
-/// Equal LSNs are skipped so streaming does not replay rows already copied by COPY.
+/// Helper method for copy boundary test
+/// Insert `id` into the copy boundary source table
+async fn insert_uncommitted(server: &mut Server, id: i64) -> Result<String, BackendError> {
+    server.execute("BEGIN").await?;
+    server
+        .execute(format!(
+            "INSERT INTO copy_boundary_source (id) VALUES ({id})"
+        ))
+        .await?;
+    let mut transaction_ids: Vec<String> = server
+        .fetch_all("SELECT pg_current_xact_id()::xid::text")
+        .await?;
+    Ok(transaction_ids.remove(0))
+}
+
+/// Helper method for copy boundary test
+/// Wait until creation of `slot_name` is blocked on transaction `transaction_id`
+async fn wait_for_slot_blocked_on(server: &mut Server, slot_name: &str, transaction_id: &str) {
+    let waiting_on_transaction = format!(
+        "slots.slot_name = '{slot_name}' AND locks.locktype = 'transactionid' AND locks.transactionid::text = '{transaction_id}' AND NOT locks.granted"
+    );
+
+    let slot_locks =
+        "pg_locks locks JOIN pg_replication_slots slots ON slots.active_pid = locks.pid";
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while count_where(server, slot_locks, &waiting_on_transaction).await == 0 {
+        assert!(Instant::now() < deadline);
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Regression test to ensure that LSNs are applied properly at COPY boundaries.
+/// This calls `copy_boundary_attempt` multiple times because there's a small chance
+/// that Postgres behaves inconsistently (very small) to prevent a flaky test
+/// This is because Postgres *may* write WAL on its own between the point
+/// of consistency and our COMMIT
 #[tokio::test]
-async fn lsn_gating_skips_copy_boundary_inserts() {
-    let mut table = make_sharded_table();
-    table.lsn = Lsn::from_i64(100);
+async fn lsn_gating_at_copy_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10 {
+        if Box::pin(copy_boundary_attempt()).await? {
+            return Ok(());
+        }
+    }
+    Err("(flaky?) no transaction committed exactly at the consistent point".into())
+}
 
-    let mut sub = make_subscriber_with_tables(vec![table, make_sharded_test_b_table()]);
-    let mut verify = test_server().await;
-    sub.connect().await.unwrap();
+/// Returns `false` if the transaction missed the point of consistency
+async fn copy_boundary_attempt() -> Result<bool, Box<dyn std::error::Error>> {
+    let mut admin = test_server().await;
+    for query in [
+        "DROP PUBLICATION IF EXISTS copy_boundary",
+        "DROP TABLE IF EXISTS copy_boundary_source, copy_boundary_dest",
+        "CREATE TABLE copy_boundary_source (id BIGINT PRIMARY KEY, value TEXT)",
+        "CREATE TABLE copy_boundary_dest (id BIGINT PRIMARY KEY, value TEXT)",
+        "CREATE PUBLICATION copy_boundary FOR TABLE copy_boundary_source",
+    ] {
+        admin.execute(query).await?;
+    }
 
-    let oid = Oid(16384);
-    let id = random_id();
+    let mut tables = Table::load("copy_boundary", &mut admin).await?;
+    tables[0].table.parent_schema = tables[0].table.schema.clone();
+    tables[0].table.parent_name = "copy_boundary_dest".into();
 
-    cleanup(&mut verify, "public.sharded", &[&id]).await;
+    let mut replication_stream = ReplicationSlot::new_temporary("copy_boundary", admin.addr())
+        .create()
+        .await?;
+    replication_stream.server().execute("COMMIT").await?;
 
-    sub.handle(begin_copy_data(100)).await.unwrap();
-    sub.handle(relation_copy_data(oid)).await.unwrap();
-    sub.handle(insert_copy_data(oid, &id, "copied_already"))
-        .await
-        .unwrap();
-    sub.handle(commit_copy_data(200)).await.unwrap();
+    let (copy_lsn, rows_in_copy_snapshot) = {
+        let mut before_copy = test_server().await;
+        let mut during_copy = test_server().await;
+        let mut at_copy_boundary = test_server().await;
 
-    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 0);
+        // Row 1: left open to make the copy slot wait, lets us control when its snapshot is taken.
+        let transaction_id = insert_uncommitted(&mut before_copy, 1).await?;
+        let copy_slot = ReplicationSlot::new_temporary("copy_boundary", admin.addr());
+        let copy_slot_name = copy_slot.name().to_owned();
+        let copy_slot_creation = tokio::spawn(copy_slot.create());
+        wait_for_slot_blocked_on(&mut admin, &copy_slot_name, &transaction_id).await;
+
+        // Row 2: keeps slot waiting a second time
+        let transaction_id = insert_uncommitted(&mut during_copy, 2).await?;
+        before_copy.execute("COMMIT").await?;
+        wait_for_slot_blocked_on(&mut admin, &copy_slot_name, &transaction_id).await;
+
+        // Row 3 starts before the snapshot and commits right after it
+        // (ends up EXACTLY at the copy LSN).
+        insert_uncommitted(&mut at_copy_boundary, 3).await?;
+        during_copy.execute("COMMIT").await?;
+        let mut copy_stream = copy_slot_creation.await??;
+        at_copy_boundary.execute("COMMIT").await?;
+
+        // Row 4: commits well after the snapshot.
+        admin
+            .execute("INSERT INTO copy_boundary_source (id) VALUES (4)")
+            .await?;
+
+        // These are the rows the copy would see
+        let copy_lsn = copy_stream.lsn();
+        let rows_in_copy_snapshot: Vec<i64> = copy_stream
+            .server()
+            .fetch_all("SELECT id FROM copy_boundary_source ORDER BY id")
+            .await?;
+        copy_stream.server().execute("COMMIT").await?;
+
+        (copy_lsn, rows_in_copy_snapshot)
+    };
+
+    tables[0].lsn = copy_lsn;
+
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut subscriber = StreamSubscriber::new(&cluster, tables, test_origins(&cluster).await);
+    subscriber.connect().await?;
+    replication_stream.start_replication().await?;
+
+    let (begin_lsns, last_transaction_messages) = {
+        // Play the four transactions from above through the subscriber
+        let mut begin_lsns = vec![];
+        let mut last_transaction_messages = vec![];
+
+        let last_commit_end_lsn = loop {
+            let Some(ReplicationData::CopyData(message)) =
+                replication_stream.replicate(Duration::from_secs(5)).await?
+            else {
+                return Err("Replication ended early?".into());
+            };
+
+            let payload = message
+                .xlog_data()
+                .and_then(|xlog_data| xlog_data.payload());
+
+            if matches!(payload, Some(XLogPayload::Begin(_))) {
+                last_transaction_messages.clear();
+            }
+
+            last_transaction_messages.push(message.clone());
+            subscriber.handle(message).await?;
+
+            match payload {
+                Some(XLogPayload::Begin(begin)) => begin_lsns.push(begin.final_transaction_lsn),
+                Some(XLogPayload::Commit(commit)) if begin_lsns.len() == 4 => break commit.end_lsn,
+                _ => (),
+            }
+        };
+
+        wait_for_commit(&mut subscriber, last_commit_end_lsn).await;
+        (begin_lsns, last_transaction_messages)
+    };
+
+    // Fetch rows the subscriber wrote to the destination.
+    let rows_applied: Vec<i64> = admin
+        .fetch_all("SELECT id FROM copy_boundary_dest ORDER BY id")
+        .await?;
+
+    // Send the last transaction again (it was already applied, must be skipped)
+    {
+        admin
+            .execute("DELETE FROM copy_boundary_dest WHERE id = 4")
+            .await?;
+        for message in last_transaction_messages {
+            if let Some(XLogPayload::Insert(insert)) = message
+                .xlog_data()
+                .and_then(|xlog_data| xlog_data.payload())
+            {
+                assert!(subscriber.lsn_applied(&insert.oid));
+            }
+            subscriber.handle(message).await?;
+        }
+    }
+
+    let rows_after_redelivery: Vec<i64> = admin
+        .fetch_all("SELECT id FROM copy_boundary_dest ORDER BY id")
+        .await?;
+
+    // Cleanup!
+    for query in [
+        "DROP PUBLICATION copy_boundary",
+        "DROP TABLE copy_boundary_source, copy_boundary_dest",
+    ] {
+        admin.execute(query).await?;
+    }
+
+    // Verify that row 3 ended up exactly at the copy LSN (else we must re-try for accurate results)
+    if begin_lsns[2] != copy_lsn.lsn {
+        return Ok(false);
+    }
+
+    // row 1 & 2 are before the copy
+    assert!(begin_lsns[0] < copy_lsn.lsn && begin_lsns[1] < copy_lsn.lsn);
+
+    // row 4 is after the copy
+    assert!(begin_lsns[3] > copy_lsn.lsn);
+
+    // row 3 is **NOT** included (it's exactly at the copy LSN)
+    assert_eq!(rows_in_copy_snapshot, [1, 2]);
+
+    // stream skipped row 1 and 2
+    assert_eq!(rows_applied, [3, 4]);
+
+    // repeat was skipped
+    assert_eq!(rows_after_redelivery, [3]);
+
+    // no need to re-try
+    Ok(true)
 }
 
 /// Multiple rows in the same transaction must still be applied after inclusive LSN gating.
 #[tokio::test]
 async fn multiple_inserts_same_transaction_are_applied() {
-    let mut sub = make_subscriber();
+    let mut sub = make_subscriber().await;
     let mut verify = test_server().await;
     sub.connect().await.unwrap();
 
@@ -711,6 +1130,7 @@ async fn multiple_inserts_same_transaction_are_applied() {
         .await
         .unwrap();
     sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
 
     assert_eq!(count_row(&mut verify, "public.sharded", &id1).await, 1);
     assert_eq!(count_row(&mut verify, "public.sharded", &id2).await, 1);
@@ -773,4 +1193,1581 @@ fn copy_data_round_trip_delete() {
         payload,
         crate::net::replication::xlog_data::XLogPayload::Delete(_)
     ));
+}
+
+fn make_posts_table() -> Table {
+    Table {
+        publication: "test".to_string(),
+        table: PublicationTable {
+            schema: "public".to_string(),
+            name: "posts".to_string(),
+            attributes: "".to_string(),
+            parent_schema: "".to_string(),
+            parent_name: "".to_string(),
+        },
+        identity: ReplicaIdentity {
+            oid: Oid(3),
+            identity: "".to_string(),
+            kind: "".to_string(),
+        },
+        columns: vec![
+            PublicationTableColumn {
+                oid: 3,
+                name: "id".to_string(),
+                type_oid: Oid(20),
+                identity: true,
+            },
+            PublicationTableColumn {
+                oid: 3,
+                name: "title".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+            PublicationTableColumn {
+                oid: 3,
+                name: "body".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+        ],
+        lsn: Lsn::default(),
+    }
+}
+
+fn posts_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "posts".to_string(),
+        replica_identity: 100,
+        columns: vec![
+            RelColumn {
+                flag: 1,
+                name: "id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "title".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "body".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn posts_relation_copy_data(oid: Oid) -> CopyData {
+    xlog_copy_data(posts_relation(oid).to_bytes())
+}
+
+fn posts_insert_copy_data(oid: Oid, id: &str, title: &str, body: &str) -> CopyData {
+    xlog_copy_data(
+        XLogInsert {
+            oid,
+            tuple_data: TupleData {
+                columns: vec![text_column(id), text_column(title), text_column(body)],
+            },
+        }
+        .to_bytes(),
+    )
+}
+
+/// UPDATE for posts: title is set to `new_title`; body is marked Toasted (`'u'`).
+/// This produces a tuple where exactly one non-identity column is absent, forcing
+/// the subscriber through the slow-path `update_partial` code.
+fn posts_update_title_copy_data(oid: Oid, id: &str, new_title: &str) -> CopyData {
+    xlog_copy_data(
+        XLogUpdate {
+            oid,
+            identity: UpdateIdentity::Nothing,
+            new: TupleData {
+                columns: vec![text_column(id), text_column(new_title), toasted_column()],
+            },
+        }
+        .to_bytes(),
+    )
+}
+
+async fn fetch_posts_row(server: &mut Server, id: &str) -> Option<(String, String)> {
+    let query = format!("SELECT title, body FROM public.posts WHERE id = {}", id);
+    let rows: Vec<crate::net::DataRow> = server.fetch_all(query).await.unwrap();
+    rows.first().and_then(|row| {
+        let title = row
+            .column(0)
+            .map(|c| std::str::from_utf8(&c[..]).unwrap().to_string())?;
+        let body = row
+            .column(1)
+            .map(|c| std::str::from_utf8(&c[..]).unwrap().to_string())?;
+        Some((title, body))
+    })
+}
+
+// ── Unchanged-TOAST handling tests ───────────────────────────────
+
+/// UPDATE with an unchanged-TOAST column alongside a real updated column
+/// exercises the slow path in the subscriber (`update_partial` + `partial_new`).
+///
+/// Fixture: `posts(id PK, title text, body text)`.  `body` is Toasted (`'u'`);
+/// `title` carries a new value.  The subscriber must emit
+/// `UPDATE posts SET title=$1 WHERE id=$2`, updating `title` and leaving `body` intact.
+#[tokio::test]
+async fn toast_update_preserves_unchanged_column() {
+    let oid = Oid(16384);
+    let mut sub = make_subscriber_with_tables(vec![make_posts_table()]).await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let id = random_id();
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+
+    // Seed the destination row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(posts_relation_copy_data(oid)).await.unwrap();
+    sub.handle(posts_insert_copy_data(
+        oid,
+        &id,
+        "original-title",
+        "original-large-body",
+    ))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    let row = fetch_posts_row(&mut verify, &id)
+        .await
+        .expect("seed INSERT did not land");
+    assert_eq!(row.0, "original-title");
+    assert_eq!(row.1, "original-large-body");
+
+    // UPDATE: title gets a new value; body is Toasted — slow path must execute.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(posts_update_title_copy_data(oid, &id, "updated-title"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    let row = fetch_posts_row(&mut verify, &id)
+        .await
+        .expect("row disappeared after UPDATE");
+    assert_eq!(row.0, "updated-title", "title was not updated");
+    assert_eq!(
+        row.1, "original-large-body",
+        "unchanged-TOAST body was overwritten"
+    );
+
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+}
+
+/// Two UPDATEs with the same TOAST shape (body Toasted, title updated) must
+/// reuse the cached prepared statement generated by `ensure_update_shape` on the
+/// first pass.  Both updates must apply correctly end-to-end.
+#[tokio::test]
+async fn toast_update_shape_reuse() {
+    let oid = Oid(16384);
+    let mut sub = make_subscriber_with_tables(vec![make_posts_table()]).await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let id = random_id();
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(posts_relation_copy_data(oid)).await.unwrap();
+    sub.handle(posts_insert_copy_data(oid, &id, "seed-title", "seed-body"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // Two UPDATEs with identical TOAST shape: title changes each time, body stays
+    // Toasted.  The second must hit the shape cache without re-preparing.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(posts_update_title_copy_data(oid, &id, "first-update"))
+        .await
+        .unwrap();
+    sub.handle(posts_update_title_copy_data(oid, &id, "second-update"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    let row = fetch_posts_row(&mut verify, &id)
+        .await
+        .expect("row disappeared after shape-reuse UPDATEs");
+    assert_eq!(row.0, "second-update", "second UPDATE title did not apply");
+    assert_eq!(
+        row.1, "seed-body",
+        "body was overwritten during shape-reuse"
+    );
+
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+}
+
+/// UPDATE where ALL non-identity columns are Toasted — the no-op branch must fire.
+/// The destination row must be exactly as seeded; the LSN watermark must still advance.
+#[tokio::test]
+async fn toast_update_all_toasted_is_noop() {
+    let oid = Oid(16384);
+    let mut sub = make_subscriber_with_tables(vec![make_posts_table()]).await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let id = random_id();
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+
+    // Seed a row with known values.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(posts_relation_copy_data(oid)).await.unwrap();
+    sub.handle(posts_insert_copy_data(
+        oid,
+        &id,
+        "original-title",
+        "original-body",
+    ))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    let row = fetch_posts_row(&mut verify, &id)
+        .await
+        .expect("seed INSERT did not land");
+    assert_eq!(row.0, "original-title");
+    assert_eq!(row.1, "original-body");
+
+    // UPDATE where both non-identity columns are Toasted — no-op path.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(xlog_copy_data(
+        XLogUpdate {
+            oid,
+            identity: UpdateIdentity::Nothing,
+            new: TupleData {
+                columns: vec![text_column(&id), toasted_column(), toasted_column()],
+            },
+        }
+        .to_bytes(),
+    ))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    // Watermark advanced even though we took the no-op path.
+    assert_eq!(sub.lsn(), 400);
+
+    // Row unchanged — the no-op path must not have touched either column.
+    let row = fetch_posts_row(&mut verify, &id)
+        .await
+        .expect("row disappeared after all-TOAST no-op UPDATE");
+    assert_eq!(
+        row.0, "original-title",
+        "title changed during all-TOAST no-op"
+    );
+    assert_eq!(
+        row.1, "original-body",
+        "body changed during all-TOAST no-op"
+    );
+
+    cleanup(&mut verify, "public.posts", &[&id]).await;
+}
+
+/// PK-change UPDATE with 'u' in the new tuple fails with ToastedRowMigration.
+#[tokio::test]
+async fn toast_pk_change_with_u_rejects() {
+    let mut sub = make_subscriber().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(relation_copy_data(oid)).await.unwrap();
+    let err = sub
+        .handle(x_update(XLogUpdate {
+            oid,
+            identity: UpdateIdentity::Key(TupleData {
+                columns: vec![text_column("old")],
+            }),
+            new: TupleData {
+                columns: vec![text_column("new"), toasted_column()],
+            },
+        }))
+        .await
+        .expect_err("expected ToastedRowMigration");
+    assert!(
+        matches!(
+            err,
+            crate::backend::replication::logical::Error::ToastedRowMigration { .. }
+        ),
+        "got: {:?}",
+        err
+    );
+}
+
+/// No key: pgoutput emits 'u' for an out-of-line identity column that didn't change.
+#[tokio::test]
+async fn update_rejects_toasted_identity_no_key() {
+    let oid = Oid(16384);
+    let mut sub = make_subscriber_with_tables(vec![make_posts_table()]).await;
+    sub.connect().await.unwrap();
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(posts_relation_copy_data(oid)).await.unwrap();
+    let err = sub
+        .handle(x_update(XLogUpdate {
+            oid,
+            identity: UpdateIdentity::Nothing,
+            new: TupleData {
+                columns: vec![
+                    toasted_column(),
+                    text_column("new-title"),
+                    text_column("new-body"),
+                ],
+            },
+        }))
+        .await
+        .expect_err("toasted identity must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::backend::replication::logical::Error::ToastedIdentityColumn { .. }
+        ),
+        "got: {err:?}"
+    );
+}
+
+/// Key present (USING INDEX replica identity): identity column is still 'u' in the new tuple.
+#[tokio::test]
+async fn update_rejects_toasted_identity_with_key() {
+    let oid = Oid(16384);
+    let mut sub = make_subscriber_with_tables(vec![make_posts_table()]).await;
+    sub.connect().await.unwrap();
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(posts_relation_copy_data(oid)).await.unwrap();
+    let err = sub
+        .handle(x_update(XLogUpdate {
+            oid,
+            identity: UpdateIdentity::Key(TupleData {
+                columns: vec![text_column("42")],
+            }),
+            new: TupleData {
+                columns: vec![
+                    toasted_column(),
+                    text_column("new-title"),
+                    text_column("new-body"),
+                ],
+            },
+        }))
+        .await
+        .expect_err("toasted identity with key must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::backend::replication::logical::Error::ToastedIdentityColumn { .. }
+        ),
+        "got: {err:?}"
+    );
+}
+
+// ── REPLICA IDENTITY FULL tests ──────────────────────────────────────────────
+
+/// Build a sharded FULL-identity table that maps to `public.sharded`.
+/// All columns have `identity = false` (FULL identity has no designated identity cols).
+fn make_full_identity_sharded_table() -> Table {
+    Table {
+        publication: "test".to_string(),
+        table: PublicationTable {
+            schema: "public".to_string(),
+            name: "sharded".to_string(),
+            attributes: "".to_string(),
+            parent_schema: "".to_string(),
+            parent_name: "".to_string(),
+        },
+        identity: ReplicaIdentity {
+            oid: Oid(3),
+            identity: "f".to_string(),
+            kind: "r".to_string(),
+        },
+        columns: vec![
+            PublicationTableColumn {
+                oid: 3,
+                name: "id".to_string(),
+                type_oid: Oid(20), // bigint
+                identity: false,   // FULL: no designated identity columns
+            },
+            PublicationTableColumn {
+                oid: 3,
+                name: "value".to_string(),
+                type_oid: Oid(25), // text
+                identity: false,
+            },
+        ],
+        lsn: Lsn::default(),
+    }
+}
+
+/// Build a NOTHING-identity table — used to verify `relation()` rejects it.
+fn make_replica_identity_nothing_table() -> Table {
+    let mut t = make_full_identity_sharded_table();
+    t.identity.identity = "n".to_string();
+    t
+}
+
+/// Build an omni FULL-identity table that maps to `public.full_events_omni`.
+/// Columns `(a, b)` are not part of the sharding schema → `is_sharded()` returns false.
+fn make_full_identity_omni_table() -> Table {
+    Table {
+        publication: "test".to_string(),
+        table: PublicationTable {
+            schema: "public".to_string(),
+            name: "full_events_omni".to_string(),
+            attributes: "".to_string(),
+            parent_schema: "".to_string(),
+            parent_name: "".to_string(),
+        },
+        identity: ReplicaIdentity {
+            oid: Oid(5),
+            identity: "f".to_string(),
+            kind: "r".to_string(),
+        },
+        columns: vec![
+            PublicationTableColumn {
+                oid: 5,
+                name: "a".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+            PublicationTableColumn {
+                oid: 5,
+                name: "b".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+        ],
+        lsn: Lsn::default(),
+    }
+}
+
+fn full_identity_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "sharded".to_string(),
+        replica_identity: b'f' as i8,
+        columns: vec![
+            RelColumn {
+                flag: 0,
+                name: "id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "value".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn full_identity_relation_copy_data(oid: Oid) -> CopyData {
+    xlog_copy_data(full_identity_relation(oid).to_bytes())
+}
+
+/// Helper: build a FULL-identity UPDATE CopyData.
+/// Both old and new tuples share the same column positions.
+fn full_update_copy_data(
+    oid: Oid,
+    old_id: &str,
+    old_value: &str,
+    new_id: &str,
+    new_value: &str,
+) -> CopyData {
+    x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(TupleData {
+            columns: vec![text_column(old_id), text_column(old_value)],
+        }),
+        new: TupleData {
+            columns: vec![text_column(new_id), text_column(new_value)],
+        },
+    })
+}
+
+/// FULL-identity UPDATE: `value` Toasted in NEW (unchanged), fully present in OLD.
+/// Real WAL shape — PG always materialises OLD inline under REPLICA IDENTITY FULL.
+fn full_update_value_toasted_copy_data(
+    oid: Oid,
+    old_id: &str,
+    old_value: &str,
+    new_id: &str,
+) -> CopyData {
+    x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(TupleData {
+            columns: vec![text_column(old_id), text_column(old_value)],
+        }),
+        new: TupleData {
+            columns: vec![text_column(new_id), toasted_column()],
+        },
+    })
+}
+
+/// Helper: build a FULL-identity UPDATE where ALL columns are Toasted in new.
+fn full_update_all_toasted_copy_data(oid: Oid) -> CopyData {
+    x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(TupleData {
+            columns: vec![toasted_column(), toasted_column()],
+        }),
+        new: TupleData {
+            columns: vec![toasted_column(), toasted_column()],
+        },
+    })
+}
+
+/// Helper: FULL-identity DELETE using the full old-row tuple.
+fn full_delete_copy_data(oid: Oid, id: &str, value: &str) -> CopyData {
+    xlog_copy_data(
+        XLogDelete {
+            oid,
+            key: None,
+            old: Some(TupleData {
+                columns: vec![text_column(id), text_column(value)],
+            }),
+        }
+        .to_bytes(),
+    )
+}
+
+// ── Helpers for duplicate-row and omni-dedup tests ─────────────────────────────────────────────
+
+/// Table without a primary key — allows duplicate rows.
+/// In the test sharding config so `is_sharded()` returns `true`, bypassing the omni unique-index check.
+fn make_full_identity_dup_rows_table() -> Table {
+    let mut t = make_full_identity_sharded_table();
+    t.table.name = "full_dup_rows".to_string();
+    t
+}
+
+fn full_dup_rows_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "full_dup_rows".to_string(),
+        replica_identity: b'f' as i8,
+        columns: vec![
+            RelColumn {
+                flag: 0,
+                name: "id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "value".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn full_dup_rows_relation_copy_data(oid: Oid) -> CopyData {
+    xlog_copy_data(full_dup_rows_relation(oid).to_bytes())
+}
+
+/// Omni FULL-identity table with `(a TEXT, b TEXT)` and a unique index on `(a, b)`.
+/// A separate table from `full_events_omni` so the no-unique-index rejection test is unaffected.
+fn make_full_identity_omni_dedup_table() -> Table {
+    let mut t = make_full_identity_omni_table();
+    t.table.name = "full_omni_dedup".to_string();
+    t
+}
+
+fn full_omni_dedup_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "full_omni_dedup".to_string(),
+        replica_identity: b'f' as i8,
+        columns: vec![
+            RelColumn {
+                flag: 0,
+                name: "a".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "b".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn full_omni_dedup_relation_copy_data(oid: Oid) -> CopyData {
+    xlog_copy_data(full_omni_dedup_relation(oid).to_bytes())
+}
+
+/// Build an INSERT CopyData for the omni dedup table `(a, b)`.
+fn omni_insert_copy_data(oid: Oid, a: &str, b: &str) -> CopyData {
+    xlog_copy_data(
+        XLogInsert {
+            oid,
+            tuple_data: TupleData {
+                columns: vec![text_column(a), text_column(b)],
+            },
+        }
+        .to_bytes(),
+    )
+}
+
+// ── NOTHING rejection ───────────────────────────────────────────────────────────────────────────
+
+/// REPLICA IDENTITY NOTHING must be rejected at relation() time.
+#[tokio::test]
+async fn full_identity_nothing_rejected() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_replica_identity_nothing_table()],
+        test_origins(&cluster).await,
+    );
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16390);
+    // Use the same schema+name as the nothing table so relation() finds it.
+    let mut rel = full_identity_relation(oid);
+    rel.name = "sharded".to_string();
+    let err = sub
+        .handle(xlog_copy_data(rel.to_bytes()))
+        .await
+        .expect_err("REPLICA IDENTITY NOTHING must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::backend::replication::logical::Error::TableValidation(_)
+        ),
+        "expected TableValidation error, got: {err:?}"
+    );
+    // Match the exact Display rendering so a future copy edit (sort key, tabs, remediation guidance)
+    // is caught — mirrors the assertion style of `data_sync_rejects_no_pk_table_before_slots_created`.
+    assert_eq!(
+        err.to_string(),
+        "Table validation failed:\n\ttable \"public\".\"sharded\": REPLICA IDENTITY NOTHING, UPDATE/DELETE carry no row identity and cannot be replicated; set it to DEFAULT, INDEX, or FULL",
+        "NOTHING rejection message drifted; got: {err}"
+    );
+}
+
+// ── Omni no-unique-index rejection ────────────────────────────────────────────────────
+
+/// FULL identity omni table without a unique index on the destination must be rejected.
+/// `full_events_omni` is absent (or has no qualifying index) — enough for `tables_missing_unique_index()` to return it as missing.
+#[tokio::test]
+async fn full_identity_omni_no_unique_index_rejected() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_omni_table()],
+        test_origins(&cluster).await,
+    );
+
+    // Enforce precondition: the table must exist but have no qualifying unique index.
+    // A stale unique index from a prior run would make tables_missing_unique_index() return empty,
+    // causing expect_err() to panic. Drop and recreate the table to guarantee a clean state.
+    {
+        let mut setup = test_server().await;
+        let _ = setup
+            .execute("DROP TABLE IF EXISTS public.full_events_omni")
+            .await;
+        setup
+            .execute("CREATE TABLE IF NOT EXISTS public.full_events_omni (a TEXT, b TEXT)")
+            .await
+            .unwrap();
+    }
+
+    let err = sub
+        .connect()
+        .await
+        .expect_err("omni FULL table without unique index must be rejected at connect time");
+    assert!(
+        matches!(
+            err,
+            crate::backend::replication::logical::Error::TableValidation(_)
+        ),
+        "expected TableValidation error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("REPLICA IDENTITY FULL"),
+        "error message must mention FULL identity, got: {err}"
+    );
+}
+
+// ── FULL identity DML tests ───────────────────────────────────────────────────────────
+
+/// FULL identity sharded INSERT lands exactly once on the destination.
+#[tokio::test]
+async fn full_identity_insert_sharded() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "full_hello"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+}
+
+/// FULL identity fast-path UPDATE: no Toasted columns — UPDATE matches the old row
+/// via IS NOT DISTINCT FROM and applies the new values.
+#[tokio::test]
+async fn full_identity_update_fast_path() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    let id2 = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id, &id2]).await;
+
+    // Insert the initial row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "before"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
+
+    // Update the row: change id from `id` to `id2`, value from "before" to "after".
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_update_copy_data(oid, &id, "before", &id2, "after"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    assert_eq!(
+        count_row(&mut verify, "public.sharded", &id).await,
+        0,
+        "old row gone"
+    );
+    assert_eq!(
+        count_row(&mut verify, "public.sharded", &id2).await,
+        1,
+        "new row present"
+    );
+    // Read back `value` so a SET-clause regression (dropped column / wrong $N)
+    // is observable. count_row alone would silently pass.
+    assert_eq!(
+        fetch_value(&mut verify, "public.sharded", &id2)
+            .await
+            .as_deref(),
+        Some("after"),
+        "SET clause must update value column"
+    );
+
+    cleanup(&mut verify, "public.sharded", &[&id, &id2]).await;
+}
+
+/// FULL identity slow-path UPDATE: `value` is Toasted (unchanged), only `id` present.
+/// Verifies the shape cache is populated and the partial UPDATE executes without error.
+#[tokio::test]
+async fn full_identity_update_slow_path() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    let id2 = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id, &id2]).await;
+
+    // Insert initial row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "initial"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // Rename id → id2; value Toasted in NEW (unchanged), inline in OLD.
+    // Using distinct id2 forces a real row rename so assertions are non-trivial.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_update_value_toasted_copy_data(
+        oid, &id, "initial", &id2,
+    ))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    // Old row must be gone.
+    assert_eq!(
+        count_row(&mut verify, "public.sharded", &id).await,
+        0,
+        "original id row must be gone after rename"
+    );
+    // New row must exist.
+    assert_eq!(
+        count_row(&mut verify, "public.sharded", &id2).await,
+        1,
+        "renamed id2 row must be present"
+    );
+    // Toasted `value` must survive the rename — a regression that drops or zeroes the
+    // toasted column would produce NULL or an empty string here.
+    assert_eq!(
+        fetch_value(&mut verify, "public.sharded", &id2)
+            .await
+            .as_deref(),
+        Some("initial"),
+        "unchanged-TOAST column must be preserved across slow-path UPDATE"
+    );
+
+    cleanup(&mut verify, "public.sharded", &[&id, &id2]).await;
+}
+
+/// Regression: real PG WAL never has `'u'` markers in OLD under REPLICA IDENTITY FULL
+/// (PG calls `toast_flatten_tuple` on OLD before WAL-logging). Only NEW carries `'u'`.
+/// Exercises the path the prior buggy `old.without_toasted()` failed on (n+k bind vs 2k SQL).
+#[tokio::test]
+async fn full_identity_update_slow_path_realistic_old_tuple() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    // Seed the row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "initial"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // Realistic UPDATE shape produced by PG: OLD has every column inline,
+    // NEW marks the unchanged `value` column as 'u'.
+    let realistic = x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(TupleData {
+            columns: vec![text_column(&id), text_column("initial")],
+        }),
+        new: TupleData {
+            columns: vec![text_column(&id), toasted_column()],
+        },
+    });
+
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    let result = sub.handle(realistic).await;
+    // Drain the commit so the connection state is clean even on failure.
+    let _ = sub.handle(commit_copy_data(400)).await;
+
+    result.unwrap();
+
+    assert_eq!(
+        count_row(&mut verify, "public.sharded", &id).await,
+        1,
+        "row must still exist after slow-path UPDATE"
+    );
+    assert_eq!(
+        fetch_value(&mut verify, "public.sharded", &id)
+            .await
+            .as_deref(),
+        Some("initial"),
+        "unchanged-TOAST `value` must be preserved across slow-path UPDATE"
+    );
+
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+}
+
+/// FULL identity UPDATE where every column is Toasted: nothing to do, skip silently.
+#[tokio::test]
+async fn full_identity_update_all_toasted_is_noop() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    // Insert initial row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "stable"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // All columns Toasted: no-op, must not error, row must be untouched.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_update_all_toasted_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
+    // Value column must be untouched — a no-op that silently zeros a column would
+    // still satisfy the count check but would fail here.
+    assert_eq!(
+        fetch_value(&mut verify, "public.sharded", &id)
+            .await
+            .as_deref(),
+        Some("stable"),
+        "all-toasted no-op must leave value column untouched"
+    );
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+}
+
+/// FULL identity DELETE: matches old-row tuple via IS NOT DISTINCT FROM on all columns.
+#[tokio::test]
+async fn full_identity_delete() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_sharded_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    // Insert row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_identity_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(insert_copy_data(oid, &id, "to_delete"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 1);
+
+    // Delete via full old-row match.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_delete_copy_data(oid, &id, "to_delete"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    assert_eq!(count_row(&mut verify, "public.sharded", &id).await, 0);
+
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+}
+
+// ── Omni dedup test ────────────────────────────────────────────────────────────────────────
+
+/// FULL identity omni INSERT: verifies `ON CONFLICT DO NOTHING` deduplication during
+/// the COPY-to-replication overlap window — same row inserted twice must land once.
+#[tokio::test]
+async fn full_identity_insert_omni_dedup() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_omni_dedup_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+
+    // Ensure destination table exists with unique index before relation() runs.
+    ensure_table(&mut verify, "public.full_omni_dedup").await;
+    verify
+        .execute("DELETE FROM public.full_omni_dedup")
+        .await
+        .unwrap();
+
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16400);
+    // Send relation — tables_missing_unique_index() must return empty or relation() rejects.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_omni_dedup_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // First INSERT: row lands.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(omni_insert_copy_data(oid, "hello", "world"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    let predicate = "a = 'hello' AND b = 'world'";
+    let count = count_where(&mut verify, "public.full_omni_dedup", predicate).await;
+    assert_eq!(count, 1, "first INSERT must land");
+
+    // Second INSERT: same values — ON CONFLICT DO NOTHING, count stays at 1.
+    sub.handle(begin_copy_data(500)).await.unwrap();
+    sub.handle(omni_insert_copy_data(oid, "hello", "world"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(600)).await.unwrap();
+    wait_for_commit(&mut sub, 600).await;
+
+    let count = count_where(&mut verify, "public.full_omni_dedup", predicate).await;
+    assert_eq!(
+        count, 1,
+        "second INSERT must be silently skipped by ON CONFLICT DO NOTHING"
+    );
+
+    verify
+        .execute("DELETE FROM public.full_omni_dedup")
+        .await
+        .unwrap();
+}
+
+// ── Duplicate-row handling tests ──────────────────────────────────────────────────────────────────────────────────
+
+/// FULL identity UPDATE on a table with two identical rows must succeed and affect exactly one row.
+/// With REPLICA IDENTITY FULL, Postgres materialises all TOAST values into the WAL record, so the
+/// old tuple is always complete. Two rows matching the old tuple are byte-for-byte identical;
+/// the ctid-based WHERE targets one of them, which is semantically correct.
+#[tokio::test]
+async fn full_identity_update_duplicate_rows() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_dup_rows_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+
+    ensure_table(&mut verify, "public.full_dup_rows").await;
+
+    let id = random_id();
+    // Clean slate.
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16401);
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_dup_rows_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // Seed two identical rows directly.
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, 'dup')"
+        ))
+        .await
+        .unwrap();
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, 'dup')"
+        ))
+        .await
+        .unwrap();
+
+    // FULL UPDATE WAL event: old = (id, 'dup'), new = (id2, 'changed').
+    // The ctid subquery must target exactly one of the two identical rows.
+    let id2 = random_id();
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_update_copy_data(oid, &id, "dup", &id2, "changed"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    // Exactly one row was updated: the old (id, 'dup') row remains, the other became (id2, 'changed').
+    assert_eq!(
+        count_row(&mut verify, "public.full_dup_rows", &id).await,
+        1,
+        "exactly one of the two duplicate rows must have been updated"
+    );
+
+    // Cleanup.
+    verify
+        .execute(format!(
+            "DELETE FROM public.full_dup_rows WHERE id IN ({id}, {id2})"
+        ))
+        .await
+        .unwrap();
+}
+
+/// FULL identity DELETE on a table with two identical rows must succeed and remove exactly one row.
+/// Same rationale as the UPDATE variant: ctid targets one byte-for-byte identical row.
+#[tokio::test]
+async fn full_identity_delete_duplicate_rows() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_dup_rows_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+
+    ensure_table(&mut verify, "public.full_dup_rows").await;
+
+    let id = random_id();
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16402);
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_dup_rows_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // Seed two identical rows.
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, 'dup')"
+        ))
+        .await
+        .unwrap();
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, 'dup')"
+        ))
+        .await
+        .unwrap();
+
+    // FULL DELETE: old = (id, 'dup') — ctid must remove exactly one of the two identical rows.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(full_delete_copy_data(oid, &id, "dup"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    // Exactly one row deleted: one (id, 'dup') row must remain.
+    assert_eq!(
+        count_row(&mut verify, "public.full_dup_rows", &id).await,
+        1,
+        "exactly one of the two duplicate rows must have been deleted"
+    );
+
+    // Cleanup.
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+}
+
+// ── NULL-column FULL identity matching ─────────────────────────────────────────────────────────
+
+/// FULL identity UPDATE/DELETE matches a row whose `value` column is NULL.
+///
+/// `IS NOT DISTINCT FROM` is required for this case — plain `=` on NULL evaluates to NULL
+/// (not TRUE), so the WHERE clause would never match a NULL-valued row. A regression that
+/// swapped the operator back to `=` would miss every NULL-keyed row and silently drop the
+/// event. count_row alone in other FULL tests would not catch this.
+#[tokio::test]
+async fn full_identity_update_matches_null_column() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_dup_rows_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+
+    // full_dup_rows has no NOT NULL on value — we can seed a NULL row.
+    ensure_table(&mut verify, "public.full_dup_rows").await;
+
+    let id = random_id();
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, NULL)"
+        ))
+        .await
+        .unwrap();
+
+    sub.connect().await.unwrap();
+    let oid = Oid(16410);
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_dup_rows_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // FULL UPDATE: old = (id, NULL), new = (id, "filled"). The WHERE clause must use
+    // IS NOT DISTINCT FROM so NULL participates in the match.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(TupleData {
+            columns: vec![text_column(&id), null_column()],
+        }),
+        new: TupleData {
+            columns: vec![text_column(&id), text_column("filled")],
+        },
+    }))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    assert_eq!(
+        fetch_value(&mut verify, "public.full_dup_rows", &id)
+            .await
+            .as_deref(),
+        Some("filled"),
+        "FULL identity UPDATE must match NULL via IS NOT DISTINCT FROM"
+    );
+
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+}
+
+/// FULL identity DELETE removes a row whose value column is NULL.
+#[tokio::test]
+async fn full_identity_delete_matches_null_column() {
+    let cluster = Cluster::new_test_single_shard(&config());
+    let mut sub = StreamSubscriber::new(
+        &cluster,
+        vec![make_full_identity_dup_rows_table()],
+        test_origins(&cluster).await,
+    );
+    let mut verify = test_server().await;
+
+    ensure_table(&mut verify, "public.full_dup_rows").await;
+
+    let id = random_id();
+    verify
+        .execute(format!("DELETE FROM public.full_dup_rows WHERE id = {id}"))
+        .await
+        .unwrap();
+    verify
+        .execute(format!(
+            "INSERT INTO public.full_dup_rows VALUES ({id}, NULL)"
+        ))
+        .await
+        .unwrap();
+
+    sub.connect().await.unwrap();
+    let oid = Oid(16411);
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(full_dup_rows_relation_copy_data(oid))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    // DELETE with old = (id, NULL).
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(xlog_copy_data(
+        XLogDelete {
+            oid,
+            key: None,
+            old: Some(TupleData {
+                columns: vec![text_column(&id), null_column()],
+            }),
+        }
+        .to_bytes(),
+    ))
+    .await
+    .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+
+    assert_eq!(
+        count_row(&mut verify, "public.full_dup_rows", &id).await,
+        0,
+        "FULL identity DELETE must match NULL via IS NOT DISTINCT FROM"
+    );
+}
+
+/// Source LSN recorded in the replication origin of each destination shard,
+/// `None` while the origin has no commit.
+async fn origin_progress(server: &mut Server) -> Vec<Option<Lsn>> {
+    let mut progress = vec![];
+    for shard in 0..2 {
+        let rows: Vec<String> = server
+            .fetch_all(format!(
+                "SELECT COALESCE(pg_replication_origin_progress('__pgdog_origin_test_{shard}', false)::text, '')"
+            ))
+            .await
+            .unwrap();
+        progress.push(rows[0].parse().ok());
+    }
+    progress
+}
+
+/// A transaction that changes only one of two shards is confirmed: the
+/// shard without changes does not block it, and only the changed shard
+/// records the commit in its origin.
+#[tokio::test]
+async fn transaction_on_one_shard_is_confirmed() {
+    let mut sub = make_subscriber().await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    sub.handle(relation_copy_data(oid)).await.unwrap();
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(insert_copy_data(oid, &id, "one shard"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+
+    let mut progress = origin_progress(&mut verify).await;
+    progress.sort();
+    assert_eq!(progress, [None, Some(Lsn::from_u64(200))]);
+
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+}
+
+/// A transaction whose change hits no row, and a transaction without
+/// changes, are both confirmed.
+#[tokio::test]
+async fn transactions_without_written_rows_are_confirmed() {
+    let mut sub = make_subscriber().await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let id = random_id();
+    cleanup(&mut verify, "public.sharded", &[&id]).await;
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(relation_copy_data(oid)).await.unwrap();
+    sub.handle(delete_copy_data(oid, &id)).await.unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+    wait_for_commit(&mut sub, 200).await;
+    assert!(
+        origin_progress(&mut verify)
+            .await
+            .contains(&Some(Lsn::from_u64(200)))
+    );
+
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    wait_for_commit(&mut sub, 400).await;
+}
+
+/// One check confirms every transaction that is durable, not one at a time.
+#[tokio::test]
+async fn one_check_confirms_several_transactions() {
+    let mut sub = make_subscriber().await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let ids = [random_id(), random_id(), random_id()];
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
+
+    sub.handle(relation_copy_data(oid)).await.unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        let lsn = 200 * (n as u64 + 1);
+        sub.handle(begin_copy_data(lsn - 100)).await.unwrap();
+        sub.handle(insert_copy_data(oid, id, "batch"))
+            .await
+            .unwrap();
+        sub.handle(commit_copy_data(lsn)).await.unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut applied = 0;
+        for id in &ids {
+            applied += count_row(&mut verify, "public.sharded", id).await;
+        }
+        if applied == ids.len() as i64 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "rows were not applied");
+        sleep(Duration::from_millis(10)).await;
+    }
+    sleep(Duration::from_millis(500)).await;
+
+    assert!(sub.check_confirmed_sent_lsn().await.unwrap());
+    assert_eq!(sub.status_update().last_flushed, 600);
+
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
+}
+
+/// After a reconnect the source sends again the transactions that were
+/// applied but not confirmed. Each shard skips what its origin already has.
+#[tokio::test]
+async fn replay_after_reconnect_skips_applied_transactions() {
+    let mut sub = make_subscriber().await;
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16384);
+    let ids = [random_id(), random_id()];
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
+
+    let transaction = [
+        begin_copy_data(100),
+        relation_copy_data(oid),
+        insert_copy_data(oid, &ids[0], "replayed"),
+        insert_copy_data(oid, &ids[1], "replayed"),
+        commit_copy_data(200),
+    ];
+    for message in transaction.clone() {
+        sub.handle(message).await.unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut applied = 0;
+        for id in &ids {
+            applied += count_row(&mut verify, "public.sharded", id).await;
+        }
+        if applied == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "rows were not applied");
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sub.status_update().last_flushed, 0, "not confirmed yet");
+
+    sub.reconnect().await.unwrap();
+    for message in transaction {
+        sub.handle(message).await.unwrap();
+    }
+    wait_for_commit(&mut sub, 200).await;
+
+    for id in &ids {
+        assert_eq!(count_row(&mut verify, "public.sharded", id).await, 1);
+    }
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
+}
+
+#[tokio::test]
+async fn new_stream_with_the_same_origins_skips_applied_transactions() {
+    let cluster = Cluster::new_test(&config());
+    let tables = vec![make_sharded_table(), make_sharded_test_b_table()];
+    let origins = test_origins(&cluster).await;
+    let mut verify = test_server().await;
+
+    let oid = Oid(16384);
+    let ids = [random_id(), random_id()];
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
+
+    let transaction = [
+        begin_copy_data(100),
+        relation_copy_data(oid),
+        insert_copy_data(oid, &ids[0], "restarted"),
+        insert_copy_data(oid, &ids[1], "restarted"),
+        commit_copy_data(200),
+    ];
+
+    let mut first = StreamSubscriber::new(&cluster, tables.clone(), origins.clone());
+    first.connect().await.unwrap();
+    for message in transaction.clone() {
+        first.handle(message).await.unwrap();
+    }
+    wait_for_commit(&mut first, 200).await;
+    drop(first);
+
+    let mut second = StreamSubscriber::new(&cluster, tables, origins);
+    second.connect().await.unwrap();
+    for message in transaction {
+        second.handle(message).await.unwrap();
+    }
+    wait_for_commit(&mut second, 200).await;
+
+    for id in &ids {
+        assert_eq!(count_row(&mut verify, "public.sharded", id).await, 1);
+    }
+    cleanup(&mut verify, "public.sharded", &id_refs).await;
 }

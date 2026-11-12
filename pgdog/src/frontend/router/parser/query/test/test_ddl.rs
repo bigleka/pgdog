@@ -1,5 +1,5 @@
-use crate::frontend::router::parser::Shard;
 use crate::frontend::Command;
+use crate::frontend::router::parser::Shard;
 
 use super::setup::{QueryParserTest, *};
 
@@ -7,10 +7,9 @@ use super::setup::{QueryParserTest, *};
 fn test_create_table() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT)",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT)").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::All);
@@ -30,10 +29,9 @@ fn test_drop_table() {
 fn test_alter_table() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "ALTER TABLE sharded ADD COLUMN new_col TEXT",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("ALTER TABLE sharded ADD COLUMN new_col TEXT").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::All);
@@ -44,7 +42,7 @@ fn test_create_index() {
     let mut test = QueryParserTest::new();
 
     let command = test.execute(vec![
-        Query::new("CREATE INDEX idx_test ON sharded (email)").into()
+        Query::new("CREATE INDEX idx_test ON sharded (email)").into(),
     ]);
 
     assert!(command.route().is_write());
@@ -101,25 +99,79 @@ fn test_analyze() {
 
 #[test]
 fn test_commit() {
-    let mut test = QueryParserTest::new();
+    for query in [
+        "COMMIT",
+        "COMMIT AND CHAIN",
+        "COMMIT AND NO CHAIN",
+        "COMMIT WORK",
+        "COMMIT WORK AND CHAIN",
+        "COMMIT WORK AND NO CHAIN",
+        "COMMIT TRANSACTION",
+        "COMMIT TRANSACTION AND CHAIN",
+        "COMMIT TRANSACTION AND NO CHAIN",
+        "commit;",
+        "  COMMIT  ",
+        "/* transaction */ COMMIT",
+        "END",
+        "END AND CHAIN",
+        "END AND NO CHAIN",
+        "END WORK",
+        "END WORK AND CHAIN",
+        "END WORK AND NO CHAIN",
+        "END TRANSACTION",
+        "END TRANSACTION AND CHAIN",
+        "END TRANSACTION AND NO CHAIN",
+        "end;",
+        "  END  ",
+        "/* transaction */ END",
+    ] {
+        let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new("COMMIT").into()]);
+        let command = test.execute(vec![Query::new(query).into()]);
 
-    match command {
-        Command::CommitTransaction { .. } => {}
-        _ => panic!("expected CommitTransaction, got {command:?}"),
+        match command {
+            Command::CommitTransaction { .. } => {}
+            _ => panic!("expected CommitTransaction, for {query:?}, got {command:?}"),
+        }
     }
 }
 
 #[test]
 fn test_rollback() {
-    let mut test = QueryParserTest::new();
+    for query in [
+        "ROLLBACK",
+        "ROLLBACK AND CHAIN",
+        "ROLLBACK AND NO CHAIN",
+        "ROLLBACK WORK",
+        "ROLLBACK WORK AND CHAIN",
+        "ROLLBACK WORK AND NO CHAIN",
+        "ROLLBACK TRANSACTION",
+        "ROLLBACK TRANSACTION AND CHAIN",
+        "ROLLBACK TRANSACTION AND NO CHAIN",
+        "rollback;",
+        "  ROLLBACK  ",
+        "/* transaction */ ROLLBACK",
+        "ABORT",
+        "ABORT AND CHAIN",
+        "ABORT AND NO CHAIN",
+        "ABORT WORK",
+        "ABORT WORK AND CHAIN",
+        "ABORT WORK AND NO CHAIN",
+        "ABORT TRANSACTION",
+        "ABORT TRANSACTION AND CHAIN",
+        "ABORT TRANSACTION AND NO CHAIN",
+        "abort;",
+        "  ABORT  ",
+        "/* transaction */ ABORT",
+    ] {
+        let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new("ROLLBACK").into()]);
+        let command = test.execute(vec![Query::new(query).into()]);
 
-    match command {
-        Command::RollbackTransaction { .. } => {}
-        _ => panic!("expected RollbackTransaction, got {command:?}"),
+        match command {
+            Command::RollbackTransaction { .. } => {}
+            _ => panic!("expected RollbackTransaction, for {query:?}, got {command:?}"),
+        }
     }
 }
 
@@ -129,10 +181,9 @@ fn test_rollback() {
 fn test_create_table_shard_0() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "CREATE TABLE shard_0.test_table (id SERIAL PRIMARY KEY, name TEXT)",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("CREATE TABLE shard_0.test_table (id SERIAL PRIMARY KEY, name TEXT)").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(0));
@@ -142,10 +193,9 @@ fn test_create_table_shard_0() {
 fn test_create_table_shard_1() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "CREATE TABLE shard_1.test_table (id SERIAL PRIMARY KEY, name TEXT)",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("CREATE TABLE shard_1.test_table (id SERIAL PRIMARY KEY, name TEXT)").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(1));
@@ -156,7 +206,7 @@ fn test_drop_table_shard_0() {
     let mut test = QueryParserTest::new();
 
     let command = test.execute(vec![
-        Query::new("DROP TABLE IF EXISTS shard_0.test_table").into()
+        Query::new("DROP TABLE IF EXISTS shard_0.test_table").into(),
     ]);
 
     assert!(command.route().is_write());
@@ -168,7 +218,7 @@ fn test_drop_table_shard_1() {
     let mut test = QueryParserTest::new();
 
     let command = test.execute(vec![
-        Query::new("DROP TABLE IF EXISTS shard_1.test_table").into()
+        Query::new("DROP TABLE IF EXISTS shard_1.test_table").into(),
     ]);
 
     assert!(command.route().is_write());
@@ -179,10 +229,9 @@ fn test_drop_table_shard_1() {
 fn test_alter_table_shard_0() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "ALTER TABLE shard_0.sharded ADD COLUMN new_col TEXT",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("ALTER TABLE shard_0.sharded ADD COLUMN new_col TEXT").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(0));
@@ -192,10 +241,9 @@ fn test_alter_table_shard_0() {
 fn test_alter_table_shard_1() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "ALTER TABLE shard_1.sharded ADD COLUMN new_col TEXT",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("ALTER TABLE shard_1.sharded ADD COLUMN new_col TEXT").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(1));
@@ -205,10 +253,9 @@ fn test_alter_table_shard_1() {
 fn test_create_index_shard_0() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "CREATE INDEX idx_test ON shard_0.sharded (email)",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("CREATE INDEX idx_test ON shard_0.sharded (email)").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(0));
@@ -218,10 +265,9 @@ fn test_create_index_shard_0() {
 fn test_create_index_shard_1() {
     let mut test = QueryParserTest::new();
 
-    let command = test.execute(vec![Query::new(
-        "CREATE INDEX idx_test ON shard_1.sharded (email)",
-    )
-    .into()]);
+    let command = test.execute(vec![
+        Query::new("CREATE INDEX idx_test ON shard_1.sharded (email)").into(),
+    ]);
 
     assert!(command.route().is_write());
     assert_eq!(command.route().shard(), &Shard::Direct(1));
@@ -232,7 +278,7 @@ fn test_drop_index_shard_0() {
     let mut test = QueryParserTest::new();
 
     let command = test.execute(vec![
-        Query::new("DROP INDEX IF EXISTS shard_0.idx_test").into()
+        Query::new("DROP INDEX IF EXISTS shard_0.idx_test").into(),
     ]);
 
     assert!(command.route().is_write());
@@ -244,7 +290,7 @@ fn test_drop_index_shard_1() {
     let mut test = QueryParserTest::new();
 
     let command = test.execute(vec![
-        Query::new("DROP INDEX IF EXISTS shard_1.idx_test").into()
+        Query::new("DROP INDEX IF EXISTS shard_1.idx_test").into(),
     ]);
 
     assert!(command.route().is_write());

@@ -161,6 +161,23 @@ def test_pipeline():
     no_out_of_sync()
 
 
+def test_pipeline_listen_then_query():
+    """An intercepted LISTEN must not emit ReadyForQuery before pipeline Sync."""
+    conn = normal_sync()
+    conn.autocommit = True
+
+    with conn.pipeline() as pipeline:
+        conn.execute("LISTEN pgdog_pipeline_listen")
+        cur = conn.execute("SELECT 1::bigint")
+        pipeline.sync()
+
+    assert cur.fetchone()[0] == 1
+    assert conn.execute("SELECT 42::bigint").fetchone()[0] == 42
+
+    conn.close()
+    no_out_of_sync()
+
+
 def test_pipeline_many_queries():
     """Stress the splicing logic with many queries in a single pipeline.
 
@@ -348,5 +365,37 @@ def test_pipeline_multiple_errors():
                 cur.execute("SELECT * FROM no_existing_table")
             cur.fetchone()
 
+    conn.close()
+    no_out_of_sync()
+
+
+def test_server_cursor_with_shard_pin():
+    conn = sharded_sync()
+    conn.execute("SET pgdog.shard TO 1")
+
+    cur = conn.cursor(name="probe")
+    cur.execute("SELECT generate_series(1, 10) AS n")
+    assert cur.description[0].name == "n"
+    assert [row[0] for row in cur.fetchmany(3)] == [1, 2, 3]
+    assert len(cur.fetchall()) == 7
+    cur.close()
+
+    conn.rollback()
+    conn.close()
+    no_out_of_sync()
+
+
+def test_describe_portal_with_shard_pin():
+    conn = sharded_sync()
+    conn.execute("SET pgdog.shard TO 1")
+    conn.execute(
+        "DECLARE probe NO SCROLL CURSOR FOR SELECT generate_series(1, 10) AS n"
+    )
+
+    result = conn.pgconn.describe_portal(b"probe")
+    assert result.status == psycopg.pq.ExecStatus.COMMAND_OK, result.error_message
+    assert result.fname(0) == b"n"
+
+    conn.rollback()
     conn.close()
     no_out_of_sync()

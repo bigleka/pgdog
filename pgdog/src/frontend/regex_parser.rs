@@ -3,12 +3,15 @@ use pgdog_config::{General, QueryParserLevel};
 use regex::RegexSet;
 
 use crate::frontend::ClientRequest;
+use crate::util::truncate_utf8;
+
+/// Whitespace and inline SQL comments (`-- line` and `/* block */`)
+/// allowed before a statement keyword.
+static COMMENT_PREFIX: &str = r"(?i)^\s*(?:(?:--[^\n]*\n|/\*[\s\S]*?\*/)\s*)*";
 
 static CMD_BASE: &[&str] = &[
-    "(?i)^ *(RE)?SET",
-    "(?i)^ *BEGIN",
-    "(?i)^ *COMMIT",
-    "(?i)^ *ROLLBACK",
+    "(RE)?SET", "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "LISTEN", "UNLISTEN", "NOTIFY",
+    "DISCARD", "ABORT",
 ];
 
 static CMD_ADVISORY: &[&str] = &[
@@ -25,21 +28,16 @@ static CMD_ADVISORY: &[&str] = &[
     r"(?i)\bpg_try_advisory_xact_lock_shared\b",
 ];
 
-static CMD_RE: Lazy<RegexSet> = Lazy::new(|| RegexSet::new(CMD_BASE).unwrap());
-static CMD_RE_ADVISORY: Lazy<RegexSet> =
-    Lazy::new(|| RegexSet::new(CMD_BASE.iter().chain(CMD_ADVISORY.iter())).unwrap());
-
-fn scan_prefix(query: &str, limit: usize) -> &str {
-    if query.len() <= limit {
-        query
-    } else {
-        let mut end = limit;
-        while !query.is_char_boundary(end) {
-            end -= 1;
-        }
-        &query[..end]
-    }
+fn cmd_base_patterns() -> impl Iterator<Item = String> {
+    CMD_BASE
+        .iter()
+        .map(|cmd| format!("{}{}", COMMENT_PREFIX, cmd))
 }
+
+static CMD_RE: Lazy<RegexSet> = Lazy::new(|| RegexSet::new(cmd_base_patterns()).unwrap());
+static CMD_RE_ADVISORY: Lazy<RegexSet> = Lazy::new(|| {
+    RegexSet::new(cmd_base_patterns().chain(CMD_ADVISORY.iter().map(|s| s.to_string()))).unwrap()
+});
 
 #[derive(Debug, Clone)]
 pub(crate) struct RegexParser {
@@ -67,14 +65,14 @@ impl RegexParser {
         let session_control =
             self.level == QueryParserLevel::SessionControl || self.level == QueryParserLevel::Auto;
 
-        if with_locks || session_control {
-            if let Ok(Some(query)) = request.query() {
-                let prefix = scan_prefix(query.query(), self.limit);
-                if with_locks {
-                    return CMD_RE_ADVISORY.is_match(prefix);
-                } else {
-                    return CMD_RE.is_match(prefix);
-                }
+        if (with_locks || session_control)
+            && let Ok(Some(query)) = request.query()
+        {
+            let prefix = truncate_utf8(query.query(), self.limit);
+            if with_locks {
+                return CMD_RE_ADVISORY.is_match(prefix);
+            } else {
+                return CMD_RE.is_match(prefix);
             }
         }
 
@@ -146,6 +144,48 @@ mod test {
     }
 
     #[test]
+    fn test_listen() {
+        assert!(matches("LISTEN test_channel"));
+        assert!(matches("listen test_channel"));
+        assert!(matches("   LISTEN test_channel"));
+        assert!(matches("LISTEN \"test-channel\""));
+        assert!(matches("/* comment */ LISTEN test_channel"));
+        assert!(matches("-- comment\nLISTEN test_channel"));
+    }
+
+    #[test]
+    fn test_unlisten() {
+        assert!(matches("UNLISTEN test_channel"));
+        assert!(matches("unlisten test_channel"));
+        assert!(matches("   UNLISTEN test_channel"));
+        assert!(matches("UNLISTEN *"));
+        assert!(matches("/* comment */ UNLISTEN test_channel"));
+        assert!(matches("-- comment\nUNLISTEN *"));
+    }
+
+    #[test]
+    fn test_notify() {
+        assert!(matches("NOTIFY test_channel"));
+        assert!(matches("notify test_channel"));
+        assert!(matches("   NOTIFY test_channel"));
+        assert!(matches("NOTIFY test_channel, 'payload'"));
+        assert!(matches("/* comment */ NOTIFY test_channel"));
+        assert!(matches("-- comment\nNOTIFY test_channel, 'payload'"));
+    }
+
+    #[test]
+    fn test_discard() {
+        assert!(matches("DISCARD ALL"));
+        assert!(matches("discard all"));
+        assert!(matches("   DISCARD ALL"));
+        assert!(matches("DISCARD PLANS"));
+        assert!(matches("DISCARD SEQUENCES"));
+        assert!(matches("DISCARD TEMPORARY"));
+        assert!(matches("/* comment */ DISCARD ALL"));
+        assert!(matches("-- comment\nDISCARD ALL"));
+    }
+
+    #[test]
     fn test_advisory_lock() {
         let l = QueryParserLevel::SessionControlAndLocks;
         assert!(matches_at("SELECT pg_advisory_lock(1)", l));
@@ -179,6 +219,87 @@ mod test {
 
         let short = format!("{}pg_advisory_lock(1)", " ".repeat(900));
         assert!(matches_at(&short, l));
+    }
+
+    #[test]
+    fn test_limit_longer_than_query() {
+        let query = "SET statement_timeout TO 1";
+
+        for limit in [query.len(), query.len() + 1, 10_000, usize::MAX] {
+            let req = ClientRequest::from(vec![ProtocolMessage::from(Query::new(query))]);
+            let parser = RegexParser::new(limit, QueryParserLevel::SessionControl);
+            assert!(parser.use_parser(&req), "limit {} should match", limit);
+        }
+
+        // Multi-byte characters at the end don't trip the boundary scan.
+        let multibyte = "SET application_name TO 'héllo'";
+        let req = ClientRequest::from(vec![ProtocolMessage::from(Query::new(multibyte))]);
+        let parser = RegexParser::new(usize::MAX, QueryParserLevel::SessionControl);
+        assert!(parser.use_parser(&req));
+    }
+
+    #[test]
+    fn test_inline_comments() {
+        assert!(matches("/* comment */ SET statement_timeout TO 1"));
+        assert!(matches("/* comment */SET statement_timeout TO 1"));
+        assert!(matches("-- comment\nSET statement_timeout TO 1"));
+        assert!(matches("--comment\n  RESET ALL"));
+        assert!(matches("/* one */ /* two */ BEGIN"));
+        assert!(matches("/* multi\nline\ncomment */ COMMIT"));
+        assert!(matches("-- first\n-- second\nROLLBACK"));
+        assert!(matches("/* block */ -- line\nbegin read only"));
+
+        // Comment-only or commented-out statements don't match.
+        assert!(!matches("-- SET statement_timeout TO 1"));
+        assert!(!matches("/* SET statement_timeout TO 1 */ SELECT 1"));
+        assert!(!matches("/* comment */ SELECT 1"));
+    }
+
+    #[test]
+    fn test_leading_whitespace() {
+        assert!(matches("   /* comment */ SET statement_timeout TO 1"));
+        assert!(matches("\t/* comment */\tBEGIN"));
+        assert!(matches("\n\n-- comment\nCOMMIT"));
+        assert!(matches(" \t\n SET statement_timeout TO 1"));
+        assert!(matches("/* comment */\n\n   ROLLBACK"));
+        assert!(matches("  -- one\n  -- two\n  begin"));
+    }
+
+    #[test]
+    fn test_comment_edge_cases() {
+        // Empty and minimal comments.
+        assert!(matches("/**/SET statement_timeout TO 1"));
+        assert!(matches("/* */BEGIN"));
+        assert!(matches("--\nCOMMIT"));
+
+        // Stars and slashes inside block comments.
+        assert!(matches("/* a * b */ SET statement_timeout TO 1"));
+        assert!(matches("/* a / b ** c */ BEGIN"));
+
+        // Non-greedy: comment ends at the first `*/`.
+        assert!(matches("/* a */ SET application_name TO '/* b */'"));
+
+        // Windows line endings in line comments.
+        assert!(matches("-- comment\r\nSET statement_timeout TO 1"));
+
+        // Comment-lookalikes inside the comment body.
+        assert!(matches("/* -- not a line comment */ ROLLBACK"));
+        assert!(matches("-- /* not a block comment\nBEGIN"));
+
+        // Unterminated block comment never reaches a statement.
+        assert!(!matches("/* unterminated SET statement_timeout TO 1"));
+
+        // Line comment swallows the rest of the line; next line decides.
+        assert!(matches("-- SET commented out\nSET statement_timeout TO 1"));
+        assert!(!matches("/* a */ -- SET commented out\nSELECT 1"));
+    }
+
+    #[test]
+    fn test_advisory_lock_with_comments() {
+        let l = QueryParserLevel::SessionControlAndLocks;
+        assert!(matches_at("/* comment */ SELECT pg_advisory_lock(1)", l));
+        assert!(matches_at("-- comment\nSELECT pg_advisory_unlock(1)", l));
+        assert!(matches_at("SELECT /* inline */ pg_try_advisory_lock(1)", l));
     }
 
     #[test]

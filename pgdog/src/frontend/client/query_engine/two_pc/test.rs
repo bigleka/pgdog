@@ -5,8 +5,8 @@ use crate::{
     },
     config,
     frontend::router::{
-        parser::{Shard, ShardWithPriority},
         Route,
+        parser::{Shard, ShardWithPriority},
     },
     logger,
     net::Protocol,
@@ -38,7 +38,7 @@ async fn test_cleanup_transaction_phase_one() {
     let info = Manager::get().transaction(&transaction).unwrap();
     assert_eq!(info.phase, TwoPcPhase::Phase1);
 
-    conn.two_pc(&transaction.to_string(), TwoPcPhase::Phase1)
+    conn.two_pc(transaction, TwoPcPhase::Phase1, false)
         .await
         .unwrap();
 
@@ -78,9 +78,11 @@ async fn test_cleanup_transaction_phase_one() {
         .await
         .err()
         .unwrap();
-    assert!(table
-        .to_string()
-        .contains(r#"relation "test_cleanup_transaction_phase_one" does not exist"#));
+    assert!(
+        table
+            .to_string()
+            .contains(r#"relation "test_cleanup_transaction_phase_one" does not exist"#)
+    );
 }
 
 #[tokio::test]
@@ -108,7 +110,7 @@ async fn test_cleanup_transaction_phase_two() {
     let info = Manager::get().transaction(&transaction).unwrap();
     assert_eq!(info.phase, TwoPcPhase::Phase1);
 
-    conn.two_pc(&transaction.to_string(), TwoPcPhase::Phase1)
+    conn.two_pc(transaction, TwoPcPhase::Phase1, false)
         .await
         .unwrap();
 

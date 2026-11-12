@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 use crate::frontend::router::parser::Schema;
 
 #[derive(Debug, Clone)]
-pub struct ShardedSchemas {
+pub(crate) struct ShardedSchemas {
     inner: Arc<Inner>,
 }
 
@@ -41,17 +41,17 @@ impl Deref for ShardedSchemas {
 }
 
 impl ShardedSchemas {
-    pub fn get<'a>(&self, schema: Option<Schema<'a>>) -> Option<&ShardedSchema> {
-        if let Some(schema) = schema {
-            if let Some(schema) = self.inner.schemas.get(schema.name) {
-                return Some(schema);
-            }
+    pub(crate) fn get<'a>(&self, schema: Option<Schema<'a>>) -> Option<&ShardedSchema> {
+        if let Some(schema) = schema
+            && let Some(schema) = self.inner.schemas.get(schema.name)
+        {
+            return Some(schema);
         }
 
         self.inner.default_mapping.as_ref()
     }
 
-    pub fn new(schemas: Vec<ShardedSchema>) -> Self {
+    pub(crate) fn new(schemas: Vec<ShardedSchema>) -> Self {
         Self {
             inner: Arc::new(Inner::new(schemas)),
         }

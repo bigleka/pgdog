@@ -1,5 +1,5 @@
-use rust::setup::admin_sqlx;
-use rust::utils::assert_setting_str;
+use crate::setup::admin_sqlx;
+use crate::utils::assert_setting_str;
 use serial_test::serial;
 use sqlx::{Connection, Executor, PgConnection};
 
@@ -113,6 +113,58 @@ async fn test_passthrough_auth() {
 
     user.execute("SELECT 1").await.unwrap();
     original.execute("SELECT 1").await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bad_passthrough_auth_does_not_block_good_auth() {
+    let admin = admin_sqlx().await;
+    admin.execute("RELOAD").await.expect("reset config");
+    admin
+        .execute("SET passthrough_auth TO 'enabled_plain'")
+        .await
+        .expect("enable passthrough auth");
+    // Failed validation waits for checkout to time out.
+    admin
+        .execute("SET checkout_timeout TO 250")
+        .await
+        .expect("shorten failed validation wait");
+    admin
+        .execute("SET connect_timeout TO 250")
+        .await
+        .expect("shorten validation connection timeout");
+
+    // Cover a new user and a configured user with a backend username override.
+    for user in ["pgdog1", "pgdog_pass"] {
+        // Check both initial pool creation and an already authenticated pool.
+        for _ in 0..2 {
+            let bad = format!("postgres://{user}:wrong@127.0.0.1:6432/pgdog");
+            let err = PgConnection::connect(&bad)
+                .await
+                .expect_err("bad passthrough password must be rejected");
+            assert!(
+                err.to_string().contains(&format!(
+                    "password for user \"{user}\" and database \"pgdog\" is wrong"
+                )),
+                "{user}: unexpected authentication error: {err}"
+            );
+
+            // Do not reload or unban between attempts: a rejected password must
+            // not leave credentials or pool state that prevent a valid login.
+            let good = format!("postgres://{user}:pgdog@127.0.0.1:6432/pgdog");
+            let mut conn = PgConnection::connect(&good)
+                .await
+                .expect("valid passthrough login must work after a bad password");
+            let value: i32 = sqlx::query_scalar("SELECT 1")
+                .fetch_one(&mut conn)
+                .await
+                .expect("query must work after a bad password");
+            assert_eq!(value, 1);
+            conn.close().await.expect("close passthrough connection");
+        }
+    }
+
+    admin.execute("RELOAD").await.expect("restore config");
 }
 
 #[tokio::test]
@@ -248,6 +300,54 @@ async fn test_multi_password_server_rotation() {
         .unwrap();
     admin.execute("RELOAD").await.unwrap();
     admin.execute("RECONNECT").await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_multi_password_server_rotation_reload_keeps_pool_connection() {
+    let admin = admin_sqlx().await;
+    admin.execute("RELOAD").await.unwrap();
+
+    let mut direct =
+        PgConnection::connect("postgres://pgdog:pgdog@127.0.0.1:5432/pgdog?sslmode=disable")
+            .await
+            .unwrap();
+
+    direct
+        .execute("ALTER USER pgdog2 PASSWORD 'pgdog'")
+        .await
+        .unwrap();
+
+    let url = "postgres://pgdog_pw_rotate:rotated_pass@127.0.0.1:6432/pgdog";
+    let mut conn = PgConnection::connect(url).await.unwrap();
+    let original_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+
+    direct
+        .execute("ALTER USER pgdog2 PASSWORD 'rotated_pass'")
+        .await
+        .unwrap();
+
+    admin.execute("RELOAD").await.unwrap();
+
+    let mut conn = PgConnection::connect(url).await.unwrap();
+    let backend_pid_after_reload: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+
+    direct
+        .execute("ALTER USER pgdog2 PASSWORD 'pgdog'")
+        .await
+        .unwrap();
+    admin.execute("RELOAD").await.unwrap();
+    admin.execute("RECONNECT").await.unwrap();
+
+    assert_eq!(backend_pid_after_reload, original_backend_pid);
 }
 
 #[tokio::test]

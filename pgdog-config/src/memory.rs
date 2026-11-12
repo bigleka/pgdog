@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Memory settings manage buffer allocations that PgDog uses during network I/O operations and task execution.
 ///
-/// https://docs.pgdog.dev/configuration/pgdog.toml/memory/
+/// <https://docs.pgdog.dev/configuration/pgdog.toml/memory/>
 #[derive(JsonSchema, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Memory {
@@ -11,7 +11,7 @@ pub struct Memory {
     ///
     /// _Default:_ `4096`
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/memory/#net_buffer
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/memory/#net_buffer>
     #[serde(default = "default_net_buffer")]
     pub net_buffer: usize,
 
@@ -19,15 +19,15 @@ pub struct Memory {
     ///
     /// _Default:_ `4096`
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/memory/#message_buffer
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/memory/#message_buffer>
     #[serde(default = "default_message_buffer")]
     pub message_buffer: usize,
 
     /// Stack size for Tokio tasks in bytes. Increase this if you encounter stack overflow errors with complex queries.
     ///
-    /// _Default:_ `2097152`
+    /// _Default:_ `2097152` (`8388608` in debug builds, whose unoptimized futures are several times larger)
     ///
-    /// https://docs.pgdog.dev/configuration/pgdog.toml/memory/#stack_size
+    /// <https://docs.pgdog.dev/configuration/pgdog.toml/memory/#stack_size>
     #[serde(default = "default_stack_size")]
     pub stack_size: usize,
 }
@@ -50,7 +50,13 @@ fn default_message_buffer() -> usize {
     default_net_buffer()
 }
 
-// Default: 2MiB.
+// Default: 2MiB. Debug builds get 8MiB: their unoptimized query-path
+// futures are several times larger than release and overflow the
+// release-tuned default.
 fn default_stack_size() -> usize {
-    2 * 1024 * 1024
+    if cfg!(debug_assertions) {
+        8 * 1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    }
 }

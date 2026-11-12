@@ -5,17 +5,20 @@ use crate::backend::databases::User;
 
 use super::Error;
 
-pub mod guard;
-pub mod manager;
-pub mod phase;
-pub mod server_transactions;
-pub mod transaction;
+pub(crate) mod guard;
+pub(crate) mod manager;
+pub(crate) mod phase;
+pub(crate) mod server_transactions;
+pub(crate) mod statement;
+pub(crate) mod stats;
+pub(crate) mod transaction;
+pub(crate) mod wal;
 
-pub use guard::TwoPcGuard;
-pub use manager::Manager;
-pub use phase::TwoPcPhase;
-pub(crate) use server_transactions::TwoPcTransactions;
-pub use transaction::TwoPcTransaction;
+pub(crate) use guard::TwoPcGuard;
+pub(crate) use manager::Manager;
+pub(crate) use phase::TwoPcPhase;
+pub(crate) use stats::TwoPcStats;
+pub(crate) use transaction::TwoPcTransaction;
 
 #[cfg(test)]
 mod test;
@@ -54,7 +57,7 @@ impl TwoPc {
     pub(super) async fn phase_one(&mut self, cluster: &Arc<User>) -> Result<TwoPcGuard, Error> {
         let transaction = self.transaction();
         self.manager
-            .transaction_state(&transaction, cluster, TwoPcPhase::Phase1)
+            .transaction_state(transaction, cluster, TwoPcPhase::Phase1)
             .await
     }
 
@@ -64,7 +67,7 @@ impl TwoPc {
     pub(super) async fn phase_two(&mut self, cluster: &Arc<User>) -> Result<TwoPcGuard, Error> {
         let transaction = self.transaction();
         self.manager
-            .transaction_state(&transaction, cluster, TwoPcPhase::Phase2)
+            .transaction_state(transaction, cluster, TwoPcPhase::Phase2)
             .await
     }
 
@@ -73,17 +76,21 @@ impl TwoPc {
     /// This is just a cleanup step, to avoid unnecessary checks during crash recovery.
     pub(super) async fn done(&mut self) -> Result<(), Error> {
         let transaction = self.transaction();
-        self.manager.done(&transaction).await?;
-        self.transaction = None;
-        self.auto = false;
+        self.manager.done(transaction).await?;
+        self.reset();
         Ok(())
     }
 
-    pub fn set_auto(&mut self) {
+    pub(super) fn reset(&mut self) {
+        self.transaction = None;
+        self.auto = false;
+    }
+
+    pub(crate) fn set_auto(&mut self) {
         self.auto = true;
     }
 
-    pub fn auto(&self) -> bool {
+    pub(crate) fn auto(&self) -> bool {
         self.auto
     }
 }

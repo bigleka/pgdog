@@ -1,0 +1,272 @@
+//! Replication task definitions and statuses: the migration, one cluster
+//! stream of it, and one shard slot of that stream.
+
+use std::fmt;
+use std::time::SystemTime;
+
+use derive_more::Display;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{Databases, Lsn, TaskId};
+
+/// Replication slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationSlot {
+    pub name: String,
+    pub lsn: Lsn,
+    pub lag: i64,
+    pub temporary: bool,
+    pub existing: bool,
+    pub address: Address,
+    pub last_transaction: Option<SystemTime>,
+    pub task_id: Option<TaskId>,
+}
+
+/// Server address.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Eq, Hash)]
+pub struct Address {
+    /// Server host.
+    pub host: String,
+    /// Server port.
+    pub port: u16,
+    /// PostgreSQL database name.
+    pub database_name: String,
+}
+
+/// Direction of a resharding run: the initial migration (`Forward`) or the
+/// post-cutover reverse replication that backs a rollback (`Reverse`). A `CUTOVER`
+/// in the `Reverse` direction is therefore a rollback.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[display(rename_all = "snake_case")]
+pub enum ReshardingDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+/// Why the replication task stopped waiting and cut traffic over.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[display(rename_all = "snake_case")]
+pub enum ReplicationCutoverReason {
+    /// Replication lag reached the configured threshold.
+    Lag,
+    /// No transaction was applied for the configured delay.
+    LastTransaction,
+    /// The configured wait expired before the other conditions were met.
+    Timeout,
+    /// A reason this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// The migration one replication task drives, including every cutover it
+/// performs.
+#[derive(Debug, Clone, PartialEq, Display, Serialize, Deserialize, JsonSchema)]
+#[display("replication {databases}")]
+pub struct ReplicationDefinition {
+    pub databases: Databases,
+    pub auto_cutover: bool,
+}
+
+/// Stages of logical replication, reported as the task's status.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReplicationStatus {
+    /// Streaming changes to catch the destination up.
+    #[display("replicating")]
+    Replicating,
+    /// Streaming changes back to the original source after a cutover, so a
+    /// rollback stays possible.
+    #[display("reverse replicating")]
+    ReverseReplicating,
+    #[display("stopping traffic")]
+    StoppingTraffic,
+    #[display("waiting for catch-up")]
+    WaitingForCatchUp,
+    #[display("syncing schema")]
+    SyncingSchema,
+    #[display("preparing reverse replication")]
+    PreparingReverseReplication,
+    /// Cutting traffic over to the destination.
+    #[display("cutting over")]
+    CuttingOver,
+    /// Cutting traffic back to the original after a prior cutover (rollback).
+    #[display("rolling back")]
+    RollingBack,
+    /// A stage this build does not know.
+    #[display("")]
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// The cluster one replication subtask streams until the parent task cuts
+/// traffic over. `databases` always names the migration's original source and
+/// destination; `direction` says which of them the changes flow from.
+#[derive(Debug, Clone, PartialEq, Display, Serialize, Deserialize, JsonSchema)]
+#[display("{direction} replication {databases}")]
+pub struct ReplicationClusterDefinition {
+    pub databases: Databases,
+    pub direction: ReshardingDirection,
+}
+
+/// Stages of one replication cluster, reported as the subtask's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReplicationClusterStatus {
+    #[display("initializing replication streams")]
+    InitializingReplicationStreams,
+    /// Streaming changes to catch the destination up.
+    #[display("{direction} replicating, {progress}")]
+    Replicating {
+        direction: ReshardingDirection,
+        progress: ReplicationProgress,
+    },
+    /// Stopped streaming so the parent task can cut traffic over.
+    #[display("stopped for cutover ({reason})")]
+    StoppedForCutover { reason: ReplicationCutoverReason },
+    /// A stage this build does not know.
+    #[display("")]
+    #[serde(other)]
+    Other,
+}
+
+/// How far the whole cluster has replicated: the largest lag of its shards,
+/// how long ago the newest transaction was applied, and the rows and bytes
+/// applied by every shard together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationProgress {
+    pub lag_bytes: Option<u64>,
+    pub last_transaction_ms: Option<u64>,
+    pub rows: u64,
+    pub bytes: u64,
+    pub rows_per_sec: Option<u64>,
+    pub bytes_per_sec: Option<u64>,
+}
+
+impl fmt::Display for ReplicationProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.lag_bytes {
+            Some(lag) => write!(f, "lag {lag} bytes")?,
+            None => write!(f, "lag unknown")?,
+        }
+        if let Some(age) = self.last_transaction_ms {
+            write!(f, ", last transaction {age}ms ago")?;
+        }
+        write!(f, ", applied {} rows {} bytes", self.rows, self.bytes)?;
+        if let (Some(rows), Some(bytes)) = (self.rows_per_sec, self.bytes_per_sec) {
+            write!(f, " [since start: {rows} rows/sec, {bytes} bytes/sec]")?;
+        }
+        Ok(())
+    }
+}
+
+/// The slot one per-shard replication subtask streams from.
+#[derive(Debug, Clone, PartialEq, Display, Serialize, Deserialize, JsonSchema)]
+#[display("{slot} on {host}:{port}/{database_name}")]
+pub struct ReplicationShardDefinition {
+    pub slot: String,
+    pub host: String,
+    pub port: u16,
+    pub database_name: String,
+    pub source_shard: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MissedRows {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+impl MissedRows {
+    pub fn non_zero(&self) -> bool {
+        self.inserts > 0 || self.updates > 0 || self.deletes > 0
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.inserts += other.inserts;
+        self.updates += other.updates;
+        self.deletes += other.deletes;
+    }
+
+    pub fn record(&mut self, tag: &str) {
+        if tag.starts_with("INSERT") {
+            self.inserts += 1;
+        } else if tag.starts_with("UPDATE") {
+            self.updates += 1;
+        } else if tag.starts_with("DELETE") {
+            self.deletes += 1;
+        }
+    }
+}
+
+impl std::fmt::Display for MissedRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut written = false;
+        if self.inserts > 0 {
+            write!(f, "insert={}", self.inserts)?;
+            written = true;
+        }
+        if self.updates > 0 {
+            write!(
+                f,
+                "{}update={}",
+                if written { " " } else { "" },
+                self.updates
+            )?;
+            written = true;
+        }
+        if self.deletes > 0 {
+            write!(
+                f,
+                "{}delete={}",
+                if written { " " } else { "" },
+                self.deletes
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// How far one replication slot has streamed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicationShardStatus {
+    pub lsn: Lsn,
+    /// `pg_current_wal_lsn() - confirmed_flush_lsn`, clamped to zero.
+    pub lag_bytes: Option<u64>,
+    pub missed_rows: MissedRows,
+    pub rows: u64,
+    pub bytes: u64,
+    pub rows_per_sec: Option<u64>,
+    pub bytes_per_sec: Option<u64>,
+}
+
+impl fmt::Display for ReplicationShardStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.lag_bytes {
+            Some(b) => write!(f, "lag {} bytes at {}", b, self.lsn)?,
+            None => write!(f, "lag unknown at {}", self.lsn)?,
+        }
+
+        if self.missed_rows.non_zero() {
+            write!(f, ", missed {}", self.missed_rows)?;
+        }
+
+        write!(f, ", applied {} rows {} bytes", self.rows, self.bytes)?;
+        if let (Some(rows), Some(bytes)) = (self.rows_per_sec, self.bytes_per_sec) {
+            write!(f, " [since start: {rows} rows/sec, {bytes} bytes/sec]")?;
+        }
+        Ok(())
+    }
+}

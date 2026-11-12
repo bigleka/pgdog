@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use crate::net::messages::Vector;
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum OrderBy {
+pub(crate) enum OrderBy {
     Asc(usize),
     Desc(usize),
     AscColumn(String),
@@ -15,8 +15,12 @@ pub enum OrderBy {
 }
 
 impl OrderBy {
+    pub(crate) fn helper_column_name(sort_key_position: usize) -> String {
+        format!("__pgdog_order_col{sort_key_position}")
+    }
+
     /// ORDER BY x ASC
-    pub fn asc(&self) -> bool {
+    pub(crate) fn asc(&self) -> bool {
         matches!(
             self,
             OrderBy::Asc(_)
@@ -27,7 +31,7 @@ impl OrderBy {
     }
 
     /// Column index.
-    pub fn index(&self) -> Option<usize> {
+    pub(crate) fn index(&self) -> Option<usize> {
         match self {
             OrderBy::Asc(column) => Some(*column - 1),
             OrderBy::Desc(column) => Some(*column - 1),
@@ -36,18 +40,8 @@ impl OrderBy {
         }
     }
 
-    /// Get column name.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            OrderBy::AscColumn(ref name) => Some(name.as_str()),
-            OrderBy::DescColumn(ref name) => Some(name.as_str()),
-            OrderBy::AscVectorL2Column(ref name, _) => Some(name.as_str()),
-            _ => None,
-        }
-    }
-
     /// ORDER BY clause contains a vector.
-    pub fn vector(&self) -> Option<(&Vector, &String)> {
+    pub(crate) fn vector(&self) -> Option<(&Vector, &String)> {
         match self {
             OrderBy::AscVectorL2Column(name, vector) => Some((vector, name)),
             _ => None,

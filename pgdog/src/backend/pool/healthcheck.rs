@@ -2,15 +2,15 @@
 
 use std::time::Duration;
 
-use tokio::time::timeout;
 use tokio::time::Instant;
 use tracing::error;
 
 use super::{Error, Pool};
 use crate::backend::Server;
+use crate::util::safe_timeout;
 
 /// Perform a healtcheck on a connection.
-pub struct Healtcheck<'a> {
+pub(crate) struct Healtcheck<'a> {
     conn: &'a mut Server,
     pool: &'a Pool,
     healthcheck_interval: Duration,
@@ -20,7 +20,7 @@ pub struct Healtcheck<'a> {
 
 impl<'a> Healtcheck<'a> {
     /// Perform a healtcheck only if necessary.
-    pub fn conditional(
+    pub(crate) fn conditional(
         conn: &'a mut Server,
         pool: &'a Pool,
         healthcheck_interval: Duration,
@@ -37,7 +37,11 @@ impl<'a> Healtcheck<'a> {
     }
 
     /// Perform a mandatory healtcheck.
-    pub fn mandatory(conn: &'a mut Server, pool: &'a Pool, healthcheck_timeout: Duration) -> Self {
+    pub(crate) fn mandatory(
+        conn: &'a mut Server,
+        pool: &'a Pool,
+        healthcheck_timeout: Duration,
+    ) -> Self {
         Self::conditional(
             conn,
             pool,
@@ -48,14 +52,23 @@ impl<'a> Healtcheck<'a> {
     }
 
     /// Perform the healtcheck if it's required.
-    pub async fn healthcheck(&mut self) -> Result<(), Error> {
+    pub(crate) async fn healthcheck(&mut self) -> Result<(), Error> {
         let health_check_age = self.conn.healthcheck_age(self.now);
 
         if health_check_age < self.healthcheck_interval {
             return Ok(());
         }
 
-        match timeout(self.healthcheck_timeout, self.conn.healthcheck(";")).await {
+        // Boxed to keep the ~1.6 KB query future out of this state machine:
+        // it is inlined all the way up into `Pool::get`, which is built and
+        // moved on every checkout, while the query itself runs at most once
+        // per healthcheck interval.
+        match safe_timeout(
+            self.healthcheck_timeout,
+            Box::pin(self.conn.healthcheck(";")),
+        )
+        .await
+        {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
                 // Check if this is an administrator command termination

@@ -4,7 +4,7 @@ use super::prelude::*;
 use crate::backend::{databases::databases, pool};
 
 #[derive(Default)]
-pub struct Ban {
+pub(crate) struct Ban {
     id: Option<u64>,
     unban: bool,
 }
@@ -46,14 +46,14 @@ impl Command for Ban {
         for database in databases().all().values() {
             for shard in database.shards() {
                 for (_role, ban, pool) in shard.pools_with_roles_and_bans() {
-                    if let Some(id) = self.id {
-                        if id != pool.id() {
-                            continue;
-                        }
+                    if let Some(id) = self.id
+                        && id != pool.id()
+                    {
+                        continue;
                     }
 
                     if self.unban {
-                        ban.unban(false);
+                        ban.unban(false, pool::lb::UnbanReason::Manual);
                     } else {
                         ban.ban(pool::Error::ManualBan, Duration::MAX);
                     }

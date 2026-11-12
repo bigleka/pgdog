@@ -7,9 +7,9 @@ use std::str::{from_utf8, from_utf8_unchecked};
 
 /// Query (F) message.
 #[derive(Clone, PartialEq)]
-pub struct Query {
+pub(crate) struct Query {
     /// Query string.
-    pub payload: Bytes,
+    pub(crate) payload: Bytes,
 }
 
 impl std::fmt::Debug for Query {
@@ -21,27 +21,27 @@ impl std::fmt::Debug for Query {
 }
 
 impl Query {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.payload.len()
     }
 
     /// Create new query.
-    pub fn new(query: impl ToString) -> Self {
+    pub(crate) fn new(query: impl AsRef<str>) -> Self {
         let mut payload = Payload::named('Q');
-        payload.put_string(&query.to_string());
+        payload.put_string(query.as_ref());
         let payload = payload.freeze();
 
         Self { payload }
     }
 
-    pub fn query(&self) -> &str {
+    pub(crate) fn query(&self) -> &str {
         // SAFETY:  We check for valid UTF-8 on creation.
         //          Don't read the trailing null byte.
         unsafe { from_utf8_unchecked(&self.payload[5..self.payload.len() - 1]) }
     }
 
     /// Update the SQL query.
-    pub fn set_query(&mut self, query: &str) {
+    pub(crate) fn set_query(&mut self, query: &str) {
         let mut payload = Payload::named('Q');
         payload.put_string(query);
         self.payload = payload.freeze();
@@ -63,8 +63,8 @@ impl FromBytes for Query {
 }
 
 impl ToBytes for Query {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(self.payload.clone())
+    fn to_bytes(&self) -> Bytes {
+        self.payload.clone()
     }
 }
 
@@ -74,7 +74,7 @@ impl Protocol for Query {
     }
 }
 
-impl<T: ToString> From<T> for Query {
+impl<T: AsRef<str>> From<T> for Query {
     fn from(value: T) -> Self {
         Query::new(value)
     }
@@ -87,7 +87,7 @@ mod test {
     #[test]
     fn test_query() {
         let query = Query::new("SELECT 1, 2, 3");
-        let query = Query::from_bytes(query.to_bytes().unwrap()).unwrap();
+        let query = Query::from_bytes(query.to_bytes()).unwrap();
         assert_eq!(query.query(), "SELECT 1, 2, 3");
     }
 }

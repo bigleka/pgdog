@@ -2,12 +2,14 @@
 //!
 //! # Summary
 //!
-//! The monitor has three (3) loops running in different Tokio tasks:
+//! The monitor has four (4) loops running in different Tokio tasks:
 //!
 //! * the maintenance loop which runs ~3 times per second,
-//! * the healthcheck loop which runs every `idle_healthcheck_interval`
+//! * the healthcheck loop which runs every `idle_healthcheck_interval`,
 //! * the new connection loop which runs every time a client asks
-//!   for a new connection to be created
+//!   for a new connection to be created,
+//! * the token refresh loop which runs for pools backed by an external
+//!   identity provider (RDS IAM, Azure Workload Identity, Vault).
 //!
 //! ## Maintenance loop
 //!
@@ -31,18 +33,30 @@
 //! a connection to the server can take ~100ms even inside datacenters, other clients may have returned
 //! connections back to the idle pool in that amount of time, and new connections are no longer needed even
 //! if clients requested ones to be created ~100ms ago.
+//!
+//! ## Token refresh loop
+//!
+//! Spawned once per pool for addresses that use an external identity provider.
+//! Sleeps until just before the cached token expires, fetches a new one, and
+//! repeats. On failure it evicts the stale cache entry so the next connection
+//! attempt blocks on a fresh fetch rather than presenting an expired token.
+//! The loop exits when the pool shuts down (e.g. on config reload), preventing
+//! refresh tasks from leaking across reloads.
 
 use std::time::Duration;
 
-use super::{Error, Guard, Healtcheck, Oids, Pool, Request};
+use super::{Error, Guard, Healtcheck, Pool, Request};
+use crate::backend::auth::{azure_workload_identity, rds_iam, vault};
 use crate::backend::pool::inner::ShouldCreate;
-use crate::backend::{ConnectReason, DisconnectReason, Server};
+use crate::backend::pool::token_cache::TokenCache;
+use crate::backend::{ConnectReason, DisconnectReason};
+use crate::config::ServerAuth;
+use crate::tasks;
 
-use tokio::time::{interval, sleep, timeout, Instant};
-use tokio::{select, task::spawn};
-use tracing::info;
-
-use tracing::{debug, error};
+use crate::util::{safe_interval, safe_sleep};
+use tokio::select;
+use tokio::time::Instant;
+use tracing::{debug, error, info, warn};
 
 static MAINTENANCE: Duration = Duration::from_millis(333);
 
@@ -50,7 +64,7 @@ static MAINTENANCE: Duration = Duration::from_millis(333);
 ///
 /// See [`crate::backend::pool::monitor`] module documentation
 /// for more details.
-pub struct Monitor {
+pub(crate) struct Monitor {
     pool: Pool,
 }
 
@@ -61,7 +75,7 @@ impl Monitor {
     pub(super) fn run(pool: &Pool) {
         let monitor = Self { pool: pool.clone() };
 
-        spawn(async move {
+        tasks::spawn("pool monitor", async move {
             monitor.spawn().await;
         });
     }
@@ -72,24 +86,43 @@ impl Monitor {
 
         // Maintenance loop.
         let pool = self.pool.clone();
-        spawn(async move { Self::maintenance(pool).await });
+        tasks::spawn(
+            "pool maintenance",
+            async move { Self::maintenance(pool).await },
+        );
         let pool = self.pool.clone();
-        spawn(async move { Self::stats(pool).await });
+        tasks::spawn("pool stats", async move { Self::stats(pool).await });
 
         // Delay starting health checks to give
         // time for the pool to spin up.
         let pool = self.pool.clone();
-        let (delay, replication_mode) = {
+        let (delay, interval, replication_mode) = {
             let lock = pool.lock();
             let config = lock.config();
-            (config.idle_healthcheck_delay(), config.replication_mode)
+            (
+                config.idle_healthcheck_delay,
+                config.idle_healthcheck_interval,
+                config.replication_mode,
+            )
         };
 
-        if !replication_mode {
-            spawn(async move {
-                sleep(delay).await;
+        if !replication_mode && interval > Duration::ZERO {
+            tasks::spawn("pool healthchecks", async move {
+                select! {
+                    _ = safe_sleep(delay) => {}
+                    _ = pool.comms().shutdown.cancelled() => return,
+                }
                 Self::healthchecks(pool).await
             });
+        }
+
+        // Token refresh loop — one task per pool, tied to pool lifetime.
+        // Only spawned for pools that use an external identity provider.
+        if self.pool.addr().server_auth.is_external_identity() {
+            tasks::spawn(
+                "pool token refresh",
+                Box::pin(Self::token_refresh(self.pool.clone())),
+            );
         }
 
         loop {
@@ -136,7 +169,7 @@ impl Monitor {
                 }
 
                 // Pool is shutting down.
-                _ = comms.shutdown.notified() => {
+                _ = comms.shutdown.cancelled() => {
                     break;
                 }
             }
@@ -145,11 +178,85 @@ impl Monitor {
         debug!("maintenance loop is shut down [{}]", self.pool.addr());
     }
 
+    /// Keeps the token cache warm for this pool's address.
+    ///
+    /// Sleeps until just before the cached token expires, fetches a fresh
+    /// one, and repeats. On failure the stale entry is evicted so the next
+    /// [`TokenCache::get_or_fetch`] call blocks on a real fetch rather than
+    /// handing out an expired token indefinitely.
+    ///
+    /// Exits when the pool shuts down, so no refresh tasks outlive their
+    /// pool across config reloads.
+    async fn token_refresh(pool: Pool) {
+        let addr = pool.addr().clone();
+        let comms = pool.comms();
+
+        debug!("token refresh loop started [{}]", addr);
+
+        loop {
+            // Sleep until just before the cached token expires.
+            // If nothing is cached yet (cold start) or the entry was evicted
+            // after a failed refresh, fire immediately to prime the cache.
+            let sleep_duration = TokenCache::global().refresh_in(&addr);
+
+            select! {
+                _ = safe_sleep(sleep_duration) => {
+                    let result = match addr.server_auth {
+                        ServerAuth::RdsIam => Box::pin(rds_iam::token(addr.clone())).await.map(
+                            |(token, expires_at)| {
+                                TokenCache::global().set(&addr, token, expires_at)
+                            },
+                        ),
+                        ServerAuth::AzureWorkloadIdentity => {
+                            azure_workload_identity::token(addr.clone()).await.map(
+                                |(token, expires_at)| {
+                                    TokenCache::global().set(&addr, token, expires_at)
+                                },
+                            )
+                        }
+                        ServerAuth::VaultStatic => {
+                            vault::static_backend_credentials(addr.clone()).await.map(
+                                |(token, refresh_at)| {
+                                    TokenCache::global().set_with_refresh_at(
+                                        &addr, token, refresh_at,
+                                    )
+                                },
+                            )
+                        }
+                        ServerAuth::VaultDynamic => {
+                            vault::credentials(addr.clone()).await.map(|credentials| {
+                                TokenCache::global().set_credentials(&addr, credentials);
+                                pool.lock().bump_credentials_generation();
+                            })
+                        }
+                        // Guard in spawn() ensures we only reach here for
+                        // external identity pools.
+                        _ => break,
+                    };
+
+                    match result {
+                        Ok(()) => {
+                            debug!("token refreshed [{}]", addr);
+                        }
+                        Err(err) => {
+                            warn!("token refresh failed, evicting cache entry: {err} [{}]", addr);
+                            TokenCache::global().evict(&addr);
+                        }
+                    }
+                }
+
+                _ = comms.shutdown.cancelled() => break,
+            }
+        }
+
+        debug!("token refresh loop stopped [{}]", addr);
+    }
+
     /// The health check loop.
     ///
     /// Runs regularly and ensures the pool triggers health checks on idle connections.
     async fn healthchecks(pool: Pool) {
-        let mut tick = interval(pool.lock().config().idle_healthcheck_interval());
+        let mut tick = safe_interval(pool.lock().config().idle_healthcheck_interval);
         let comms = pool.comms();
 
         debug!("health checks running [{}]", pool.addr());
@@ -175,7 +282,7 @@ impl Monitor {
                 }
 
 
-                _ = comms.shutdown.notified() => break,
+                _ = comms.shutdown.cancelled() => break,
             }
         }
 
@@ -184,7 +291,7 @@ impl Monitor {
 
     /// Perform maintenance on the pool periodically.
     async fn maintenance(pool: Pool) {
-        let mut tick = interval(MAINTENANCE);
+        let mut tick = safe_interval(MAINTENANCE);
         let comms = pool.comms();
 
         debug!("maintenance started [{}]", pool.addr());
@@ -216,7 +323,7 @@ impl Monitor {
                     guard.close_old(now);
                 }
 
-                _ = comms.shutdown.notified() => break,
+                _ = comms.shutdown.cancelled() => break,
             }
         }
 
@@ -225,34 +332,23 @@ impl Monitor {
 
     /// Replenish pool with one new connection.
     async fn replenish(&self, reason: ConnectReason) -> Result<bool, Error> {
-        if let Ok(conn) = Self::create_connection(&self.pool, reason).await {
-            let now = Instant::now();
-            let server = Box::new(conn);
-            let mut guard = self.pool.lock();
-            if guard.online {
-                guard.put(server, now)?;
+        let args = super::ConnectionArgs::from_pool(&self.pool, reason);
+
+        match super::connection_creation::create(args).await {
+            Ok(conn) => {
+                let now = Instant::now();
+                let server = Box::new(conn);
+                let mut guard = self.pool.lock();
+                if guard.online {
+                    guard.put(server, now);
+                }
+                Ok(true)
             }
-            Ok(true)
-        } else {
-            Ok(false)
+            _ => Ok(false),
         }
     }
 
-    #[allow(dead_code)]
-    async fn fetch_oids(pool: &Pool) -> Result<(), Error> {
-        if pool.lock().oids.is_none() {
-            let oids = Oids::load(&mut pool.get(&Request::default()).await?)
-                .await
-                .ok();
-            if let Some(oids) = oids {
-                pool.lock().oids = Some(oids);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn healthcheck(pool: &Pool) -> Result<bool, Error> {
+    pub(crate) async fn healthcheck(pool: &Pool) -> Result<bool, Error> {
         match Self::healthcheck_internal(pool).await {
             Ok(result) => {
                 pool.inner().health.toggle(result);
@@ -291,7 +387,9 @@ impl Monitor {
             // Create a new one and close it.
             info!("creating new healthcheck connection [{}]", pool.addr());
 
-            let mut server = Self::create_connection(pool, ConnectReason::Healthcheck)
+            let args = super::ConnectionArgs::from_pool(pool, ConnectReason::Healthcheck);
+
+            let mut server = super::connection_creation::create(args)
                 .await
                 .map_err(|_| Error::HealthcheckError)?;
 
@@ -309,83 +407,27 @@ impl Monitor {
         let duration = pool.config().stats_period;
         let comms = pool.comms();
 
+        // Don't tick that often.
+        if duration.is_zero() {
+            return;
+        }
+
+        let mut interval = safe_interval(pool.config().stats_period);
+
         loop {
             select! {
-                _ = sleep(duration) => {
+                _ = interval.tick() => {
                     {
                         let mut lock = pool.lock();
                         lock.stats.calc_averages(duration);
                     }
                 }
 
-                _ = comms.shutdown.notified() => {
+                _ = comms.shutdown.cancelled() => {
                     break;
                 }
             }
         }
-    }
-
-    pub(super) async fn create_connection(
-        pool: &Pool,
-        reason: ConnectReason,
-    ) -> Result<Server, Error> {
-        let connect_timeout = pool.config().connect_timeout;
-        let connect_attempts = pool.config().connect_attempts;
-        let connect_attempt_delay = pool.config().connect_attempt_delay;
-        let options = pool.server_options();
-
-        let mut error = Error::ServerError;
-        let now = Instant::now();
-
-        for attempt in 0..connect_attempts {
-            match timeout(
-                connect_timeout,
-                Server::connect(pool.addr(), options.clone(), reason),
-            )
-            .await
-            {
-                Ok(Ok(conn)) => {
-                    let elapsed = now.elapsed();
-                    {
-                        let mut guard = pool.lock();
-                        guard.stats.counts.connect_count += 1;
-                        guard.stats.counts.connect_time += elapsed;
-                    }
-                    return Ok(conn);
-                }
-
-                Ok(Err(err)) => {
-                    error!(
-                        "{}error connecting to server: {} [{}]",
-                        if attempt > 0 {
-                            format!("[attempt {}] ", attempt)
-                        } else {
-                            String::new()
-                        },
-                        err,
-                        pool.addr(),
-                    );
-                    error = Error::ServerError;
-                }
-
-                Err(_) => {
-                    error!(
-                        "{}server connection timeout [{}]",
-                        if attempt > 0 {
-                            format!("[attempt {}] ", attempt)
-                        } else {
-                            String::new()
-                        },
-                        pool.addr(),
-                    );
-                    error = Error::ConnectTimeout;
-                }
-            }
-
-            sleep(connect_attempt_delay).await;
-        }
-
-        Err(error)
     }
 }
 
@@ -439,12 +481,10 @@ mod test {
         crate::logger();
 
         let config = Config {
-            inner: pgdog_stats::Config {
-                max: 1,
-                min: 1,
-                healthcheck_timeout: Duration::from_millis(10),
-                ..Config::default().inner
-            },
+            max: 1,
+            min: 1,
+            healthcheck_timeout: Duration::from_millis(10),
+            ..Config::default()
         };
 
         let pool = Pool::new(&PoolConfig {
@@ -474,11 +514,9 @@ mod test {
         crate::logger();
 
         let config = Config {
-            inner: pgdog_stats::Config {
-                max: 5,
-                min: 2,
-                ..Config::default().inner
-            },
+            max: 5,
+            min: 2,
+            ..Config::default()
         };
 
         let pool = Pool::new(&PoolConfig {

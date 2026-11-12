@@ -1,15 +1,16 @@
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant};
 use url::Url;
 
 use crate::{
-    backend::{pool::Address, ConnectReason, Server, ServerOptions},
+    backend::{ConnectReason, Server, ServerOptions, pool::Address},
     config::config,
 };
 
 use super::prelude::*;
+use crate::util::safe_timeout;
 
 #[derive(Debug, Clone)]
-pub struct Probe {
+pub(crate) struct Probe {
     url: Url,
 }
 
@@ -25,13 +26,14 @@ impl Command for Probe {
     }
 
     async fn execute(&self) -> Result<Vec<Message>, Error> {
-        let mut conn = timeout(
+        let mut conn = safe_timeout(
             Duration::from_millis(config().config.general.connect_timeout),
-            Server::connect(
+            Box::pin(Server::connect(
                 &Address::try_from(self.url.clone()).map_err(|_| Error::InvalidAddress)?,
                 ServerOptions::default(),
                 ConnectReason::Probe,
-            ),
+                Default::default(),
+            )),
         )
         .await?
         .map_err(|err| Error::Backend(Box::new(err)))?;
@@ -44,6 +46,6 @@ impl Command for Probe {
         let rd = RowDescription::new(&[Field::bigint("latency")]);
         let mut dr = DataRow::new();
         dr.add(duration.as_millis() as i64);
-        Ok(vec![rd.message()?, dr.message()?])
+        Ok(vec![rd.message(), dr.message()])
     }
 }

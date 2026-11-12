@@ -4,12 +4,12 @@ use std::{fmt, time::Duration};
 
 use pgdog_config::RedisMode;
 use redis::{
+    AsyncConnectionConfig, Cmd, ConnectionInfo, IntoConnectionInfo, Pipeline, RedisFuture,
+    RedisResult, Value,
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
     sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType},
-    AsyncConnectionConfig, Cmd, ConnectionInfo, IntoConnectionInfo, Pipeline, RedisFuture,
-    RedisResult, Value,
 };
 
 /// How long the cache waits on Redis. Past these, Redis is treated as

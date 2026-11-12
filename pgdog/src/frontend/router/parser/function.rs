@@ -1,170 +1,96 @@
-use std::collections::{HashMap, HashSet};
+use pg_raw_parse::{Node, nodes};
 
-use once_cell::sync::Lazy;
-use pg_query::{protobuf, Node, NodeEnum};
+const WRITE_ONLY: &[&str] = &["nextval", "setval"];
 
-static WRITE_ONLY: Lazy<HashMap<&'static str, LockingBehavior>> = Lazy::new(|| {
-    HashMap::from([
-        ("pg_advisory_lock", LockingBehavior::Lock),
-        ("pg_advisory_xact_lock", LockingBehavior::None),
-        ("pg_advisory_lock_shared", LockingBehavior::Lock),
-        ("pg_advisory_xact_lock_shared", LockingBehavior::None),
-        ("pg_try_advisory_lock", LockingBehavior::Lock),
-        ("pg_try_advisory_xact_lock", LockingBehavior::None),
-        ("pg_try_advisory_lock_shared", LockingBehavior::Lock),
-        ("pg_try_advisory_xact_lock_shared", LockingBehavior::None),
-        ("pg_advisory_unlock_all", LockingBehavior::Unlock),
-        ("pg_advisory_unlock", LockingBehavior::Unlock), // TODO: we don't track multiple advisory locks.
-        ("nextval", LockingBehavior::None),
-        ("setval", LockingBehavior::None),
-    ])
-});
-
-static CROSS_SHARD: Lazy<HashSet<(&'static str, &'static str)>> =
-    Lazy::new(|| HashSet::from([("pgdog", "install_sharded_sequence")]));
-
-#[derive(Debug, Copy, Clone, PartialEq, Default)]
-pub enum LockingBehavior {
-    Lock,
-    Unlock,
-    #[default]
-    None,
-}
+const CROSS_SHARD: &[(Option<&str>, &str)] = &[(Some("pgdog"), "install_sharded_sequence")];
 
 #[derive(Default, Debug, Copy, Clone)]
-pub struct FunctionBehavior {
-    pub writes: bool,
-    pub locking_behavior: LockingBehavior,
-    pub cross_shard: bool,
+pub(crate) struct FunctionBehavior {
+    pub(crate) writes: bool,
+    pub(crate) cross_shard: bool,
 }
 
-impl FunctionBehavior {
-    pub fn writes_only() -> FunctionBehavior {
-        FunctionBehavior {
-            writes: true,
-            ..Default::default()
-        }
-    }
-}
-
-pub struct Function<'a> {
-    pub name: &'a str,
-    pub schema: Option<&'a str>,
+pub(crate) struct Function<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) schema: Option<&'a str>,
 }
 
 impl<'a> Function<'a> {
     /// Build a Function from a qualified name list (as found in `FuncCall.funcname`).
     /// The last element is the function name; the preceding element (if any) is the
     /// schema.
-    fn from_strings(parts: &'a [Node]) -> Result<Self, ()> {
-        let str_of = |node: &'a Node| match &node.node {
-            Some(NodeEnum::String(protobuf::String { sval })) => Ok(sval.as_str()),
-            _ => Err(()),
-        };
-        match parts {
-            [name] => Ok(Self {
-                name: str_of(name)?,
-                schema: None,
-            }),
-            [.., schema, name] => Ok(Self {
-                name: str_of(name)?,
-                schema: Some(str_of(schema)?),
-            }),
-            _ => Err(()),
-        }
+    pub(crate) fn from_strings(
+        mut parts: impl DoubleEndedIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        Some(Self {
+            name: parts.next_back()?,
+            schema: parts.next_back(),
+        })
     }
 
     /// This function likely writes.
-    pub fn behavior(&self) -> FunctionBehavior {
-        let cross_shard = self
-            .schema
-            .map(|schema| CROSS_SHARD.contains(&(schema, self.name)))
-            .unwrap_or(false);
+    pub(crate) fn behavior(&self) -> FunctionBehavior {
+        FunctionBehavior {
+            writes: WRITE_ONLY.contains(&self.name),
+            cross_shard: CROSS_SHARD.contains(&(self.schema, self.name)),
+        }
+    }
 
-        if let Some(locks) = WRITE_ONLY.get(&self.name) {
-            FunctionBehavior {
-                writes: true,
-                locking_behavior: *locks,
-                cross_shard,
-            }
-        } else {
-            FunctionBehavior {
-                cross_shard,
-                ..FunctionBehavior::default()
-            }
+    pub(crate) fn extract_func_call(node: Node<'a>) -> Option<&'a nodes::FuncCall> {
+        match node {
+            Node::FuncCall(func) => Some(func),
+            Node::TypeCast(cast) => Self::extract_func_call(cast.arg()),
+            Node::NullTest(test) => Self::extract_func_call(test.arg()),
+            _ => None,
         }
     }
 }
 
-impl<'a> TryFrom<&'a Node> for Function<'a> {
+impl<'a> TryFrom<Node<'a>> for Function<'a> {
     type Error = ();
-    fn try_from(value: &'a Node) -> Result<Self, Self::Error> {
-        match &value.node {
-            Some(NodeEnum::FuncCall(func)) => {
-                return Self::from_strings(&func.funcname);
-            }
 
-            Some(NodeEnum::TypeCast(cast)) => {
-                if let Some(node) = cast.arg.as_ref() {
-                    return Self::try_from(node.as_ref());
-                }
-            }
-
-            Some(NodeEnum::ResTarget(res)) => {
-                if let Some(val) = &res.val {
-                    return Self::try_from(val.as_ref());
-                }
-            }
-
-            Some(NodeEnum::NullTest(test)) => {
-                if let Some(node) = test.arg.as_ref() {
-                    return Self::try_from(node.as_ref());
-                }
-            }
-
-            _ => (),
-        }
-
-        Err(())
+    fn try_from(value: Node<'a>) -> Result<Self, Self::Error> {
+        Self::extract_func_call(value)
+            .and_then(|f| Self::from_strings(f.funcname().iter().filter_map(Node::as_str)))
+            .ok_or(())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use pg_query::parse;
+    use pg_raw_parse::parse;
 
     use super::*;
 
     #[test]
     fn test_function() {
-        let ast =
-            parse("SELECT pg_advisory_lock(234234), pg_try_advisory_lock(23234)::bool").unwrap();
-        let root = ast.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let query = "SELECT pg_advisory_lock(234234), pg_try_advisory_lock(23234)::bool";
+        funcs(query, |func| {
+            assert!(func.name.contains("advisory_lock"));
+            assert!(func.schema.is_none());
+            assert!(!func.behavior().cross_shard);
+        });
+    }
 
-        match root.node.as_ref() {
-            Some(NodeEnum::SelectStmt(stmt)) => {
-                for node in &stmt.target_list {
-                    let func = Function::try_from(node).unwrap();
-                    assert!(func.name.contains("advisory_lock"));
-                    assert!(func.schema.is_none());
-                    assert!(!func.behavior().cross_shard);
-                }
-            }
+    fn funcs(query: &str, mut check: impl FnMut(Function<'_>)) {
+        let ast = parse(query).unwrap();
+        let Node::SelectStmt(stmt) = ast.stmts().next().unwrap() else {
+            unreachable!();
+        };
 
-            _ => panic!("not a select"),
+        for node in stmt.target_list() {
+            let func = Function::try_from(node.val()).unwrap();
+            check(func);
         }
     }
 
-    fn first_func<R>(query: &str, check: impl FnOnce(Function<'_>) -> R) -> R {
-        let ast = parse(query).unwrap();
-        let root = ast.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
-        match root.node.as_ref() {
-            Some(NodeEnum::SelectStmt(stmt)) => {
-                let target = stmt.target_list.first().unwrap();
-                check(Function::try_from(target).unwrap())
+    fn first_func(query: &str, check: impl FnOnce(Function<'_>)) {
+        let mut check = Some(check);
+        funcs(query, |func| {
+            if let Some(c) = check.take() {
+                c(func)
             }
-            _ => panic!("not a select"),
-        }
+        });
     }
 
     #[test]

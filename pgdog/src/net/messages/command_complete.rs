@@ -10,7 +10,7 @@ use super::prelude::*;
 
 /// CommandComplete (B) message.
 #[derive(Clone)]
-pub struct CommandComplete {
+pub(crate) struct CommandComplete {
     payload: Bytes,
 }
 
@@ -24,7 +24,7 @@ impl Debug for CommandComplete {
 
 impl CommandComplete {
     /// Number of rows sent/received.
-    pub fn rows(&self) -> Result<Option<usize>, Error> {
+    pub(crate) fn rows(&self) -> Result<Option<usize>, Error> {
         Ok(self
             .command()
             .split(" ")
@@ -35,12 +35,11 @@ impl CommandComplete {
     }
 
     /// Get command tag.
-    pub fn tag(&self) -> &str {
+    pub(crate) fn tag(&self) -> &str {
         // SAFETY: split always returns at least one element.
         self.command().split(" ").next().unwrap()
     }
 
-    #[inline]
     pub(crate) fn command(&self) -> &str {
         unsafe { from_utf8_unchecked(&self.payload[5..self.payload.len() - 1]) }
     }
@@ -55,7 +54,7 @@ impl CommandComplete {
     }
 
     /// Rewrite the message with new number of rows.
-    pub fn rewrite(&self, rows: usize) -> Result<Self, Error> {
+    pub(crate) fn rewrite(&self, rows: usize) -> Result<Self, Error> {
         let mut parts = self.command().split(" ").collect::<Vec<_>>();
         parts.pop();
         let rows = rows.to_string();
@@ -64,29 +63,14 @@ impl CommandComplete {
         Ok(Self::from_str(&parts.join(" ")))
     }
 
-    /// Start transaction.
-    pub fn new_begin() -> Self {
-        Self::from_str("BEGIN")
-    }
-
-    /// Rollback transaction.
-    pub fn new_rollback() -> Self {
-        Self::from_str("ROLLBACK")
-    }
-
-    /// Commit transaction.
-    pub fn new_commit() -> Self {
-        Self::from_str("COMMIT")
-    }
-
-    pub fn new(command: impl ToString) -> Self {
-        Self::from_str(command.to_string().as_str())
+    pub(crate) fn new(command: impl AsRef<str>) -> Self {
+        Self::from_str(command.as_ref())
     }
 }
 
 impl ToBytes for CommandComplete {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(self.payload.clone())
+    fn to_bytes(&self) -> Bytes {
+        self.payload.clone()
     }
 }
 
@@ -111,5 +95,43 @@ impl FromBytes for CommandComplete {
 impl Protocol for CommandComplete {
     fn code(&self) -> char {
         'C'
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn rows_and_tag_for_dml() {
+        let insert = CommandComplete::from_str("INSERT 0 5");
+        assert_eq!(insert.tag(), "INSERT");
+        assert_eq!(insert.rows().unwrap(), Some(5));
+
+        let update = CommandComplete::from_str("UPDATE 3");
+        assert_eq!(update.tag(), "UPDATE");
+        assert_eq!(update.rows().unwrap(), Some(3));
+
+        let delete = CommandComplete::from_str("DELETE 2");
+        assert_eq!(delete.tag(), "DELETE");
+        assert_eq!(delete.rows().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rows_and_tag_for_copy() {
+        let copy = CommandComplete::from_str("COPY 42");
+        assert_eq!(copy.tag(), "COPY");
+        assert_eq!(copy.rows().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn rows_none_for_non_dml() {
+        let begin = CommandComplete::from_str("BEGIN");
+        assert_eq!(begin.tag(), "BEGIN");
+        assert_eq!(begin.rows().unwrap(), None);
+
+        let select = CommandComplete::from_str("SELECT 10");
+        assert_eq!(select.tag(), "SELECT");
+        assert_eq!(select.rows().unwrap(), Some(10));
     }
 }

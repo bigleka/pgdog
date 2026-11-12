@@ -1,40 +1,27 @@
 use bytes::BytesMut;
 
-use crate::backend::replication::publisher::Lsn;
+use crate::net::CopyData;
 use crate::net::replication::KeepAlive;
 use crate::net::replication::ReplicationMeta;
-use crate::net::CopyData;
 use crate::util::postgres_now;
 
 use super::super::code;
 use super::super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct StatusUpdate {
-    pub last_written: i64,
-    pub last_flushed: i64,
-    pub last_applied: i64,
-    pub system_clock: i64,
-    pub reply: u8,
+pub(crate) struct StatusUpdate {
+    pub(crate) last_written: u64,
+    pub(crate) last_flushed: u64,
+    pub(crate) last_applied: u64,
+    pub(crate) system_clock: i64,
+    pub(crate) reply: u8,
 }
 
 impl StatusUpdate {
-    pub fn wrapped(self) -> Result<CopyData, Error> {
+    pub(crate) fn wrapped(self) -> Result<CopyData, Error> {
         Ok(CopyData::new(
-            &ReplicationMeta::StatusUpdate(self).to_bytes()?,
+            &ReplicationMeta::StatusUpdate(self).to_bytes(),
         ))
-    }
-
-    /// Generate a request from peer to update me now
-    /// with latest lsn.
-    pub fn new_reply(lsn: Lsn) -> Self {
-        Self {
-            last_applied: lsn.lsn,
-            last_flushed: lsn.lsn,
-            last_written: lsn.lsn,
-            system_clock: postgres_now(),
-            reply: 1,
-        }
     }
 }
 
@@ -55,9 +42,9 @@ impl FromBytes for StatusUpdate {
         code!(bytes, 'r');
 
         Ok(Self {
-            last_written: bytes.get_i64(),
-            last_flushed: bytes.get_i64(),
-            last_applied: bytes.get_i64(),
+            last_written: bytes.get_u64(),
+            last_flushed: bytes.get_u64(),
+            last_applied: bytes.get_u64(),
             system_clock: bytes.get_i64(),
             reply: bytes.get_u8(),
         })
@@ -65,17 +52,17 @@ impl FromBytes for StatusUpdate {
 }
 
 impl ToBytes for StatusUpdate {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = BytesMut::new();
         payload.put_u8(b'r');
 
-        payload.put_i64(self.last_written);
-        payload.put_i64(self.last_flushed);
-        payload.put_i64(self.last_applied);
+        payload.put_u64(self.last_written);
+        payload.put_u64(self.last_flushed);
+        payload.put_u64(self.last_applied);
         payload.put_i64(self.system_clock);
         payload.put_u8(self.reply);
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -92,7 +79,7 @@ mod test {
             system_clock: 4,
             reply: 5,
         };
-        let su = StatusUpdate::from_bytes(su.to_bytes().unwrap()).unwrap();
+        let su = StatusUpdate::from_bytes(su.to_bytes()).unwrap();
         assert_eq!(su.last_applied, 1);
         assert_eq!(su.last_flushed, 2);
         assert_eq!(su.last_written, 3);
@@ -124,15 +111,5 @@ mod test {
         assert_eq!(update.last_flushed, 123);
         assert_eq!(update.last_applied, 123);
         assert_eq!(update.reply, 0);
-    }
-
-    #[test]
-    fn status_update_new_reply_sets_reply_flag() {
-        let lsn = Lsn::from_i64(999);
-        let update = StatusUpdate::new_reply(lsn);
-        assert_eq!(update.last_written, 999);
-        assert_eq!(update.last_flushed, 999);
-        assert_eq!(update.last_applied, 999);
-        assert_eq!(update.reply, 1);
     }
 }

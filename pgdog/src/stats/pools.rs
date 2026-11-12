@@ -3,12 +3,12 @@ use crate::util::millis;
 
 use super::{Measurement, Metric, OpenMetric};
 
-pub struct PoolMetric {
-    pub name: String,
-    pub measurements: Vec<Measurement>,
-    pub help: String,
-    pub unit: Option<String>,
-    pub metric_type: Option<String>,
+pub(crate) struct PoolMetric {
+    pub(crate) name: String,
+    pub(crate) measurements: Vec<Measurement>,
+    pub(crate) help: String,
+    pub(crate) unit: Option<String>,
+    pub(crate) metric_type: Option<String>,
 }
 
 impl OpenMetric for PoolMetric {
@@ -37,20 +37,23 @@ impl OpenMetric for PoolMetric {
     }
 }
 
-pub struct Pools {
+pub(crate) struct Pools {
     metrics: Vec<Metric>,
 }
 
 impl Pools {
-    pub fn load() -> Pools {
+    pub(crate) fn load() -> Pools {
         let mut metrics = vec![];
         let mut max_connections = vec![];
+        let mut min_connections = vec![];
         let mut cl_waiting = vec![];
         let mut sv_active = vec![];
         let mut sv_idle = vec![];
+        let mut sv_locked = vec![];
         let mut maxwait = vec![];
         let mut errors = vec![];
         let mut out_of_sync = vec![];
+        let mut banned = vec![];
         let mut total_xact_count = vec![];
         let mut total_xact_2pc_count = vec![];
         let mut avg_xact_count = vec![];
@@ -67,6 +70,8 @@ impl Pools {
         let mut avg_idle_xact_time = vec![];
         let mut total_query_time = vec![];
         let mut avg_query_time = vec![];
+        let mut total_wait_time = vec![];
+        let mut avg_wait_time = vec![];
         let mut total_close = vec![];
         let mut avg_close = vec![];
         let mut total_server_errors = vec![];
@@ -75,6 +80,8 @@ impl Pools {
         let mut avg_cleaned = vec![];
         let mut total_rollbacks = vec![];
         let mut avg_rollbacks = vec![];
+        let mut total_idle_xact_timeouts = vec![];
+        let mut avg_idle_xact_timeouts = vec![];
         let mut total_connect_time = vec![];
         let mut avg_connect_time = vec![];
         let mut total_connect_count = vec![];
@@ -84,12 +91,32 @@ impl Pools {
         let mut total_writes = vec![];
         let mut avg_writes = vec![];
         let mut total_sv_xact_idle = vec![];
+        let mut total_auth_attempts = vec![];
+        let mut avg_auth_attempts = vec![];
+        let mut total_rows_inserted = vec![];
+        let mut avg_rows_inserted = vec![];
+        let mut total_rows_updated = vec![];
+        let mut avg_rows_updated = vec![];
+        let mut total_rows_deleted = vec![];
+        let mut avg_rows_deleted = vec![];
+        let mut total_rows_copied = vec![];
+        let mut avg_rows_copied = vec![];
+        let mut total_tables_created = vec![];
+        let mut avg_tables_created = vec![];
+        let mut total_tables_dropped = vec![];
+        let mut avg_tables_dropped = vec![];
+        let mut total_ddl_commands = vec![];
+        let mut avg_ddl_commands = vec![];
+        let mut total_dml_commands = vec![];
+        let mut avg_dml_commands = vec![];
+        let mut total_checkout_timeouts = vec![];
+        let mut avg_checkout_timeouts = vec![];
 
         let general = &crate::config::config().config.general;
 
         for (user, cluster) in databases().all() {
             for (shard_num, shard) in cluster.shards().iter().enumerate() {
-                for (role, pool) in shard.pools_with_roles() {
+                for (role, ban, pool) in shard.pools_with_roles_and_bans() {
                     let state = pool.state();
                     let labels = vec![
                         ("user".into(), user.user.clone()),
@@ -103,6 +130,11 @@ impl Pools {
                     max_connections.push(Measurement {
                         labels: labels.clone(),
                         measurement: state.config.max.into(),
+                    });
+
+                    min_connections.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: state.config.min.into(),
                     });
 
                     cl_waiting.push(Measurement {
@@ -120,6 +152,11 @@ impl Pools {
                         measurement: state.idle.into(),
                     });
 
+                    sv_locked.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: state.locked.into(),
+                    });
+
                     maxwait.push(Measurement {
                         labels: labels.clone(),
                         measurement: state.maxwait.as_secs_f64().into(),
@@ -133,6 +170,11 @@ impl Pools {
                     out_of_sync.push(Measurement {
                         labels: labels.clone(),
                         measurement: state.out_of_sync.into(),
+                    });
+
+                    banned.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: (ban.banned() as i64).into(),
                     });
 
                     let stats = state.stats;
@@ -219,6 +261,16 @@ impl Pools {
                         measurement: millis(averages.query_time).into(),
                     });
 
+                    total_wait_time.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: millis(totals.wait_time).into(),
+                    });
+
+                    avg_wait_time.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: millis(averages.wait_time).into(),
+                    });
+
                     total_close.push(Measurement {
                         labels: labels.clone(),
                         measurement: totals.close.into(),
@@ -257,6 +309,16 @@ impl Pools {
                     avg_rollbacks.push(Measurement {
                         labels: labels.clone(),
                         measurement: averages.rollbacks.into(),
+                    });
+
+                    total_idle_xact_timeouts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.idle_xact_timeouts.into(),
+                    });
+
+                    avg_idle_xact_timeouts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.idle_xact_timeouts.into(),
                     });
 
                     total_connect_time.push(Measurement {
@@ -303,6 +365,106 @@ impl Pools {
                         labels: labels.clone(),
                         measurement: backend::stats::idle_in_transaction(&pool).into(),
                     });
+
+                    total_auth_attempts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.auth_attempts.into(),
+                    });
+
+                    avg_auth_attempts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.auth_attempts.into(),
+                    });
+
+                    total_rows_inserted.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.rows_inserted.into(),
+                    });
+
+                    avg_rows_inserted.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.rows_inserted.into(),
+                    });
+
+                    total_rows_updated.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.rows_updated.into(),
+                    });
+
+                    avg_rows_updated.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.rows_updated.into(),
+                    });
+
+                    total_rows_deleted.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.rows_deleted.into(),
+                    });
+
+                    avg_rows_deleted.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.rows_deleted.into(),
+                    });
+
+                    total_rows_copied.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.rows_copied.into(),
+                    });
+
+                    avg_rows_copied.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.rows_copied.into(),
+                    });
+
+                    total_tables_created.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.tables_created.into(),
+                    });
+
+                    avg_tables_created.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.tables_created.into(),
+                    });
+
+                    total_tables_dropped.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.tables_dropped.into(),
+                    });
+
+                    avg_tables_dropped.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.tables_dropped.into(),
+                    });
+
+                    total_ddl_commands.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.ddl_commands.into(),
+                    });
+
+                    avg_ddl_commands.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.ddl_commands.into(),
+                    });
+
+                    total_dml_commands.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.dml_commands.into(),
+                    });
+
+                    avg_dml_commands.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.dml_commands.into(),
+                    });
+
+                    total_checkout_timeouts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.checkout_timeouts.into(),
+                    });
+
+                    avg_checkout_timeouts.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.checkout_timeouts.into(),
+                    });
                 }
             }
         }
@@ -311,6 +473,14 @@ impl Pools {
             name: "max_connections".into(),
             measurements: max_connections,
             help: "Maximum number of allowed server connections".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "min_connections".into(),
+            measurements: min_connections,
+            help: "Minimum number of server connections kept open".into(),
             unit: None,
             metric_type: None,
         }));
@@ -362,6 +532,16 @@ impl Pools {
         }));
 
         metrics.push(Metric::new(PoolMetric {
+            name: "sv_locked".into(),
+            measurements: sv_locked,
+            help: "Servers pinned to a client (advisory lock or manual pin), \
+                   ineligible for transaction pooling."
+                .into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
             name: "maxwait".into(),
             measurements: maxwait,
             help: "How long clients have been waiting for a connection.".into(),
@@ -383,6 +563,14 @@ impl Pools {
             help: "Connections that have been returned to the pool in a broken state.".into(),
             unit: None,
             metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "banned".into(),
+            measurements: banned,
+            help: "Whether the pool is currently banned from serving traffic (1 = banned, 0 = available).".into(),
+            unit: None,
+            metric_type: None,
         }));
 
         metrics.push(Metric::new(PoolMetric {
@@ -447,7 +635,7 @@ impl Pools {
             measurements: avg_received,
             help: "Average number of bytes received.".into(),
             unit: None,
-            metric_type: Some("counter".into()),
+            metric_type: None,
         }));
 
         metrics.push(Metric::new(PoolMetric {
@@ -510,6 +698,22 @@ impl Pools {
             name: "avg_query_time".into(),
             measurements: avg_query_time,
             help: "Average time spent executing queries.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_wait_time".into(),
+            measurements: total_wait_time,
+            help: "Total time spent waiting for connection.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_wait_time".into(),
+            measurements: avg_wait_time,
+            help: "Average time spent waiting for connection.".into(),
             unit: None,
             metric_type: None,
         }));
@@ -580,6 +784,24 @@ impl Pools {
             help:
                 "Average number of abandoned transactions that had to be rolled back automatically."
                     .into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_idle_xact_timeouts".into(),
+            measurements: total_idle_xact_timeouts,
+            help: "Total number of server connections terminated by Postgres with idle-in-transaction session timeout (25P03)."
+                .into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_idle_xact_timeouts".into(),
+            measurements: avg_idle_xact_timeouts,
+            help: "Average number of server connections terminated by Postgres with idle-in-transaction session timeout (25P03)."
+                .into(),
             unit: None,
             metric_type: None,
         }));
@@ -656,7 +878,171 @@ impl Pools {
             metric_type: None,
         }));
 
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_auth_attempts".into(),
+            measurements: total_auth_attempts,
+            help: "Total number of server authentication attempts.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_auth_attempts".into(),
+            measurements: avg_auth_attempts,
+            help: "Average number of server authentication attempts per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_rows_inserted".into(),
+            measurements: total_rows_inserted,
+            help: "Total rows reported affected by INSERT command tags.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_rows_inserted".into(),
+            measurements: avg_rows_inserted,
+            help: "Average rows inserted per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_rows_updated".into(),
+            measurements: total_rows_updated,
+            help: "Total rows reported affected by UPDATE command tags.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_rows_updated".into(),
+            measurements: avg_rows_updated,
+            help: "Average rows updated per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_rows_deleted".into(),
+            measurements: total_rows_deleted,
+            help: "Total rows reported affected by DELETE command tags.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_rows_deleted".into(),
+            measurements: avg_rows_deleted,
+            help: "Average rows deleted per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_rows_copied".into(),
+            measurements: total_rows_copied,
+            help: "Total rows reported by COPY command tags.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_rows_copied".into(),
+            measurements: avg_rows_copied,
+            help: "Average rows copied per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_tables_created".into(),
+            measurements: total_tables_created,
+            help: "Total tables created by successfully executed parsed statements.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_tables_created".into(),
+            measurements: avg_tables_created,
+            help: "Average tables created per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_tables_dropped".into(),
+            measurements: total_tables_dropped,
+            help: "Total tables dropped by successfully executed parsed statements.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_tables_dropped".into(),
+            measurements: avg_tables_dropped,
+            help: "Average tables dropped per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_ddl_commands".into(),
+            measurements: total_ddl_commands,
+            help: "Total successfully executed DDL commands identified by the query parser.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_ddl_commands".into(),
+            measurements: avg_ddl_commands,
+            help: "Average successfully executed DDL commands per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_dml_commands".into(),
+            measurements: total_dml_commands,
+            help: "Total successfully executed DML commands identified by the query parser.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_dml_commands".into(),
+            measurements: avg_dml_commands,
+            help: "Average successfully executed DML commands per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_checkout_timeouts".into(),
+            measurements: total_checkout_timeouts,
+            help: "Total number of connection pool checkout timeouts.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_checkout_timeouts".into(),
+            measurements: avg_checkout_timeouts,
+            help: "Average number of connection pool checkout timeouts.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
         Pools { metrics }
+    }
+
+    pub(crate) fn into_metrics(self) -> Vec<Metric> {
+        self.metrics
     }
 }
 
@@ -708,6 +1094,34 @@ mod tests {
         assert_eq!(lines[1], "# UNIT sv_active connections");
         assert_eq!(lines[2], "# HELP sv_active Active servers per pool");
         assert_eq!(lines[3], "sv_active{user=\"alice\",database=\"app\"} 5");
+    }
+
+    #[test]
+    fn banned_metric_renders_as_gauge() {
+        config::set(ConfigAndUsers::default()).unwrap();
+
+        let metric = PoolMetric {
+            name: "banned".into(),
+            measurements: vec![Measurement {
+                labels: vec![
+                    ("database".into(), "app".into()),
+                    ("role".into(), "replica".into()),
+                ],
+                measurement: (true as i64).into(),
+            }],
+            help: "Whether the pool is currently banned from serving traffic (1 = banned, 0 = available).".into(),
+            unit: None,
+            metric_type: None,
+        };
+
+        let rendered = Metric::new(metric).to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "# TYPE banned gauge");
+        assert_eq!(
+            lines[1],
+            "# HELP banned Whether the pool is currently banned from serving traffic (1 = banned, 0 = available)."
+        );
+        assert_eq!(lines[2], "banned{database=\"app\",role=\"replica\"} 1");
     }
 }
 

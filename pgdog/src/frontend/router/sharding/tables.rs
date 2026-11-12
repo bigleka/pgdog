@@ -1,16 +1,51 @@
+use pgdog_config::{DataType, Hasher, LookupResult};
+use pgdog_vector::Vector;
+
 use crate::{
     backend::ShardingSchema,
-    config::ShardedTable,
     frontend::router::parser::{Column, Table},
 };
 
-#[derive(Debug)]
-pub struct Key<'a> {
-    pub table: &'a ShardedTable,
-    pub position: usize,
+use super::Mapping;
+
+/// Runtime representation of a sharded table, derived from [`pgdog_config::ShardedTableConfig`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ShardedTable {
+    pub(crate) database: String,
+    pub(crate) name: Option<String>,
+    pub(crate) prefix: bool,
+    pub(crate) schema: Option<String>,
+    pub(crate) column: String,
+    pub(crate) primary: bool,
+    pub(crate) centroids: Vec<Vector>,
+    pub(crate) data_type: DataType,
+    pub(crate) centroid_probes: usize,
+    pub(crate) hasher: Hasher,
+    pub(crate) mapping: Option<Mapping>,
+    pub(crate) lookup_query: Option<String>,
+    pub(crate) lookup_result: LookupResult,
 }
 
-pub struct Tables<'a> {
+impl ShardedTable {
+    /// Whether `table` matches this table's configured name (or prefix).
+    pub(crate) fn name_matches(&self, table: &str) -> bool {
+        self.name.as_deref().is_some_and(|name| {
+            if self.prefix {
+                table.starts_with(name)
+            } else {
+                table == name
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Key<'a> {
+    pub(crate) table: &'a ShardedTable,
+    pub(crate) position: usize,
+}
+
+pub(crate) struct Tables<'a> {
     schema: &'a ShardingSchema,
 }
 
@@ -22,30 +57,22 @@ impl<'a> Tables<'a> {
     pub(crate) fn sharded(&'a self, table: Table) -> Option<&'a ShardedTable> {
         let tables = self.schema.tables().tables();
 
-        let sharded = tables
-            .iter()
-            .filter(|table| table.name.is_some())
-            .find(|t| t.name.as_deref() == Some(table.name));
-
-        sharded
+        tables.iter().find(|t| t.name_matches(table.name))
     }
 
     pub(crate) fn key(&'a self, table: Table, columns: &'a [Column]) -> Option<Key<'a>> {
         let tables = self.schema.tables().tables();
 
         // Check tables with name first.
-        let sharded = tables
-            .iter()
-            .filter(|table| table.name.is_some())
-            .find(|t| t.name.as_deref() == Some(table.name));
+        let sharded = tables.iter().find(|t| t.name_matches(table.name));
 
-        if let Some(sharded) = sharded {
-            if let Some(position) = columns.iter().position(|col| col.name == sharded.column) {
-                return Some(Key {
-                    table: sharded,
-                    position,
-                });
-            }
+        if let Some(sharded) = sharded
+            && let Some(position) = columns.iter().position(|col| col.name == sharded.column)
+        {
+            return Some(Key {
+                table: sharded,
+                position,
+            });
         }
 
         // Check tables without name.
@@ -54,13 +81,13 @@ impl<'a> Tables<'a> {
             .filter(|table| table.name.is_none())
             .map(|t| (t, columns.iter().position(|col| col.name == t.column)))
             .find(|t| t.1.is_some());
-        if let Some(key) = key {
-            if let Some(position) = key.1 {
-                return Some(Key {
-                    table: key.0,
-                    position,
-                });
-            }
+        if let Some(key) = key
+            && let Some(position) = key.1
+        {
+            return Some(Key {
+                table: key.0,
+                position,
+            });
         }
 
         None

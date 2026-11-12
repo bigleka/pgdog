@@ -17,6 +17,7 @@ pub struct Counts {
     pub queries: usize,
     pub rollbacks: usize,
     pub errors: usize,
+    pub idle_xact_timeouts: usize,
     pub prepared_statements: usize,
     pub query_time: Duration,
     pub transaction_time: Duration,
@@ -27,6 +28,14 @@ pub struct Counts {
     pub close: usize,
     pub cleaned: usize,
     pub prepared_sync: usize,
+    pub rows_inserted: usize,
+    pub rows_updated: usize,
+    pub rows_deleted: usize,
+    pub rows_copied: usize,
+    pub tables_created: usize,
+    pub tables_dropped: usize,
+    pub ddl_commands: usize,
+    pub dml_commands: usize,
 }
 
 impl Add<Counts> for PoolCounts {
@@ -47,15 +56,28 @@ impl Add<Counts> for PoolCounts {
             parse_count: self.parse_count + rhs.parse,
             bind_count: self.bind_count + rhs.bind,
             rollbacks: self.rollbacks + rhs.rollbacks,
+            idle_xact_timeouts: self.idle_xact_timeouts + rhs.idle_xact_timeouts,
             healthchecks: self.healthchecks + rhs.healthchecks,
             close: self.close + rhs.close,
             errors: self.errors + rhs.errors,
             cleaned: self.cleaned + rhs.cleaned,
             prepared_sync: self.prepared_sync + rhs.prepared_sync,
+            rows_inserted: self.rows_inserted + rhs.rows_inserted,
+            rows_updated: self.rows_updated + rhs.rows_updated,
+            rows_deleted: self.rows_deleted + rhs.rows_deleted,
+            rows_copied: self.rows_copied + rhs.rows_copied,
+            tables_created: self.tables_created + rhs.tables_created,
+            tables_dropped: self.tables_dropped + rhs.tables_dropped,
+            ddl_commands: self.ddl_commands + rhs.ddl_commands,
+            dml_commands: self.dml_commands + rhs.dml_commands,
+
+            // These are not counted by each server stats.
             connect_count: self.connect_count,
             connect_time: self.connect_time,
             writes: self.writes,
             reads: self.reads,
+            auth_attempts: self.auth_attempts,
+            checkout_timeouts: self.checkout_timeouts,
         }
     }
 }
@@ -72,6 +94,9 @@ impl Add for Counts {
             queries: self.queries.saturating_add(rhs.queries),
             rollbacks: self.rollbacks.saturating_add(rhs.rollbacks),
             errors: self.errors.saturating_add(rhs.errors),
+            idle_xact_timeouts: self
+                .idle_xact_timeouts
+                .saturating_add(rhs.idle_xact_timeouts),
             prepared_statements: self.prepared_statements + rhs.prepared_statements,
             query_time: self.query_time.saturating_add(rhs.query_time),
             transaction_time: self.transaction_time.saturating_add(rhs.transaction_time),
@@ -84,6 +109,14 @@ impl Add for Counts {
             close: self.close.saturating_add(rhs.close),
             cleaned: self.cleaned.saturating_add(rhs.cleaned),
             prepared_sync: self.prepared_sync.saturating_add(rhs.prepared_sync),
+            rows_inserted: self.rows_inserted.saturating_add(rhs.rows_inserted),
+            rows_updated: self.rows_updated.saturating_add(rhs.rows_updated),
+            rows_deleted: self.rows_deleted.saturating_add(rhs.rows_deleted),
+            rows_copied: self.rows_copied.saturating_add(rhs.rows_copied),
+            tables_created: self.tables_created.saturating_add(rhs.tables_created),
+            tables_dropped: self.tables_dropped.saturating_add(rhs.tables_dropped),
+            ddl_commands: self.ddl_commands.saturating_add(rhs.ddl_commands),
+            dml_commands: self.dml_commands.saturating_add(rhs.dml_commands),
         }
     }
 }
@@ -113,5 +146,70 @@ impl Default for Stats {
             last_sent: 0,
             last_received: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_idle_xact_timeouts_propagate_to_pool() {
+        let pool = PoolCounts {
+            idle_xact_timeouts: 2,
+            ..Default::default()
+        };
+        let server = Counts {
+            idle_xact_timeouts: 3,
+            ..Default::default()
+        };
+
+        assert_eq!((pool + server).idle_xact_timeouts, 5);
+    }
+
+    #[test]
+    fn test_statement_metrics_propagate_to_pool() {
+        let server = Counts {
+            rows_copied: 10,
+            tables_created: 1,
+            tables_dropped: 2,
+            ddl_commands: 3,
+            dml_commands: 4,
+            ..Default::default()
+        };
+
+        let pool = PoolCounts::default() + server;
+        assert_eq!(pool.rows_copied, 10);
+        assert_eq!(pool.tables_created, 1);
+        assert_eq!(pool.tables_dropped, 2);
+        assert_eq!(pool.ddl_commands, 3);
+        assert_eq!(pool.dml_commands, 4);
+    }
+
+    #[test]
+    fn test_statement_metrics_add() {
+        let left = Counts {
+            rows_copied: 10,
+            tables_created: 1,
+            tables_dropped: 2,
+            ddl_commands: 3,
+            dml_commands: 4,
+            ..Default::default()
+        };
+        let right = Counts {
+            rows_copied: 5,
+            tables_created: 2,
+            tables_dropped: 3,
+            ddl_commands: 4,
+            dml_commands: 5,
+            ..Default::default()
+        };
+
+        let total = left + right;
+        assert_eq!(total.rows_copied, 15);
+        assert_eq!(total.tables_created, 3);
+        assert_eq!(total.tables_dropped, 5);
+        assert_eq!(total.ddl_commands, 7);
+        assert_eq!(total.dml_commands, 9);
     }
 }

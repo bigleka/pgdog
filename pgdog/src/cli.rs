@@ -1,41 +1,40 @@
-use std::ops::Deref;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use std::fs::read_to_string;
-use thiserror::Error;
-use tokio::time::sleep;
-use tokio::{select, signal::ctrl_c};
-use tracing::{info, warn};
+use tracing::info;
 
+use crate::api::resharding::ReshardTask;
+use crate::api::schema_sync::{SchemaSyncPhase, SchemaSyncTask};
+use crate::api::task::TaskError;
+use crate::api::{MigrationError, run_task};
 use crate::backend::databases::databases;
-use crate::backend::replication::orchestrator::Orchestrator;
+use crate::backend::replication::logical::Error::ReplicationAborted;
+use crate::backend::replication::resharding_state::ReshardingState;
 use crate::backend::schema::sync::config::ShardConfig;
-use crate::backend::schema::sync::pg_dump::SyncState;
-use crate::config::{Config, Users};
+use crate::frontend::comms::comms;
 use crate::frontend::router::cli::RouterCli;
+use pgdog_stats::Databases;
 
 /// PgDog is a PostgreSQL pooler, proxy, load balancer and query router.
 #[derive(Parser, Debug)]
 #[command(name = "", version = concat!("PgDog v", env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"))]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Path to the configuration file. Default: "pgdog.toml"
     #[arg(short, long, default_value = "pgdog.toml")]
-    pub config: PathBuf,
+    pub(crate) config: PathBuf,
     /// Path to the users.toml file. Default: "users.toml"
     #[arg(short, long, default_value = "users.toml")]
-    pub users: PathBuf,
+    pub(crate) users: PathBuf,
     /// Connection URL.
     #[arg(short, long)]
-    pub database_url: Option<Vec<String>>,
+    pub(crate) database_url: Option<Vec<String>>,
     /// Subcommand.
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub(crate) command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
-pub enum Commands {
+pub(crate) enum Commands {
     /// Start PgDog.
     Run {
         /// Size of the connection pool.
@@ -56,14 +55,6 @@ pub enum Commands {
     Hash {
         /// The plaintext password to hash.
         password: String,
-    },
-
-    /// Fingerprint a query.
-    Fingerprint {
-        #[arg(short, long)]
-        query: Option<String>,
-        #[arg(short, long)]
-        path: Option<PathBuf>,
     },
 
     /// Execute the router on the queries.
@@ -99,11 +90,11 @@ pub enum Commands {
         #[arg(long)]
         to_database: String,
 
-        /// Replicate or copy data over.
+        /// Only replicate; skip the initial data copy.
         #[arg(long, default_value = "false")]
         replicate_only: bool,
 
-        /// Replicate or copy data over.
+        /// Only copy data and synchronize tables; skip replication and cutover.
         #[arg(long, default_value = "false")]
         sync_only: bool,
 
@@ -111,7 +102,7 @@ pub enum Commands {
         #[arg(long)]
         replication_slot: Option<String>,
 
-        /// Don't perform pre-data schema sync.
+        /// Don't perform pre-data or post-data schema sync.
         #[arg(long)]
         skip_schema_sync: bool,
     },
@@ -133,17 +124,27 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Ignore errors.
+        /// Ignore errors for any phase. Post-data ignores errors by default.
         #[arg(long)]
         ignore_errors: bool,
 
-        /// Data sync has been complete.
-        #[arg(long)]
+        #[arg(
+            long,
+            value_enum,
+            help = "Schema sync phase to run.",
+            default_value_t = SchemaSyncPhase::Pre,
+            conflicts_with_all = ["data_sync_complete", "cutover", "validation"]
+        )]
+        phase: SchemaSyncPhase,
+
+        #[arg(long, hide = true, conflicts_with_all = ["cutover", "validation"])]
         data_sync_complete: bool,
 
-        /// Execute cutover statements.
-        #[arg(long)]
+        #[arg(long, hide = true, conflicts_with = "validation")]
         cutover: bool,
+
+        #[arg(long, hide = true)]
+        validation: bool,
     },
 
     /// For testing purposes only.
@@ -183,7 +184,7 @@ pub enum Commands {
 
 /// Generate and print a SCRAM-SHA-256 hash from a plaintext password.
 #[allow(clippy::print_stdout)]
-pub fn hash_password(password: &str) {
+pub(crate) fn hash_password(password: &str) {
     use rand::Rng;
 
     let salt: [u8; 16] = rand::rng().random();
@@ -194,93 +195,10 @@ pub fn hash_password(password: &str) {
     );
 }
 
-/// Fingerprint some queries.
-#[allow(clippy::print_stdout)]
-pub fn fingerprint(
-    query: Option<String>,
-    path: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(query) = query {
-        let fingerprint = pg_query::fingerprint(&query)?;
-        println!("{} [{}]", fingerprint.hex, fingerprint.value);
-    } else if let Some(path) = path {
-        let queries = read_to_string(path)?;
-        for query in queries.split(";") {
-            if query.trim().is_empty() {
-                continue;
-            }
-            tracing::debug!("{}", query);
-            if let Ok(fingerprint) = pg_query::fingerprint(query) {
-                println!(
-                    r#"
-[[manual_query]]
-fingerprint = "{}" #[{}]"#,
-                    fingerprint.hex, fingerprint.value
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigCheckError {
-    #[error("need at least one of --config or --users")]
-    MissingInput,
-
-    #[error("I/O error on `{0}`: {1}")]
-    Io(PathBuf, #[source] std::io::Error),
-
-    #[error("TOML parse error in `{0}`: {1}")]
-    Parse(PathBuf, #[source] toml::de::Error),
-
-    #[error("{0:#?}")]
-    Multiple(Vec<ConfigCheckError>),
-}
-
-/// Confirm that the configuration and users files are valid.
-pub fn config_check(
-    config_path: Option<PathBuf>,
-    users_path: Option<PathBuf>,
-) -> Result<(), ConfigCheckError> {
-    if config_path.is_none() && users_path.is_none() {
-        return Err(ConfigCheckError::MissingInput);
-    }
-
-    let mut errors: Vec<ConfigCheckError> = Vec::new();
-
-    if let Some(path) = config_path {
-        match read_to_string(&path) {
-            Ok(s) => {
-                if let Err(e) = toml::from_str::<Config>(&s) {
-                    errors.push(ConfigCheckError::Parse(path.clone(), e));
-                }
-            }
-            Err(e) => errors.push(ConfigCheckError::Io(path.clone(), e)),
-        }
-    }
-
-    if let Some(path) = users_path {
-        match read_to_string(&path) {
-            Ok(s) => {
-                if let Err(e) = toml::from_str::<Users>(&s) {
-                    errors.push(ConfigCheckError::Parse(path.clone(), e));
-                }
-            }
-            Err(e) => errors.push(ConfigCheckError::Io(path.clone(), e)),
-        }
-    }
-
-    match errors.len() {
-        0 => Ok(()),
-        1 => Err(errors.into_iter().next().unwrap()),
-        _ => Err(ConfigCheckError::Multiple(errors)),
-    }
-}
-
 /// FOR TESTING PURPOSES ONLY.
-pub async fn replicate_and_cutover(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn replicate_and_cutover(
+    commands: Commands,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::ReplicateAndCutover {
         from_database,
         to_database,
@@ -288,22 +206,26 @@ pub async fn replicate_and_cutover(commands: Commands) -> Result<(), Box<dyn std
         replication_slot,
     } = commands
     {
-        let mut orchestrator = Orchestrator::new(
-            &from_database,
-            &to_database,
-            &publication,
-            replication_slot.clone(),
-        )?;
+        let state = ReshardingState::builder()
+            .source(&from_database)
+            .destination(&to_database)
+            .publication(&publication)
+            .maybe_replication_slot(replication_slot.clone())
+            .build()?;
 
-        orchestrator.replicate_and_cutover().await?;
+        run_task(
+            ReshardTask::builder()
+                .state(state)
+                .auto_cutover(true)
+                .build(),
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-pub async fn data_sync(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::backend::replication::logical::Error;
-
+pub(crate) async fn data_sync(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::DataSync {
         from_database,
         to_database,
@@ -314,102 +236,80 @@ pub async fn data_sync(commands: Commands) -> Result<(), Box<dyn std::error::Err
         skip_schema_sync,
     } = commands
     {
-        let mut orchestrator = Orchestrator::new(
-            &from_database,
-            &to_database,
-            &publication,
-            replication_slot.clone(),
-        )?;
-        orchestrator.load_schema().await?;
+        let state = ReshardingState::builder()
+            .source(&from_database)
+            .destination(&to_database)
+            .publication(&publication)
+            .maybe_replication_slot(replication_slot)
+            .build()?;
 
-        if !skip_schema_sync {
-            orchestrator.schema_sync_pre(true).await?;
+        let result = run_task(
+            ReshardTask::builder()
+                .state(state)
+                .skip_schema_sync(skip_schema_sync)
+                .replicate_only(replicate_only)
+                .sync_only(sync_only)
+                .build(),
+        )
+        .await;
+
+        if let Err(TaskError::Failed(MigrationError::Replication(ReplicationAborted))) = result
+            && comms().offline()
+        {
+            // pgdog is shutting down, that's why the replication process is aborted.
+            // Consider this as a success replication and other errors as fail.
+            info!("replication stopped due to shutdown");
+        } else {
+            result?;
         }
-
-        if !replicate_only {
-            select! {
-                result = orchestrator.data_sync() => {
-                    result?;
-                }
-
-                _ = ctrl_c() => {
-                    warn!("abort signal received, waiting 5 seconds and performing cleanup");
-                    sleep(Duration::from_secs(5)).await;
-
-                    orchestrator.cleanup().await?;
-
-                    return Err(Error::DataSyncAborted.into());
-                }
-            }
-        }
-
-        if !sync_only {
-            let mut waiter = orchestrator.replicate().await?;
-
-            select! {
-                result = waiter.wait() => {
-                    result?;
-                }
-
-                _ = ctrl_c() => {
-                    warn!("abort signal received");
-
-                    orchestrator.request_stop().await;
-
-                    info!("waiting for replication to stop");
-
-                    waiter.wait().await?;
-                    orchestrator.cleanup().await?;
-
-                    return Err(Error::DataSyncAborted.into());
-                }
-            }
-        }
-    } else {
-        return Ok(());
     }
 
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
-pub async fn schema_sync(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
+fn legacy_phase(
+    data_sync_complete: bool,
+    cutover: bool,
+    validation: bool,
+) -> Option<SchemaSyncPhase> {
+    if data_sync_complete {
+        Some(SchemaSyncPhase::Post)
+    } else if cutover {
+        Some(SchemaSyncPhase::Cutover)
+    } else if validation {
+        Some(SchemaSyncPhase::PostDataValidation)
+    } else {
+        None
+    }
+}
+
+pub(crate) async fn schema_sync(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::SchemaSync {
         from_database,
         to_database,
         publication,
         dry_run,
         ignore_errors,
+        phase,
         data_sync_complete,
         cutover,
+        validation,
     } = commands
     {
-        let mut orchestrator = Orchestrator::new(&from_database, &to_database, &publication, None)?;
-        orchestrator.load_schema().await?;
-
-        if dry_run {
-            let state = if data_sync_complete {
-                SyncState::PostData
-            } else if cutover {
-                SyncState::Cutover
-            } else {
-                SyncState::PreData
-            };
-
-            let schema = orchestrator.schema()?;
-            for statement in schema.statements(state)? {
-                println!("{}", statement.deref());
-            }
-            return Ok(());
-        }
-
-        if data_sync_complete {
-            orchestrator.schema_sync_post(ignore_errors).await?;
-        } else if cutover {
-            orchestrator.schema_sync_cutover(ignore_errors).await?;
-        } else {
-            orchestrator.schema_sync_pre(ignore_errors).await?;
-        }
+        let phase = legacy_phase(data_sync_complete, cutover, validation).unwrap_or(phase);
+        run_task(
+            SchemaSyncTask::builder()
+                .databases(Databases {
+                    source: from_database,
+                    destination: to_database,
+                })
+                .publication(publication)
+                .phase(phase)
+                .ignore_errors(ignore_errors || phase == SchemaSyncPhase::Post)
+                .dry_run(dry_run)
+                .build(),
+        )
+        .await?;
     } else {
         return Ok(());
     }
@@ -417,7 +317,7 @@ pub async fn schema_sync(commands: Commands) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-pub async fn setup(database: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn setup(database: &str) -> Result<(), Box<dyn std::error::Error>> {
     let databases = databases();
     let schema_owner = databases.schema_owner(database)?;
 
@@ -426,7 +326,7 @@ pub async fn setup(database: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn route(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn route(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
     if let Commands::Route {
         user,
         database,
@@ -463,5 +363,61 @@ mod test {
                 env!("GIT_HASH")
             ))
         );
+    }
+
+    mod schema_sync {
+        use crate::cli::*;
+
+        fn parse(args: &[&str]) -> Result<SchemaSyncPhase, clap::Error> {
+            let mut argv = vec![
+                "pgdog",
+                "schema-sync",
+                "--from-database",
+                "a",
+                "--to-database",
+                "b",
+                "--publication",
+                "p",
+            ];
+            argv.extend_from_slice(args);
+
+            let Some(Commands::SchemaSync {
+                phase,
+                data_sync_complete,
+                cutover,
+                validation,
+                ..
+            }) = Cli::try_parse_from(argv)?.command
+            else {
+                panic!("not a schema sync command");
+            };
+
+            Ok(legacy_phase(data_sync_complete, cutover, validation).unwrap_or(phase))
+        }
+
+        #[test]
+        fn test_phase_flags() {
+            for (args, expected) in [
+                (vec![], Some(SchemaSyncPhase::Pre)),
+                (vec!["--phase", "post"], Some(SchemaSyncPhase::Post)),
+                (vec!["--phase", "cutover"], Some(SchemaSyncPhase::Cutover)),
+                (
+                    vec!["--phase", "post-data-validation"],
+                    Some(SchemaSyncPhase::PostDataValidation),
+                ),
+                (vec!["--data-sync-complete"], Some(SchemaSyncPhase::Post)),
+                (vec!["--cutover"], Some(SchemaSyncPhase::Cutover)),
+                (
+                    vec!["--validation"],
+                    Some(SchemaSyncPhase::PostDataValidation),
+                ),
+                (vec!["--phase", "bogus"], None),
+                (vec!["--phase", "post", "--cutover"], None),
+                (vec!["--cutover", "--validation"], None),
+                (vec!["--data-sync-complete", "--validation"], None),
+            ] {
+                assert_eq!(parse(&args).ok(), expected, "{args:?}");
+            }
+        }
     }
 }

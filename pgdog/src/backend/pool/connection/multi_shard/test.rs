@@ -1,6 +1,9 @@
 use crate::{
-    frontend::router::parser::{Shard, ShardWithPriority},
-    net::{DataRow, Field},
+    frontend::router::parser::{
+        DistinctBy, OrderBy, Shard, ShardWithPriority,
+        rewrite::statement::projection::{OrderByHelper, OrderBySource, ProjectionRewritePlan},
+    },
+    net::{BindComplete, DataRow, Field, Format, NoData},
 };
 
 use super::*;
@@ -8,18 +11,18 @@ use super::*;
 #[test]
 fn test_inconsistent_row_descriptions() {
     let route = Route::default();
-    let mut multi_shard = MultiShard::new(vec![0, 1], &route);
+    let mut multi_shard = MultiShard::new(2, &route);
 
     // Create two different row descriptions
     let rd1 = RowDescription::new(&[Field::text("name"), Field::bigint("id")]);
     let rd2 = RowDescription::new(&[Field::text("name")]); // Missing column
 
     // First row description should be processed successfully
-    let result = multi_shard.forward(rd1.message().unwrap()).unwrap();
+    let result = multi_shard.handle_server_message(rd1.message()).unwrap();
     assert!(result.is_none()); // Not forwarded until all shards respond
 
     // Second inconsistent row description should cause an error
-    let result = multi_shard.forward(rd2.message().unwrap());
+    let result = multi_shard.handle_server_message(rd2.message());
     assert!(result.is_err());
 
     if let Err(error) = result {
@@ -32,11 +35,11 @@ fn test_inconsistent_row_descriptions() {
 #[test]
 fn test_inconsistent_data_rows() {
     let route = Route::default();
-    let mut multi_shard = MultiShard::new(vec![0, 1], &route);
+    let mut multi_shard = MultiShard::new(2, &route);
 
     // Set up row description first
     let rd = RowDescription::new(&[Field::text("name"), Field::bigint("id")]);
-    multi_shard.forward(rd.message().unwrap()).unwrap();
+    multi_shard.handle_server_message(rd.message()).unwrap();
 
     // Create data rows with different column counts
     let mut dr1 = DataRow::new();
@@ -46,11 +49,11 @@ fn test_inconsistent_data_rows() {
     dr2.add("only_name"); // Missing id column
 
     // First data row should be processed successfully
-    let result = multi_shard.forward(dr1.message().unwrap()).unwrap();
+    let result = multi_shard.handle_server_message(dr1.message()).unwrap();
     assert!(result.is_none()); // Buffered, not forwarded immediately
 
     // Second inconsistent data row should cause an error
-    let result = multi_shard.forward(dr2.message().unwrap());
+    let result = multi_shard.handle_server_message(dr2.message());
     assert!(result.is_err());
 
     if let Err(error) = result {
@@ -61,9 +64,83 @@ fn test_inconsistent_data_rows() {
 }
 
 #[test]
+fn test_order_by_helper_after_star_expansion_is_dropped_after_sorting() {
+    let mut plan = ProjectionRewritePlan::default();
+    plan.order_by_helpers.push(OrderByHelper {
+        sort_position: 0,
+        source: OrderBySource::Column("price".into()),
+        alias: "__pgdog_order_col0".into(),
+        injected: true,
+    });
+    let mut route = Route::select(
+        ShardWithPriority::new_default_unset(Shard::All),
+        vec![OrderBy::AscColumn("__pgdog_order_col0".into())],
+        Default::default(),
+        Default::default(),
+        None,
+    );
+    route.projection_rewrite_plan = Some(std::sync::Arc::new(plan));
+    let mut multi_shard = MultiShard::new(2, &route);
+
+    let row_description = RowDescription::new(&[
+        Field::bigint("id"),
+        Field::text("value"),
+        Field::timestamp("created_at"),
+        Field::bigint("__pgdog_order_col0"),
+    ]);
+    assert!(
+        multi_shard
+            .handle_server_message(row_description.message())
+            .unwrap()
+            .is_none()
+    );
+    let client_description = multi_shard
+        .handle_server_message(row_description.message())
+        .unwrap()
+        .unwrap();
+    let client_description = RowDescription::from_bytes(client_description.to_bytes()).unwrap();
+    assert_eq!(
+        client_description
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "value", "created_at"]
+    );
+
+    let mut first = DataRow::new();
+    first
+        .add(1_i64)
+        .add("first")
+        .add("2026-01-01 00:00:00")
+        .add(20_i64);
+    let mut second = DataRow::new();
+    second
+        .add(2_i64)
+        .add("second")
+        .add("2026-01-02 00:00:00")
+        .add(10_i64);
+    multi_shard.handle_server_message(first.message()).unwrap();
+    multi_shard.handle_server_message(second.message()).unwrap();
+
+    for _ in 0..2 {
+        multi_shard
+            .handle_server_message(CommandComplete::from_str("SELECT 1").message())
+            .unwrap();
+    }
+
+    for expected in [2_i64, 1_i64] {
+        let message = multi_shard.get_server_message().unwrap();
+        let row = DataRow::from_bytes(message.to_bytes()).unwrap();
+        assert_eq!(row.len(), 3);
+        assert_eq!(row.get::<i64>(0, Format::Text).unwrap(), expected);
+    }
+}
+
+#[test]
 fn test_rd_before_dr() {
     let mut multi_shard = MultiShard::new(
-        vec![0, 1, 2],
+        3,
         &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
     );
     let rd = RowDescription::new(&[Field::bigint("id")]);
@@ -71,120 +148,167 @@ fn test_rd_before_dr() {
     dr.add(1i64);
     for _ in 0..2 {
         let result = multi_shard
-            .forward(rd.message().unwrap().backend(BackendKeyData::default()))
+            .handle_server_message(rd.message().backend(BackendPid::for_test(1)))
             .unwrap();
         assert!(result.is_none()); // dropped
         let result = multi_shard
-            .forward(dr.message().unwrap().backend(BackendKeyData::default()))
+            .handle_server_message(dr.message().backend(BackendPid::for_test(1)))
             .unwrap();
         assert!(result.is_none()); // buffered.
     }
 
-    let result = multi_shard.forward(rd.message().unwrap()).unwrap();
-    assert_eq!(result, Some(rd.message().unwrap()));
-    let result = multi_shard.message();
+    let result = multi_shard.handle_server_message(rd.message()).unwrap();
+    assert_eq!(result, Some(rd.message()));
+    let result = multi_shard.get_server_message();
     // Waiting for command complete
     assert!(result.is_none());
 
     for _ in 0..3 {
         let result = multi_shard
-            .forward(
+            .handle_server_message(
                 CommandComplete::from_str("SELECT 1")
                     .message()
-                    .unwrap()
-                    .backend(BackendKeyData::default()),
+                    .backend(BackendPid::for_test(1)),
             )
             .unwrap();
         assert!(result.is_none());
     }
 
     for _ in 0..2 {
-        let result = multi_shard.message();
-        let id = BackendKeyData::default();
+        let result = multi_shard.get_server_message();
+        let id = BackendPid::for_test(1);
         assert_eq!(
             result.map(|m| m.backend(id)),
-            Some(dr.message().unwrap().backend(id))
+            Some(dr.message().backend(id))
         );
     }
 
     let result = multi_shard
-        .message()
-        .map(|m| m.backend(BackendKeyData::default()));
+        .get_server_message()
+        .map(|m| m.backend(BackendPid::for_test(1)));
     assert_eq!(
         result,
         Some(
             CommandComplete::from_str("SELECT 3")
                 .message()
-                .unwrap()
-                .backend(BackendKeyData::default())
+                .backend(BackendPid::for_test(1))
         )
     );
 
     // Buffer is empty.
-    assert!(multi_shard.message().is_none());
+    assert!(multi_shard.get_server_message().is_none());
+}
+
+#[test]
+fn test_distinct_state_resets_between_requests() {
+    let route = Route::select(
+        ShardWithPriority::new_default_unset(Shard::All),
+        vec![],
+        Default::default(),
+        Default::default(),
+        Some(DistinctBy::Row),
+    );
+    let mut multi_shard = MultiShard::new(2, &route);
+    let row_description = RowDescription::new(&[Field::bigint("id")]);
+    let mut data_row = DataRow::new();
+    data_row.add(1_i64);
+
+    // The same DISTINCT query returning the same row in consecutive requests must
+    // produce the row both times. Deduplication state is scoped to one request.
+    for request in 1..=2 {
+        for _ in 0..2 {
+            multi_shard
+                .handle_server_message(row_description.message())
+                .unwrap();
+            multi_shard
+                .handle_server_message(data_row.message())
+                .unwrap();
+            multi_shard
+                .handle_server_message(CommandComplete::from_str("SELECT 1").message())
+                .unwrap();
+        }
+
+        let message = multi_shard
+            .get_server_message()
+            .unwrap_or_else(|| panic!("request {request} should return its distinct row"));
+        assert_eq!(message.code(), 'D', "request {request}");
+
+        let row = DataRow::from_bytes(message.to_bytes()).unwrap();
+        assert_eq!(row.get::<i64>(0, Format::Text).unwrap(), 1);
+
+        let message = multi_shard
+            .get_server_message()
+            .unwrap_or_else(|| panic!("request {request} should return CommandComplete"));
+        let complete = CommandComplete::from_bytes(message.to_bytes()).unwrap();
+        assert_eq!(complete.rows().unwrap(), Some(1), "request {request}");
+        assert!(multi_shard.get_server_message().is_none());
+
+        multi_shard.query_complete();
+    }
 }
 
 #[test]
 fn test_ready_for_query_error_preservation() {
     let route = Route::default();
-    let mut multi_shard = MultiShard::new(vec![0, 1], &route);
+    let mut multi_shard = MultiShard::new(2, &route);
 
     // Create ReadyForQuery messages - one with transaction error, one normal
     let rfq_error = ReadyForQuery::error();
     let rfq_normal = ReadyForQuery::in_transaction(false);
 
     // Forward first ReadyForQuery message with error state
-    let result = multi_shard.forward(rfq_error.message().unwrap()).unwrap();
+    let result = multi_shard
+        .handle_server_message(rfq_error.message())
+        .unwrap();
     assert!(result.is_none()); // Should not be forwarded yet (waiting for second shard)
 
     // Forward second normal ReadyForQuery message
-    let result = multi_shard.forward(rfq_normal.message().unwrap()).unwrap();
+    let result = multi_shard
+        .handle_server_message(rfq_normal.message())
+        .unwrap();
 
     // Should return the error message, not the normal one
     assert!(result.is_some());
     let returned_message = result.unwrap();
-    let returned_rfq = ReadyForQuery::from_bytes(returned_message.to_bytes().unwrap()).unwrap();
+    let returned_rfq = ReadyForQuery::from_bytes(returned_message.to_bytes()).unwrap();
     assert!(returned_rfq.is_transaction_aborted());
 }
 
 #[test]
 fn test_omni_command_complete_not_summed() {
     // For omni-sharded tables, we should NOT sum row counts across shards.
-    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All));
-    let mut multi_shard = MultiShard::new(vec![0, 1, 2], &route);
+    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All)).with_omnisharded(true);
+    let mut multi_shard = MultiShard::new(3, &route);
 
-    let backend1 = BackendKeyData::legacy(1, 1);
-    let backend2 = BackendKeyData::legacy(2, 2);
-    let backend3 = BackendKeyData::legacy(3, 3);
+    let backend1 = BackendPid::for_test(1);
+    let backend2 = BackendPid::for_test(2);
+    let backend3 = BackendPid::for_test(3);
 
     // All shards report UPDATE 5
     multi_shard
-        .forward(
+        .handle_server_message(
             CommandComplete::from_str("UPDATE 5")
                 .message()
-                .unwrap()
                 .backend(backend1),
         )
         .unwrap();
     multi_shard
-        .forward(
+        .handle_server_message(
             CommandComplete::from_str("UPDATE 5")
                 .message()
-                .unwrap()
                 .backend(backend2),
         )
         .unwrap();
     multi_shard
-        .forward(
+        .handle_server_message(
             CommandComplete::from_str("UPDATE 5")
                 .message()
-                .unwrap()
                 .backend(backend3),
         )
         .unwrap();
 
-    let result = multi_shard.message();
-    let cc = CommandComplete::from_bytes(result.unwrap().to_bytes().unwrap()).unwrap();
+    let result = multi_shard.get_server_message();
+    let cc = CommandComplete::from_bytes(result.unwrap().to_bytes()).unwrap();
     // Should be 5 (from one shard), not 15 (sum of all shards)
     assert_eq!(cc.rows().unwrap(), Some(5));
 }
@@ -192,34 +316,32 @@ fn test_omni_command_complete_not_summed() {
 #[test]
 fn test_omni_command_complete_uses_first_shard_row_count() {
     // For omni, we use the first shard's row count for consistency with DataRow behavior.
-    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All));
-    let mut multi_shard = MultiShard::new(vec![0, 1], &route);
+    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All)).with_omnisharded(true);
+    let mut multi_shard = MultiShard::new(2, &route);
 
-    let backend1 = BackendKeyData::legacy(1, 1);
-    let backend2 = BackendKeyData::legacy(2, 2);
+    let backend1 = BackendPid::for_test(1);
+    let backend2 = BackendPid::for_test(2);
 
     // First shard reports 7 rows
     multi_shard
-        .forward(
+        .handle_server_message(
             CommandComplete::from_str("UPDATE 7")
                 .message()
-                .unwrap()
                 .backend(backend1),
         )
         .unwrap();
 
     // Second shard reports 9 rows (different, to distinguish first vs last)
     multi_shard
-        .forward(
+        .handle_server_message(
             CommandComplete::from_str("UPDATE 9")
                 .message()
-                .unwrap()
                 .backend(backend2),
         )
         .unwrap();
 
-    let result = multi_shard.message();
-    let cc = CommandComplete::from_bytes(result.unwrap().to_bytes().unwrap()).unwrap();
+    let result = multi_shard.get_server_message();
+    let cc = CommandComplete::from_bytes(result.unwrap().to_bytes()).unwrap();
     // Should be 7 (from FIRST shard), not 9 (from last)
     assert_eq!(cc.rows().unwrap(), Some(7));
 }
@@ -227,19 +349,19 @@ fn test_omni_command_complete_uses_first_shard_row_count() {
 #[test]
 fn test_omni_data_rows_only_from_first_server() {
     // For omni-sharded tables with RETURNING, only forward DataRows from the first server.
-    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All));
-    let mut multi_shard = MultiShard::new(vec![0, 1], &route);
+    let route = Route::write(ShardWithPriority::new_table_omni(Shard::All)).with_omnisharded(true);
+    let mut multi_shard = MultiShard::new(2, &route);
 
-    let backend1 = BackendKeyData::legacy(1, 1);
-    let backend2 = BackendKeyData::legacy(2, 2);
+    let backend1 = BackendPid::for_test(1);
+    let backend2 = BackendPid::for_test(2);
 
     // Setup: send RowDescription from both shards
     let rd = RowDescription::new(&[Field::bigint("id")]);
     multi_shard
-        .forward(rd.message().unwrap().backend(backend1))
+        .handle_server_message(rd.message().backend(backend1))
         .unwrap();
     let rd_result = multi_shard
-        .forward(rd.message().unwrap().backend(backend2))
+        .handle_server_message(rd.message().backend(backend2))
         .unwrap();
     assert!(rd_result.is_some()); // RowDescription forwarded after all shards
 
@@ -247,7 +369,7 @@ fn test_omni_data_rows_only_from_first_server() {
     let mut dr1 = DataRow::new();
     dr1.add(100_i64);
     let result = multi_shard
-        .forward(dr1.message().unwrap().backend(backend1))
+        .handle_server_message(dr1.message().backend(backend1))
         .unwrap();
     assert!(result.is_some()); // Should be forwarded
 
@@ -255,7 +377,7 @@ fn test_omni_data_rows_only_from_first_server() {
     let mut dr2 = DataRow::new();
     dr2.add(200_i64);
     let result = multi_shard
-        .forward(dr2.message().unwrap().backend(backend2))
+        .handle_server_message(dr2.message().backend(backend2))
         .unwrap();
     assert!(result.is_none()); // Should be dropped
 
@@ -263,7 +385,137 @@ fn test_omni_data_rows_only_from_first_server() {
     let mut dr3 = DataRow::new();
     dr3.add(101_i64);
     let result = multi_shard
-        .forward(dr3.message().unwrap().backend(backend1))
+        .handle_server_message(dr3.message().backend(backend1))
         .unwrap();
     assert!(result.is_some()); // Should be forwarded
+}
+
+/// Statements pipelined in one exchange each get their own RowDescription,
+/// and they may describe different result sets.
+#[test]
+fn test_pipelined_describe_forwards_every_group() {
+    for shards in [1, 2] {
+        let mut multi_shard = MultiShard::new(
+            shards,
+            &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
+        );
+
+        let id = RowDescription::new(&[Field::bigint("id")]);
+        let name = RowDescription::new(&[Field::text("name"), Field::bigint("id")]);
+        let mut forwarded = vec![];
+
+        for description in [&id, &name] {
+            for _ in 0..shards {
+                if let Some(message) = multi_shard
+                    .handle_server_message(description.message())
+                    .unwrap()
+                {
+                    forwarded.push(message);
+                }
+            }
+        }
+
+        assert_eq!(
+            forwarded,
+            vec![id.message(), name.message()],
+            "{shards} shard(s)",
+        );
+    }
+}
+
+/// Each Bind in a pipelined exchange decides the wire format of its own rows,
+/// and a server RowDescription must not take that over.
+#[test]
+fn test_bind_result_formats_apply_per_statement() {
+    let mut multi_shard = MultiShard::new(
+        2,
+        &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
+    );
+
+    let binary = Bind::new_params_codes_results("b1", &[], &[], &[1]);
+    let text = Bind::new_statement("b2");
+    let rd = RowDescription::new(&[Field::bigint("id")]);
+
+    multi_shard.push_bind(&binary);
+    multi_shard.push_bind(&text);
+
+    for _ in 0..2 {
+        multi_shard
+            .handle_server_message(BindComplete.message())
+            .unwrap();
+    }
+    for _ in 0..2 {
+        multi_shard.handle_server_message(rd.message()).unwrap();
+    }
+    assert_eq!(multi_shard.decoder.get_format(0), Format::Binary);
+
+    // The second statement asked for no formats.
+    for _ in 0..2 {
+        multi_shard
+            .handle_server_message(BindComplete.message())
+            .unwrap();
+    }
+    for _ in 0..2 {
+        multi_shard.handle_server_message(rd.message()).unwrap();
+    }
+    assert_eq!(multi_shard.decoder.get_format(0), Format::Text);
+}
+
+/// Rows are decoded with the columns PgDog asked for itself,
+/// and the client only sees the descriptions it asked for.
+#[test]
+fn test_descriptions_pgdog_asked_for_are_not_forwarded() {
+    let mut multi_shard = MultiShard::new(
+        2,
+        &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
+    );
+    multi_shard.set_describes(VecDeque::from([
+        DescribedBy::Client,
+        DescribedBy::PgDog,
+        DescribedBy::PgDog,
+    ]));
+
+    let statement = RowDescription::new(&[Field::text("id")]);
+    let portal = RowDescription::new(&[Field::bigint("id")]);
+    let mut forwarded = vec![];
+
+    for message in [statement.message(), portal.message(), NoData.message()] {
+        for _ in 0..2 {
+            if let Some(message) = multi_shard.handle_server_message(message.clone()).unwrap() {
+                forwarded.push(message);
+            }
+        }
+    }
+
+    assert_eq!(forwarded, vec![statement.message()]);
+    assert_eq!(multi_shard.decoder.row_description(), &portal);
+    assert!(multi_shard.describes.is_empty());
+}
+
+/// A Bind that never completed is dropped at ReadyForQuery, so the next
+/// exchange cannot pop it and type its rows after the wrong statement.
+#[test]
+fn test_ready_for_query_drops_pending_binds() {
+    let mut multi_shard = MultiShard::new(
+        2,
+        &Route::read(ShardWithPriority::new_default_unset(Shard::All)),
+    );
+
+    multi_shard.push_bind(&Bind::new_statement("b1"));
+    multi_shard.push_bind(&Bind::new_statement("b2"));
+
+    // Only the first statement binds. The second is abandoned.
+    for _ in 0..2 {
+        multi_shard
+            .handle_server_message(BindComplete.message())
+            .unwrap();
+    }
+    assert_eq!(multi_shard.bound_statements.len(), 1);
+
+    for _ in 0..2 {
+        multi_shard
+            .handle_server_message(ReadyForQuery::idle().message())
+            .unwrap();
+    }
+    assert!(multi_shard.bound_statements.is_empty());
 }

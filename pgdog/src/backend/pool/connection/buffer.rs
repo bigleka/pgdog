@@ -1,4 +1,5 @@
-//! Buffer messages to sort and aggregate them later.
+//! Buffer messages to sort and aggregate them
+//! once we received all of them from the servers.
 
 use std::{
     cmp::Ordering,
@@ -7,14 +8,16 @@ use std::{
 
 use crate::{
     frontend::router::parser::{
-        rewrite::statement::aggregate::AggregateRewritePlan, Aggregate, DistinctBy, DistinctColumn,
-        Limit, OrderBy,
+        Aggregate, DistinctBy, DistinctColumn, Limit, OrderBy,
+        rewrite::statement::projection::ProjectionRewritePlan,
     },
     net::{
-        messages::{DataRow, FromBytes, Message, Protocol, ToBytes, Vector},
         Decoder,
+        messages::{DataRow, FromBytes, Message, Protocol, ToBytes, Vector},
     },
 };
+
+use pgdog_postgres_types::Datum;
 
 use super::Aggregates;
 
@@ -29,7 +32,7 @@ pub(super) struct Buffer {
 impl Buffer {
     /// Add message to buffer.
     pub(super) fn add(&mut self, message: Message) -> Result<(), super::Error> {
-        let dr = DataRow::from_bytes(message.to_bytes()?)?;
+        let dr = DataRow::from_bytes(message.to_bytes())?;
 
         self.buffer.push_back(dr);
 
@@ -38,39 +41,35 @@ impl Buffer {
 
     /// Mark the buffer as full. It will start returning messages now.
     /// Caller is responsible for sorting the buffer if needed.
-    pub(super) fn full(&mut self) {
+    pub(super) fn mark_full(&mut self) {
         self.full = true;
     }
 
-    pub(super) fn reset(&mut self) {
-        self.buffer.clear();
-        self.full = false;
-    }
-
-    /// Sort the buffer.
+    /// Sort the buffer in specified order, using the decoder to convert
+    /// Postgres column values to Rust values we can sort.
     pub(super) fn sort(&mut self, columns: &[OrderBy], decoder: &Decoder) {
         // Calculate column indices once, since
-        // fetching indices by name is O(number of columns).
+        // fetching indices by name is O (number of columns).
         let mut cols = vec![];
         for column in columns {
             match column {
                 OrderBy::Asc(_) => cols.push(column.clone()),
                 OrderBy::AscColumn(name) => {
-                    if let Some(index) = decoder.rd().field_index(name) {
+                    if let Some(index) = decoder.row_description().field_index(name) {
                         cols.push(OrderBy::Asc(index + 1));
                     }
                     // TODO: Error out instead of silently not sorting.
                 }
                 OrderBy::Desc(_) => cols.push(column.clone()),
                 OrderBy::DescColumn(name) => {
-                    if let Some(index) = decoder.rd().field_index(name) {
+                    if let Some(index) = decoder.row_description().field_index(name) {
                         cols.push(OrderBy::Desc(index + 1));
                     }
                     // TODO: Error out instead of silently not sorting.
                 }
                 OrderBy::AscVectorL2(_, _) => cols.push(column.clone()),
                 OrderBy::AscVectorL2Column(name, vector) => {
-                    if let Some(index) = decoder.rd().field_index(name) {
+                    if let Some(index) = decoder.row_description().field_index(name) {
                         cols.push(OrderBy::AscVectorL2(index + 1, vector.clone()));
                     }
                     // TODO: Error out instead of silently not sorting.
@@ -80,48 +79,50 @@ impl Buffer {
 
         // Sort rows.
         let order_by = move |a: &DataRow, b: &DataRow| -> Ordering {
-            for col in cols.iter() {
-                let index = col.index();
-                let asc = col.asc();
-                let index = if let Some(index) = index {
-                    index
-                } else {
-                    continue;
-                };
-                let left = a.get_column(index, decoder);
-                let right = b.get_column(index, decoder);
+            cols.iter()
+                .filter_map(|col| {
+                    let index = col.index();
+                    let asc = col.asc();
+                    let index = index?;
+                    let left = a.get_column(index, decoder);
+                    let right = b.get_column(index, decoder);
 
-                let ordering = match (left, right) {
-                    (Ok(Some(left)), Ok(Some(right))) => {
-                        // Handle the special vector case.
-                        if let OrderBy::AscVectorL2(_, vector) = col {
-                            let left: Option<Vector> = left.value.try_into().ok();
-                            let right: Option<Vector> = right.value.try_into().ok();
+                    match (left, right) {
+                        (Ok(Some(left)), Ok(Some(right))) => {
+                            // Handle the special vector case.
+                            if let OrderBy::AscVectorL2(_, vector) = col {
+                                let left: Option<Vector> = left.value.try_into().ok();
+                                let right: Option<Vector> = right.value.try_into().ok();
 
-                            if let (Some(left), Some(right)) = (left, right) {
-                                let left = left.distance_l2(vector);
-                                let right = right.distance_l2(vector);
+                                if let (Some(left), Some(right)) = (left, right) {
+                                    let left = left.distance_l2(vector);
+                                    let right = right.distance_l2(vector);
 
-                                left.partial_cmp(&right)
+                                    left.partial_cmp(&right)
+                                } else {
+                                    Some(Ordering::Equal)
+                                }
                             } else {
-                                Some(Ordering::Equal)
+                                // FIXME(sage): We don't handle ASC NULLS FIRST or
+                                // DESC NULLS LAST we should either error or add
+                                // support rather than silently do the wrong sorting
+                                match (&left.value, &right.value, asc) {
+                                    (Datum::Null, Datum::Null, _) => Some(Ordering::Equal),
+                                    (Datum::Null, _, true) => Some(Ordering::Greater),
+                                    (_, Datum::Null, true) => Some(Ordering::Less),
+                                    (Datum::Null, _, false) => Some(Ordering::Less),
+                                    (_, Datum::Null, false) => Some(Ordering::Greater),
+                                    (a, b, true) => a.partial_cmp(b),
+                                    (a, b, false) => b.partial_cmp(a),
+                                }
                             }
-                        } else if asc {
-                            left.value.partial_cmp(&right.value)
-                        } else {
-                            right.value.partial_cmp(&left.value)
                         }
+
+                        _ => Some(Ordering::Equal),
                     }
-
-                    _ => Some(Ordering::Equal),
-                };
-
-                if ordering != Some(Ordering::Equal) {
-                    return ordering.unwrap_or(Ordering::Equal);
-                }
-            }
-
-            Ordering::Equal
+                })
+                .reduce(Ordering::then)
+                .unwrap_or(Ordering::Equal)
         };
 
         self.buffer.make_contiguous().sort_by(order_by);
@@ -139,38 +140,34 @@ impl Buffer {
         &mut self,
         aggregate: &Aggregate,
         decoder: &Decoder,
-        plan: &AggregateRewritePlan,
+        plan: Option<&ProjectionRewritePlan>,
     ) -> Result<(), super::Error> {
         let buffer: VecDeque<DataRow> = std::mem::take(&mut self.buffer);
-        let mut rows = if aggregate.is_empty() {
+        let rows = if aggregate.is_empty() {
             buffer
+        } else if let Some(aggregates) = Aggregates::new(&buffer, decoder, aggregate, plan) {
+            aggregates.aggregate()?
         } else {
-            let aggregates = Aggregates::new(&buffer, decoder, aggregate, plan);
-            let result = aggregates.aggregate()?;
-
-            if result.is_empty() {
-                buffer
-            } else {
-                result
-            }
+            buffer
         };
 
-        Self::drop_helper_columns(&mut rows, plan);
         self.buffer = rows;
 
         Ok(())
     }
 
-    fn drop_helper_columns(rows: &mut VecDeque<DataRow>, plan: &AggregateRewritePlan) {
-        if plan.drop_columns().is_empty() {
+    pub(super) fn drop_helper_columns(
+        &mut self,
+        plan: Option<&ProjectionRewritePlan>,
+        decoder: &Decoder,
+    ) {
+        let Some(plan) = plan else {
             return;
-        }
+        };
 
-        let mut drop = plan.drop_columns().to_vec();
-        drop.sort_unstable();
-        drop.dedup();
+        let drop = plan.drop_columns(decoder.row_description());
 
-        for row in rows.iter_mut() {
+        for row in self.buffer.iter_mut() {
             row.drop_columns(&drop);
         }
     }
@@ -182,7 +179,7 @@ impl Buffer {
                     self.buffer.retain(|row| self.distinct.insert(row.clone()));
                 }
 
-                DistinctBy::Columns(ref columns) => {
+                DistinctBy::Columns(columns) => {
                     self.buffer.retain(|row| {
                         let mut dr = DataRow::new();
                         for col in columns {
@@ -194,10 +191,10 @@ impl Buffer {
                                 }
 
                                 DistinctColumn::Name(name) => {
-                                    if let Some(index) = decoder.rd().field_index(name) {
-                                        if let Some(data) = row.column(index) {
-                                            dr.add(data);
-                                        }
+                                    if let Some(index) = decoder.row_description().field_index(name)
+                                        && let Some(data) = row.column(index)
+                                    {
+                                        dr.add(data);
                                     }
                                 }
                             }
@@ -213,10 +210,15 @@ impl Buffer {
     /// Take messages from buffer.
     pub(super) fn take(&mut self) -> Option<Message> {
         if self.full {
-            self.buffer.pop_front().and_then(|s| s.message().ok())
+            self.buffer.pop_front().map(|s| s.message())
         } else {
             None
         }
+    }
+
+    /// The buffer holds rows the client can read now.
+    pub(super) fn can_take(&self) -> bool {
+        self.full && !self.is_empty()
     }
 
     /// Execute LIMIT ... OFFSET ...
@@ -233,9 +235,16 @@ impl Buffer {
         self.buffer.len()
     }
 
-    #[allow(dead_code)]
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Clear the buffer.
+    ///
+    /// Use this in case of an aggregation/sort/post-processing error. The data in the buffer
+    /// is not valid for client consumption.
+    pub(super) fn clear(&mut self) {
+        self.buffer.clear();
     }
 }
 
@@ -254,17 +263,17 @@ mod test {
         for i in 0..25_i64 {
             let mut dr = DataRow::new();
             dr.add(25 - i).add((25 - i).to_string());
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
 
         buf.sort(&columns, &decoder);
-        buf.full();
+        buf.mark_full();
 
         let mut i = 1;
         while let Some(message) = buf.take() {
-            let dr = DataRow::from_bytes(message.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(message.to_bytes()).unwrap();
             let one = dr.get::<i64>(0, Format::Text).unwrap();
             let two = dr.get::<String>(1, Format::Text).unwrap();
             assert_eq!(one, i);
@@ -284,16 +293,15 @@ mod test {
         for _ in 0..6 {
             let mut dr = DataRow::new();
             dr.add(15_i64);
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        buf.aggregate(&agg, &Decoder::from(&rd), &AggregateRewritePlan::default())
-            .unwrap();
-        buf.full();
+        buf.aggregate(&agg, &Decoder::from(rd), None).unwrap();
+        buf.mark_full();
 
         assert_eq!(buf.len(), 1);
         let row = buf.take().unwrap();
-        let dr = DataRow::from_bytes(row.to_bytes().unwrap()).unwrap();
+        let dr = DataRow::from_bytes(row.to_bytes()).unwrap();
         let count = dr.get::<i64>(0, Format::Text).unwrap();
         assert_eq!(count, 15 * 6);
     }
@@ -310,18 +318,17 @@ mod test {
                 let mut dr = DataRow::new();
                 dr.add(15_i64);
                 dr.add(email);
-                buf.add(dr.message().unwrap()).unwrap();
+                buf.add(dr.message()).unwrap();
             }
         }
 
-        buf.aggregate(&agg, &Decoder::from(&rd), &AggregateRewritePlan::default())
-            .unwrap();
-        buf.full();
+        buf.aggregate(&agg, &Decoder::from(rd), None).unwrap();
+        buf.mark_full();
 
         assert_eq!(buf.len(), 2);
         for _ in &emails {
             let row = buf.take().unwrap();
-            let dr = DataRow::from_bytes(row.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(row.to_bytes()).unwrap();
             let count = dr.get::<i64>(0, Format::Text).unwrap();
             assert_eq!(count, 15 * 6);
         }
@@ -345,13 +352,13 @@ mod test {
         for (i, ts) in timestamps.iter().enumerate() {
             let mut dr = DataRow::new();
             dr.add(ts.to_string()).add(format!("item_{}", i));
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
 
         buf.sort(&columns, &decoder);
-        buf.full();
+        buf.mark_full();
 
         // Verify timestamps are sorted
         let expected_order = [
@@ -364,7 +371,7 @@ mod test {
 
         for expected in expected_order {
             let message = buf.take().expect("Should have message");
-            let dr = DataRow::from_bytes(message.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(message.to_bytes()).unwrap();
             let ts = dr.get::<String>(0, Format::Text).unwrap();
             assert_eq!(ts, expected);
         }
@@ -385,13 +392,13 @@ mod test {
         for (i, price) in prices.iter().enumerate() {
             let mut dr = DataRow::new();
             dr.add(price.to_string()).add(format!("product_{}", i));
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
 
         buf.sort(&columns, &decoder);
-        buf.full();
+        buf.mark_full();
 
         // Verify numeric values are sorted in descending order
         let expected_order = [
@@ -400,7 +407,7 @@ mod test {
 
         for expected in expected_order {
             let message = buf.take().expect("Should have message");
-            let dr = DataRow::from_bytes(message.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(message.to_bytes()).unwrap();
             let price = dr.get::<String>(0, Format::Text).unwrap();
             assert_eq!(price, expected);
         }
@@ -409,7 +416,8 @@ mod test {
     // Helper function to create PostgreSQL binary NUMERIC data
     fn create_binary_numeric(value: &str) -> Vec<u8> {
         use crate::net::messages::bind::Format;
-        use crate::net::messages::data_types::{FromDataType, Numeric};
+        use crate::net::messages::data_types::FromDataType;
+        use pgdog_postgres_types::Numeric;
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
@@ -441,12 +449,12 @@ mod test {
             let binary_data = create_binary_numeric(price);
             dr.add(Bytes::from(binary_data))
                 .add(format!("product_{}", i));
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
         buf.sort(&columns, &decoder);
-        buf.full();
+        buf.mark_full();
 
         let expected_order = [
             "1000.01", "1000.00", "199.99", "199.98", "75.50", "50.25", "0.99",
@@ -454,7 +462,7 @@ mod test {
 
         for expected in expected_order {
             let message = buf.take().expect("Should have message");
-            let dr = DataRow::from_bytes(message.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(message.to_bytes()).unwrap();
             // Get the numeric value and convert to string for comparison
             let column = dr.get_column(0, &decoder).unwrap().unwrap();
             if let Datum::Numeric(numeric) = column.value {
@@ -485,12 +493,12 @@ mod test {
         for (i, value) in values.iter().enumerate() {
             let mut dr = DataRow::new();
             dr.add(value.to_string()).add(format!("case_{}", i));
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
         buf.sort(&columns, &decoder);
-        buf.full();
+        buf.mark_full();
 
         // Expected order: ascending numeric sort
         // Note: equal values maintain input order (stable sort)
@@ -506,7 +514,7 @@ mod test {
 
         for expected in expected_order {
             let message = buf.take().expect("Should have message");
-            let dr = DataRow::from_bytes(message.to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(message.to_bytes()).unwrap();
             let value = dr.get::<String>(0, Format::Text).unwrap();
             assert_eq!(value, expected);
         }
@@ -519,7 +527,7 @@ mod test {
         for i in 0..10_i64 {
             let mut dr = DataRow::new();
             dr.add(i);
-            buf.add(dr.message().unwrap()).unwrap();
+            buf.add(dr.message()).unwrap();
         }
 
         // LIMIT 5
@@ -544,10 +552,10 @@ mod test {
             limit: Some(4),
             offset: Some(2),
         });
-        b.full();
+        b.mark_full();
         assert_eq!(b.len(), 4);
         for expected in 2..6_i64 {
-            let dr = DataRow::from_bytes(b.take().unwrap().to_bytes().unwrap()).unwrap();
+            let dr = DataRow::from_bytes(b.take().unwrap().to_bytes()).unwrap();
             assert_eq!(dr.get::<i64>(0, Format::Text).unwrap(), expected);
         }
 
@@ -580,14 +588,14 @@ mod test {
     fn test_distinct() {
         let mut buf = Buffer::default();
         let rd = RowDescription::new(&[Field::bigint("id"), Field::text("email")]);
-        let decoder = Decoder::from(&rd);
+        let decoder = Decoder::from(rd);
 
         for email in ["test@test.com", "apples@test.com", "domain@test.com"] {
             for i in 0..5 {
                 let mut dr = DataRow::new();
                 dr.add(i as i64);
                 dr.add(email);
-                buf.add(dr.message().unwrap()).unwrap();
+                buf.add(dr.message()).unwrap();
             }
         }
 
@@ -621,7 +629,7 @@ mod test {
                 let mut dr = DataRow::new();
                 dr.add(5_i64);
                 dr.add(email);
-                buf.add(dr.message().unwrap()).unwrap();
+                buf.add(dr.message()).unwrap();
             }
         }
 

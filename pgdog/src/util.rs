@@ -1,97 +1,43 @@
 //! What's a project without a util module.
 
-use chrono::{DateTime, Local, Utc};
+pub(crate) mod retry;
+pub(crate) mod server;
+pub(crate) mod sql;
+pub(crate) mod stats;
+pub(crate) mod sync;
+pub(crate) mod system;
+pub(crate) mod time;
+
+pub(crate) use time::{
+    format_time, human_duration, human_duration_display, millis, postgres_now, safe_interval,
+    safe_sleep, safe_timeout,
+};
+
+use futures::future::Either;
 use once_cell::sync::Lazy;
-use pgdog_plugin::comp;
-use rand::{distr::Alphanumeric, Rng};
-use std::{env, num::ParseIntError, ops::Deref, time::Duration};
+use rand::{Rng, distr::Alphanumeric};
+use std::ops::ControlFlow;
+use std::{env, future::Future, future::ready};
+use tokio::task::{JoinError, spawn_blocking};
 
 use crate::net::Parameters; // 0.8
 
-pub fn format_time(time: DateTime<Local>) -> String {
-    time.format("%Y-%m-%d %H:%M:%S%.3f %Z").to_string()
-}
-
-/// Convert Duration to milliseconds with 3 decimal places precision.
-pub fn millis(duration: Duration) -> f64 {
-    (duration.as_secs_f64() * 1_000_000.0).round() / 1000.0
-}
-
-pub fn human_duration_optional(duration: Option<Duration>) -> String {
-    if let Some(duration) = duration {
-        human_duration(duration)
-    } else {
-        "default".into()
-    }
-}
-
-/// Get a human-readable duration for amounts that
-/// a human would use.
-pub fn human_duration(duration: Duration) -> String {
-    let second = 1000;
-    let minute = second * 60;
-    let hour = minute * 60;
-    let day = hour * 24;
-    let week = day * 7;
-    // Ok that's enough.
-
-    let ms = duration.as_millis();
-    let ms_fmt = |ms: u128, unit: u128, name: &str| -> String {
-        if !ms.is_multiple_of(unit) {
-            format!("{}ms", ms)
-        } else {
-            format!("{}{}", ms / unit, name)
-        }
-    };
-
-    if ms < second {
-        format!("{}ms", ms)
-    } else if ms < minute {
-        ms_fmt(ms, second, "s")
-    } else if ms < hour {
-        ms_fmt(ms, minute, "m")
-    } else if ms < day {
-        ms_fmt(ms, hour, "h")
-    } else if ms < week {
-        ms_fmt(ms, day, "d")
-    } else {
-        ms_fmt(ms, 1, "ms")
-    }
-}
-
-/// Get a human-readable duration split into days and hh:mm:ss:ms.
-/// Example: "2d 03:15:42:100" or "00:05:30:250"
-pub fn human_duration_display(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let seconds = total_secs % 60;
-    let millis = duration.subsec_millis();
-
-    if days > 0 {
-        format!(
-            "{}d {:02}:{:02}:{:02}:{:03}",
-            days, hours, minutes, seconds, millis
-        )
-    } else {
-        format!("{:02}:{:02}:{:02}:{:03}", hours, minutes, seconds, millis)
-    }
-}
-
-// 2000-01-01T00:00:00Z
-static POSTGRES_EPOCH: i64 = 946684800000000000;
-
-/// Number of microseconds since Postgres epoch.
-pub fn postgres_now() -> i64 {
-    let start = DateTime::from_timestamp_nanos(POSTGRES_EPOCH).fixed_offset();
-    let now = Utc::now().fixed_offset();
-    // Panic if overflow.
-    (now - start).num_microseconds().unwrap()
+/// Compare two byte slices in constant time with respect to their contents.
+///
+/// The running time depends only on the input lengths, never on the byte
+/// values, so it cannot leak (via a timing side channel) how many leading
+/// bytes matched. Use this wherever an attacker-supplied value is compared
+/// against a secret (passwords, cancel keys); a short-circuiting `==`/`memcmp`
+/// there is a covert timing channel that lets an attacker recover the secret
+/// byte by byte (cf. PostgreSQL CVE-2026-6478, the MD5 password comparison).
+///
+/// Length is not treated as secret: a length mismatch returns `false` early.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    aws_lc_rs::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
 /// Generate a random string of length n.
-pub fn random_string(n: usize) -> String {
+pub(crate) fn random_string(n: usize) -> String {
     rand::rng()
         .sample_iter(&Alphanumeric)
         .take(n)
@@ -116,36 +62,67 @@ static INSTANCE_ID: Lazy<String> = Lazy::new(|| {
 
 /// Get the instance ID for this pgdog instance.
 /// This is generated once at startup and persists for the lifetime of the process.
-pub fn instance_id() -> &'static str {
+pub(crate) fn instance_id() -> &'static str {
     &INSTANCE_ID
 }
 
 /// Get an externally assigned, unique, node identifier
 /// for this instance of PgDog.
-pub fn node_id() -> Result<u64, ParseIntError> {
-    // split always returns at least one element.
-    instance_id().split("-").last().unwrap().parse()
+///
+/// Requires the `NODE_ID` environment variable. Accepts a bare number,
+/// or the documented `<prefix>-<number>` form.
+///
+/// Returns `None` when `NODE_ID` is unset, or when it does not end in a
+/// number.
+pub(crate) fn node_id() -> Option<u64> {
+    let node_id = env::var("NODE_ID").ok()?;
+    let digits = node_id
+        .rsplit_once('-')
+        .map_or(node_id.as_str(), |(_, digits)| digits);
+
+    digits.parse().ok()
+}
+
+static DEPLOYMENT_ID: Lazy<Option<String>> = Lazy::new(|| env::var("DEPLOYMENT_ID").ok());
+
+/// Get the ID of this PgDog deployment.
+///
+/// This should be _globally_ unique
+/// and is used to differentiate 2pc transactions.
+///
+pub(crate) fn deployment_id() -> Option<&'static str> {
+    DEPLOYMENT_ID.as_deref()
+}
+
+static HOSTNAME: Lazy<String> = Lazy::new(|| {
+    let hostname = env::var("HOSTNAME").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    if hostname.is_empty() { host } else { hostname }
+});
+
+pub(crate) fn hostname() -> &'static str {
+    &HOSTNAME
 }
 
 /// Escape PostgreSQL identifiers by doubling any embedded quotes.
-pub fn escape_identifier(s: &str) -> String {
+pub(crate) fn escape_identifier(s: &str) -> String {
     s.replace("\"", "\"\"")
 }
 
 /// Get PgDog's version string.
-pub fn pgdog_version() -> String {
+pub(crate) fn pgdog_version() -> String {
     format!(
         "v{} [main@{}, pgdog-plugin {}, {}]",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
-        comp::pgdog_plugin_api_version().deref(),
-        comp::rustc_version().deref()
+        pgdog_plugin::VERSION,
+        pgdog_plugin::RUSTC_VERSION,
     )
 }
 
 /// Format a number with commas for readability.
 /// Example: 1234567 -> "1,234,567"
-pub fn number_human(n: u64) -> String {
+pub(crate) fn number_human(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::new();
     for (i, c) in s.chars().rev().enumerate() {
@@ -158,7 +135,7 @@ pub fn number_human(n: u64) -> String {
 }
 
 /// Format a byte count into a human-readable string.
-pub fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -178,39 +155,74 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// Get user and database parameters.
-pub fn user_database_from_params(params: &Parameters) -> (&str, &str) {
+///
+/// These parameters are standard and defined by the Postgres protocol.
+///
+/// # Arguments
+///
+/// - `params`: Client parameters extracted from the [`crate::net::Startup`] message.
+///
+/// # Return
+///
+/// Tuple of (user, database).
+///
+pub(crate) fn user_database_from_params(params: &Parameters) -> (&str, &str) {
     let user = params.get_default("user", "postgres");
     let database = params.get_default("database", user);
 
     (user, database)
 }
 
+/// Truncate `s` to at most `limit` bytes, rounding down to the nearest UTF-8
+/// character boundary so the result is always valid UTF-8.
+pub(crate) fn truncate_utf8(s: &str, limit: usize) -> &str {
+    &s[..s.floor_char_boundary(limit)]
+}
+
+/// Sanitize a query sample for one-line log output: truncate to at most
+/// `limit` bytes on a UTF-8 character boundary and replace control
+/// characters (including newlines) with spaces so attacker-controlled
+/// bytes can't forge or flood log lines.
+pub(crate) fn sanitize_log_sample(s: &str, limit: usize) -> String {
+    truncate_utf8(s, limit).replace(|c: char| c.is_control(), " ")
+}
+
+/// Run on the blocking pool when background workers are enabled, or inline otherwise.
+pub(crate) fn maybe_spawn_blocking<F, R>(f: F) -> impl Future<Output = Result<R, JoinError>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let background_workers = crate::config::config_quick()
+        .config
+        .general
+        .background_workers;
+
+    if background_workers > 0 {
+        Either::Left(spawn_blocking(f))
+    } else {
+        Either::Right(ready(Ok(f())))
+    }
+}
+
+pub(crate) trait ResultControlFlowExt<T, E> {
+    fn break_err<B>(self) -> ControlFlow<Result<B, E>, T>;
+}
+
+impl<T, E> ResultControlFlowExt<T, E> for Result<T, E> {
+    fn break_err<B>(self) -> ControlFlow<Result<B, E>, T> {
+        match self {
+            Ok(t) => ControlFlow::Continue(t),
+            Err(e) => ControlFlow::Break(Err(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
 
-    use std::env::{remove_var, set_var};
-
     use super::*;
-
-    #[test]
-    fn test_human_duration() {
-        assert_eq!(human_duration(Duration::from_millis(500)), "500ms");
-        assert_eq!(human_duration(Duration::from_millis(2000)), "2s");
-        assert_eq!(human_duration(Duration::from_millis(1000 * 60 * 2)), "2m");
-        assert_eq!(human_duration(Duration::from_millis(1000 * 3600)), "1h");
-    }
-
-    #[test]
-    fn test_postgres_now() {
-        let start = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
-            .unwrap()
-            .fixed_offset();
-        assert_eq!(
-            DateTime::from_timestamp_nanos(POSTGRES_EPOCH).fixed_offset(),
-            start,
-        );
-        let _now = postgres_now();
-    }
+    use crate::test_utils::*;
 
     #[test]
     fn test_escape_identifier() {
@@ -226,18 +238,17 @@ mod test {
 
     #[test]
     fn test_instance_id_format() {
-        unsafe {
-            remove_var("NODE_ID");
-        }
+        let _guard = remove_env_var("NODE_ID");
         let id = instance_id();
         assert_eq!(id.len(), 8);
         // All characters should be valid hex digits (0-9, a-f)
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         // All alphabetic characters should be lowercase
-        assert!(id
-            .chars()
-            .filter(|c| c.is_alphabetic())
-            .all(|c| c.is_lowercase()));
+        assert!(
+            id.chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_lowercase())
+        );
     }
 
     #[test]
@@ -248,11 +259,21 @@ mod test {
     }
 
     #[test]
-    fn test_node_id_error() {
-        unsafe {
-            remove_var("NODE_ID");
-        }
-        assert!(node_id().is_err());
+    fn test_node_id_unset() {
+        let _guard = remove_env_var("NODE_ID");
+        assert_eq!(node_id(), None);
+    }
+
+    #[test]
+    fn test_node_id_not_a_number() {
+        let _guard = set_env_var("NODE_ID", "pgdog-abc");
+        assert_eq!(node_id(), None);
+    }
+
+    #[test]
+    fn test_node_id_bare_number() {
+        let _guard = set_env_var("NODE_ID", "7");
+        assert_eq!(node_id(), Some(7));
     }
 
     #[test]
@@ -283,121 +304,58 @@ mod test {
     }
 
     #[test]
-    fn test_human_duration_display() {
-        // Zero duration
-        assert_eq!(
-            human_duration_display(Duration::from_millis(0)),
-            "00:00:00:000"
-        );
-
-        // Just milliseconds
-        assert_eq!(
-            human_duration_display(Duration::from_millis(500)),
-            "00:00:00:500"
-        );
-
-        // Seconds and milliseconds
-        assert_eq!(
-            human_duration_display(Duration::from_millis(5500)),
-            "00:00:05:500"
-        );
-
-        // Minutes, seconds, milliseconds
-        assert_eq!(
-            human_duration_display(Duration::from_millis(65500)),
-            "00:01:05:500"
-        );
-
-        // Hours, minutes, seconds, milliseconds
-        assert_eq!(
-            human_duration_display(Duration::from_millis(3665500)),
-            "01:01:05:500"
-        );
-
-        // Days
-        assert_eq!(
-            human_duration_display(
-                Duration::from_secs(86400 + 3600 + 60 + 1) + Duration::from_millis(123)
-            ),
-            "1d 01:01:01:123"
-        );
-
-        // Multiple days
-        assert_eq!(
-            human_duration_display(
-                Duration::from_secs(2 * 86400 + 12 * 3600 + 30 * 60 + 45)
-                    + Duration::from_millis(999)
-            ),
-            "2d 12:30:45:999"
-        );
-    }
-
-    // These should run in separate processes (if using nextest).
-    #[test]
     fn test_node_id_set() {
-        unsafe {
-            set_var("NODE_ID", "pgdog-1");
-        }
-        assert_eq!(node_id(), Ok(1));
-    }
-}
-
-/// Longest timer period armed. Longer ones, like `Duration::MAX` for
-/// "disabled", can't be added to a clock reading.
-const MAX_TIMER_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
-
-/// [`tokio::time::interval`] that never ticks instead of panicking with
-/// "overflow when adding duration to instant" when `period` is too long
-/// (or zero) to schedule. Same name and behaviour as upstream PgDog's.
-pub(crate) fn safe_interval(period: Duration) -> SafeInterval {
-    SafeInterval(
-        (!period.is_zero() && period < MAX_TIMER_PERIOD).then(|| tokio::time::interval(period)),
-    )
-}
-
-/// Interval from [`safe_interval`]: disabled when its period wasn't usable.
-#[derive(Debug)]
-pub(crate) struct SafeInterval(Option<tokio::time::Interval>);
-
-impl SafeInterval {
-    pub(crate) async fn tick(&mut self) -> tokio::time::Instant {
-        match &mut self.0 {
-            Some(interval) => interval.tick().await,
-            None => std::future::pending().await,
-        }
-    }
-}
-
-#[cfg(test)]
-mod safe_interval_test {
-    use std::time::Duration;
-
-    use tokio::time::timeout;
-
-    use super::safe_interval;
-
-    /// `lsn_check_interval = Duration::MAX` (lsn checks off) used to panic
-    /// the shard monitor: "overflow when adding duration to instant".
-    #[tokio::test]
-    async fn test_huge_period_disables_the_timer() {
-        let mut interval = safe_interval(Duration::MAX / 2);
-        for _ in 0..2 {
-            assert!(
-                timeout(Duration::from_millis(20), interval.tick())
-                    .await
-                    .is_err(),
-                "disabled interval ticked"
-            );
-        }
+        let _guard = set_env_var("NODE_ID", "pgdog-1");
+        assert_eq!(node_id(), Some(1));
     }
 
-    #[tokio::test]
-    async fn test_regular_period_ticks() {
-        let mut interval = safe_interval(Duration::from_millis(5));
-        for _ in 0..3 {
-            timeout(Duration::from_secs(1), interval.tick())
-                .await
-                .expect("interval should tick");
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"hunter2", b"hunter2"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter3"));
+        // Different lengths must not match.
+        assert!(!constant_time_eq(b"hunter2", b"hunter22"));
+        assert!(!constant_time_eq(b"", b"x"));
+        // Two empty slices are equal.
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_truncate_utf8_ascii() {
+        assert_eq!(truncate_utf8("SELECT 1", 4096), "SELECT 1"); // under limit
+        assert_eq!(truncate_utf8("SELECT 1", 6), "SELECT"); // truncated
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte() {
+        // Mix of 2-byte (é), 3-byte (€), and 4-byte (𝄞) characters.
+        let s = "é€𝄞é€𝄞"; // 2+3+4+2+3+4 = 18 bytes
+
+        // Every possible byte limit produces valid UTF-8.
+        for limit in 0..=s.len() {
+            assert!(std::str::from_utf8(truncate_utf8(s, limit).as_bytes()).is_ok());
         }
+
+        assert_eq!(truncate_utf8(s, 0), ""); // empty
+        assert_eq!(truncate_utf8(s, 2), "é"); // exact: end of é
+        assert_eq!(truncate_utf8(s, 3), "é"); // 1 byte into € → walk back
+        assert_eq!(truncate_utf8(s, 5), "é€"); // exact: end of €
+        assert_eq!(truncate_utf8(s, 6), "é€"); // 1 byte into 𝄞 → walk back
+        assert_eq!(truncate_utf8(s, 9), "é€𝄞"); // exact: end of 𝄞
+    }
+
+    #[test]
+    fn test_sanitize_log_sample() {
+        // Truncates to the limit on a char boundary.
+        assert_eq!(sanitize_log_sample("SELECT 1", 6), "SELECT");
+
+        // Newlines, carriage returns, tabs, and escape sequences become spaces.
+        assert_eq!(
+            sanitize_log_sample("SELECT\r\n1\t--\x1b[31mforged\x1b[0m", 4096),
+            "SELECT  1 -- [31mforged [0m"
+        );
+
+        // Truncation happens before sanitization: limit applies to input bytes.
+        assert_eq!(sanitize_log_sample("a\nb\nc", 3), "a b");
     }
 }

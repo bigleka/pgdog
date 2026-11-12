@@ -1,20 +1,13 @@
 use std::fmt::Display;
 
-use super::{error::Error, Column, OwnedTable, Table};
-use crate::util::escape_identifier;
+use super::{Column, Table, error::Error};
+use crate::util::{escape_identifier, sql::quote_literal};
 
 /// Sequence name in a query.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Sequence<'a> {
+pub(crate) struct Sequence<'a> {
     /// Table representing the sequence name and schema.
-    pub table: Table<'a>,
-}
-
-/// Owned version of Sequence that owns its string data.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct OwnedSequence {
-    /// Table representing the sequence name and schema.
-    pub table: OwnedTable,
+    pub(crate) table: Table<'a>,
 }
 
 impl Display for Sequence<'_> {
@@ -23,44 +16,10 @@ impl Display for Sequence<'_> {
     }
 }
 
-impl Display for OwnedSequence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let borrowed = Sequence::from(self);
-        borrowed.fmt(f)
-    }
-}
-
-impl<'a> From<Sequence<'a>> for OwnedSequence {
-    fn from(sequence: Sequence<'a>) -> Self {
-        Self {
-            table: OwnedTable::from(sequence.table),
-        }
-    }
-}
-
-impl<'a> From<&'a OwnedSequence> for Sequence<'a> {
-    fn from(owned: &'a OwnedSequence) -> Self {
-        Self {
-            table: Table::from(&owned.table),
-        }
-    }
-}
-
-impl From<OwnedTable> for OwnedSequence {
-    fn from(table: OwnedTable) -> Self {
-        Self { table }
-    }
-}
-
 impl<'a> Sequence<'a> {
-    /// Convert this borrowed Sequence to an owned OwnedSequence
-    pub fn to_owned(&self) -> OwnedSequence {
-        OwnedSequence::from(*self)
-    }
-
     /// Generate a setval statement to set the sequence to the max value of the given column
-    pub fn setval_from_column(&self, column: &Column<'a>) -> Result<String, Error> {
-        let sequence_name = self.table.to_string();
+    pub(crate) fn setval_from_column(&self, column: &Column<'a>) -> Result<String, Error> {
+        let sequence_name = quote_literal(&self.table.to_string());
 
         let table = column.table().ok_or(Error::ColumnNoTable)?;
         let table_name = table.to_string();
@@ -68,7 +27,7 @@ impl<'a> Sequence<'a> {
         let column_name = format!("\"{}\"", escape_identifier(column.name));
 
         Ok(format!(
-            "SELECT setval('{}', COALESCE((SELECT MAX({}) FROM {}), 1), true);",
+            "SELECT setval({}, COALESCE((SELECT MAX({}) FROM {}), 1), true);",
             sequence_name, column_name, table_name
         ))
     }
@@ -82,47 +41,73 @@ impl<'a> From<Table<'a>> for Sequence<'a> {
 
 #[cfg(test)]
 mod test {
-    use pg_query::{parse, NodeEnum};
-
     use super::{Column, Sequence, Table};
 
     #[test]
     fn test_sequence_setval_from_alter_statement() {
-        let query =
-            parse("ALTER SEQUENCE public.user_profiles_id_seq OWNED BY public.user_profiles.id")
-                .unwrap();
-        let alter = query.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let sequence = Sequence::from(Table {
+            schema: Some("public"),
+            name: "user_profiles_id_seq",
+            alias: None,
+        });
 
-        match alter.node {
-            Some(NodeEnum::AlterSeqStmt(ref stmt)) => {
-                // Extract sequence name from the relation
-                let sequence_table = Table::from(stmt.sequence.as_ref().unwrap());
-                let sequence = Sequence::from(sequence_table);
+        let setval_sql = sequence
+            .setval_from_column(&Column {
+                schema: Some("public"),
+                table: Some("user_profiles"),
+                name: "id",
+            })
+            .unwrap();
+        assert_eq!(
+            setval_sql,
+            "SELECT setval('\"public\".\"user_profiles_id_seq\"', COALESCE((SELECT MAX(\"id\") FROM \"public\".\"user_profiles\"), 1), true);"
+        );
+    }
 
-                // Extract column from the owned_by option
-                if let Some(node) = stmt.options.first() {
-                    let column = Column::try_from(node).unwrap();
+    #[test]
+    fn test_sequence_setval_quotes_names() {
+        let sequence = Sequence::from(Table {
+            schema: Some("tenant's \"schema\""),
+            name: "customer's \"id\" sequence",
+            alias: None,
+        });
+        let sql = sequence
+            .setval_from_column(&Column {
+                schema: Some("tenant's \"schema\""),
+                table: Some("customer's table"),
+                name: "customer's \"id\"",
+            })
+            .expect("column has a table");
+        pg_raw_parse::parse(&sql).expect("cutover SQL must accept quoted identifiers");
+    }
 
-                    // Test the setval generation
-                    let setval_sql = sequence.setval_from_column(&column).unwrap();
+    #[tokio::test]
+    async fn test_sequence_setval_quoted_name_executes() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::backend::server::test::test_server;
 
-                    assert_eq!(
-                        setval_sql,
-                        "SELECT setval('\"public\".\"user_profiles_id_seq\"', COALESCE((SELECT MAX(\"id\") FROM \"public\".\"user_profiles\"), 1), true);"
-                    );
-
-                    // Verify the individual components
-                    assert_eq!(sequence.table.name, "user_profiles_id_seq");
-                    assert_eq!(sequence.table.schema, Some("public"));
-                    assert_eq!(column.name, "id");
-                    assert_eq!(column.table, Some("user_profiles"));
-                    assert_eq!(column.schema, Some("public"));
-                } else {
-                    panic!("no owned by clause");
-                }
-            }
-            _ => panic!("not an alter sequence"),
-        }
+        let mut server = test_server().await;
+        server
+            .execute("CREATE TEMP TABLE \"customer's table\" (\"id\" SERIAL)")
+            .await?;
+        server
+            .execute("INSERT INTO \"customer's table\" VALUES (42)")
+            .await?;
+        let sql = Sequence::from(Table {
+            schema: Some("pg_temp"),
+            name: "customer's table_id_seq",
+            alias: None,
+        })
+        .setval_from_column(&Column {
+            schema: Some("pg_temp"),
+            table: Some("customer's table"),
+            name: "id",
+        })?;
+        server.execute(sql).await?;
+        let next: Vec<i32> = server
+            .fetch_all("INSERT INTO \"customer's table\" DEFAULT VALUES RETURNING id")
+            .await?;
+        assert_eq!(next, vec![43]);
+        Ok(())
     }
 
     #[test]

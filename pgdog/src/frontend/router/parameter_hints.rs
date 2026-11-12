@@ -4,28 +4,40 @@ use super::parser::Error;
 use crate::{
     backend::ShardingSchema,
     frontend::router::{
-        parser::{ee::ParserHooks, Schema, Shard, ShardWithPriority, ShardsWithPriority},
-        sharding::{ContextBuilder, SchemaSharder},
+        parser::{Schema, Shard, ShardWithPriority, ShardsWithPriority, ee::ParserHooks},
+        sharding::{
+            PendingLookup, ResolvedLookups, SchemaSharder, ShardOrLookup,
+            lookup::shard_for_bare_key,
+        },
     },
-    net::{parameter::ParameterValue, Parameters},
+    parameters::{ParameterStore, ParameterValue},
 };
 
-#[derive(Debug, Clone)]
-pub struct ParameterHints<'a> {
-    pub search_path: Option<&'a ParameterValue>,
-    pub pgdog_shard: Option<&'a ParameterValue>,
-    pub pgdog_sharding_key: Option<&'a ParameterValue>,
-    pub pgdog_role: Option<&'a ParameterValue>,
+/// `SET pgdog.shard` — pin queries to an explicit shard number.
+pub(crate) const PGDOG_SHARD: &str = "pgdog.shard";
+/// `SET pgdog.sharding_key` — pin queries to the shard a key resolves to.
+pub(crate) const PGDOG_SHARDING_KEY: &str = "pgdog.sharding_key";
+/// `SET pgdog.role` — pin queries to a primary or replica.
+pub(crate) const PGDOG_ROLE: &str = "pgdog.role";
+/// Connection pinning.
+pub(crate) const PGDOG_PIN: &str = "pgdog.pin";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParameterHints<'a> {
+    pub(crate) search_path: Option<&'a ParameterValue>,
+    pub(crate) pgdog_shard: Option<&'a ParameterValue>,
+    pub(crate) pgdog_sharding_key: Option<&'a ParameterValue>,
+    pub(crate) pgdog_role: Option<&'a ParameterValue>,
     hooks: ParserHooks,
 }
 
-impl<'a> From<&'a Parameters> for ParameterHints<'a> {
-    fn from(value: &'a Parameters) -> Self {
+impl<'a> From<&'a ParameterStore> for ParameterHints<'a> {
+    fn from(value: &'a ParameterStore) -> Self {
         Self {
             search_path: value.search_path(),
-            pgdog_shard: value.get("pgdog.shard"),
-            pgdog_role: value.get("pgdog.role"),
-            pgdog_sharding_key: value.get("pgdog.sharding_key"),
+            pgdog_shard: value.get(PGDOG_SHARD),
+            pgdog_role: value.get(PGDOG_ROLE),
+            pgdog_sharding_key: value.get(PGDOG_SHARDING_KEY),
             hooks: ParserHooks::default(),
         }
     }
@@ -36,31 +48,33 @@ impl ParameterHints<'_> {
     pub(crate) fn compute_shard(
         &self,
         shards: &mut ShardsWithPriority,
+        pending_lookups: &mut Vec<PendingLookup>,
+        resolved: &ResolvedLookups,
         sharding_schema: &ShardingSchema,
     ) -> Result<(), Error> {
         let mut schema_sharder = SchemaSharder::default();
 
-        if let Some(ParameterValue::Integer(val)) = self.pgdog_shard {
-            let shard = Shard::Direct(*val as usize);
+        if let Some(ParameterValue::String(val)) = self.pgdog_shard
+            && let Ok(shard) = val.parse()
+        {
+            let shard = Shard::Direct(shard);
             self.hooks.record_set_shard(&shard);
             shards.push(ShardWithPriority::new_set(shard));
         }
-        if let Some(ParameterValue::String(val)) = self.pgdog_shard {
-            if let Ok(shard) = val.parse() {
-                let shard = Shard::Direct(shard);
-                self.hooks.record_set_shard(&shard);
-                shards.push(ShardWithPriority::new_set(shard));
-            }
-        }
         if let Some(ParameterValue::String(val)) = self.pgdog_sharding_key {
             if sharding_schema.schemas.is_empty() {
-                let ctx =
-                    ContextBuilder::infer_from_from_and_config(val.as_str(), sharding_schema)?
-                        .shards(sharding_schema.shards)
-                        .build()?;
-                let shard = ctx.apply()?;
-                self.hooks.record_set_sharding_key(&shard, val);
-                shards.push(ShardWithPriority::new_set(shard));
+                match shard_for_bare_key(val.as_str(), sharding_schema, Some(resolved))? {
+                    ShardOrLookup::Shard(shard) => {
+                        self.hooks.record_set_sharding_key(&shard, val);
+                        shards.push(ShardWithPriority::new_set(shard));
+                    }
+                    // The key missed the lookup cache. The query engine
+                    // resolves it and routes the query again; that pass
+                    // hits the cache and computes the shard.
+                    ShardOrLookup::Lookup(pending) => {
+                        pending_lookups.push(pending);
+                    }
+                }
             } else {
                 schema_sharder.resolve(Some(Schema::from(val.as_str())), &sharding_schema.schemas);
 
@@ -82,8 +96,6 @@ impl ParameterHints<'_> {
                         schema_sharder.resolve(Some(schema), &sharding_schema.schemas);
                     }
                 }
-
-                _ => (),
             }
 
             if let Some((shard, schema)) = schema_sharder.get() {
@@ -144,15 +156,19 @@ mod tests {
 
         let sharding_key = ParameterValue::String("sales".to_string());
         let hints = ParameterHints {
-            search_path: None,
-            pgdog_shard: None,
             pgdog_sharding_key: Some(&sharding_key),
-            pgdog_role: None,
-            hooks: ParserHooks::default(),
+            ..Default::default()
         };
 
         let mut shards = ShardsWithPriority::default();
-        hints.compute_shard(&mut shards, &sharding_schema).unwrap();
+        hints
+            .compute_shard(
+                &mut shards,
+                &mut Vec::new(),
+                &ResolvedLookups::default(),
+                &sharding_schema,
+            )
+            .unwrap();
 
         let result = shards.shard();
         assert_eq!(*result, Shard::Direct(1));
@@ -166,14 +182,19 @@ mod tests {
         let search_path = ParameterValue::String("inventory".to_string());
         let hints = ParameterHints {
             search_path: Some(&search_path),
-            pgdog_shard: None,
             pgdog_sharding_key: Some(&sharding_key),
-            pgdog_role: None,
-            hooks: ParserHooks::default(),
+            ..Default::default()
         };
 
         let mut shards = ShardsWithPriority::default();
-        hints.compute_shard(&mut shards, &sharding_schema).unwrap();
+        hints
+            .compute_shard(
+                &mut shards,
+                &mut Vec::new(),
+                &ResolvedLookups::default(),
+                &sharding_schema,
+            )
+            .unwrap();
 
         let result = shards.shard();
         assert_eq!(*result, Shard::Direct(0));

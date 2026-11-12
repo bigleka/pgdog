@@ -1,1 +1,1 @@
-pub use pgdog_config::general::{General, LogFormat};
+pub(crate) use pgdog_config::general::General;

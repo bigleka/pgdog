@@ -1,55 +1,140 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::setup::{admin_sqlx, connection_sqlx_direct};
 use parking_lot::Mutex;
-use sqlx::{Connection, Executor, PgConnection, postgres::PgListener};
-use tokio::{select, spawn, sync::Barrier, time::timeout};
+use rust_decimal::prelude::ToPrimitive;
+use sqlx::{Connection, Executor, PgConnection, Pool, Postgres, Row, postgres::PgListener};
+use tokio::{
+    select, spawn,
+    sync::Barrier,
+    time::{sleep, timeout},
+};
+use uuid::Uuid;
+
+#[tokio::test]
+async fn test_listener_restarts_and_resubscribes_after_backend_termination() {
+    async fn notify_and_receive(
+        notifier: &mut PgConnection,
+        listener: &mut PgListener,
+        channel: &str,
+    ) -> u32 {
+        let payload = Uuid::new_v4().to_string();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                notifier
+                    .execute(format!("NOTIFY \"{channel}\", '{payload}'").as_str())
+                    .await
+                    .expect("send notification through PgDog");
+
+                // Notifications can be lost while the backend reconnects.
+                // try_recv exposes frontend disconnects instead of hiding them
+                // behind SQLx's automatic reconnect and resubscribe behavior.
+                if let Ok(notification) =
+                    timeout(Duration::from_millis(100), listener.try_recv()).await
+                {
+                    let notification = notification
+                        .expect("receive notification")
+                        .expect("PgDog should keep the frontend connection open");
+                    if notification.payload() == payload {
+                        assert_eq!(notification.channel(), channel);
+                        return notification.process_id();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener should deliver notifications within ten seconds")
+    }
+
+    let test_id = Uuid::new_v4().simple().to_string();
+    let channels = [
+        format!("restart_events_{test_id}"),
+        format!("restart_jobs_{test_id}"),
+    ];
+    let mut listener = PgListener::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .expect("connect listener");
+    listener.eager_reconnect(false);
+    for channel in &channels {
+        listener.listen(channel).await.expect("listen on channel");
+    }
+    let mut notifier = PgConnection::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .expect("connect notifier");
+
+    // NOTIFY through PgDog uses the pub/sub backend, so the notification PID
+    // identifies the exact connection to terminate.
+    let old_pid = notify_and_receive(&mut notifier, &mut listener, &channels[0]).await;
+    assert_eq!(
+        notify_and_receive(&mut notifier, &mut listener, &channels[1]).await,
+        old_pid
+    );
+
+    let direct = connection_sqlx_direct().await;
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1, 5000)")
+        .bind(old_pid as i32)
+        .fetch_one(&direct)
+        .await
+        .expect("terminate pub/sub backend and wait for it to exit");
+    assert!(terminated, "pub/sub backend should be terminated");
+
+    // Keep the original frontend and subscriptions: PgDog must restart its
+    // listener and restore both channels without another LISTEN from the client.
+    let new_pid = notify_and_receive(&mut notifier, &mut listener, &channels[0]).await;
+    assert_ne!(new_pid, old_pid, "listener should use a new backend");
+    assert_eq!(
+        notify_and_receive(&mut notifier, &mut listener, &channels[1]).await,
+        new_pid
+    );
+}
 
 #[tokio::test]
 async fn test_notify() {
     let messages = Arc::new(Mutex::new(vec![]));
     let mut tasks = vec![];
     let mut listeners = vec![];
-    let barrier = Arc::new(Barrier::new(5));
+    let test_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let channels = (0..5)
+        .map(|i| format!("test_notify_{test_id}_{i}"))
+        .collect::<Vec<_>>();
+    let received_barrier = Arc::new(Barrier::new(channels.len() + 1));
+    let release_barrier = Arc::new(Barrier::new(channels.len() + 1));
 
-    for i in 0..5 {
+    for channel in &channels {
         let task_msgs = messages.clone();
 
         let mut listener = PgListener::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
             .await
             .unwrap();
 
-        listener
-            .listen(format!("test_notify_{}", i).as_str())
-            .await
-            .unwrap();
+        listener.listen(channel).await.unwrap();
 
-        let barrier = barrier.clone();
+        let received_barrier = received_barrier.clone();
+        let release_barrier = release_barrier.clone();
         listeners.push(spawn(async move {
             let mut received = 0;
-            loop {
-                select! {
-                    msg = listener.recv() => {
-                        let msg = msg.unwrap();
-                        received += 1;
-                        task_msgs.lock().push(msg);
-                        if received == 10 {
-                            break;
-                        }
-                    }
-
-                }
+            while received < 10 {
+                let msg = listener.recv().await.unwrap();
+                received += 1;
+                task_msgs.lock().push(msg);
             }
-            barrier.wait().await;
+
+            received_barrier.wait().await;
+            release_barrier.wait().await;
         }));
     }
 
     for i in 0..50 {
+        let channel = channels[i % channels.len()].clone();
         let handle = spawn(async move {
             let mut conn = PgConnection::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
                 .await
                 .unwrap();
-            conn.execute(format!("NOTIFY test_notify_{}, 'test_notify_{}'", i % 5, i % 5).as_str())
+            conn.execute(format!("NOTIFY {channel}, '{channel}'").as_str())
                 .await
                 .unwrap();
         });
@@ -61,15 +146,160 @@ async fn test_notify() {
         task.await.unwrap();
     }
 
+    received_barrier.wait().await;
+
+    {
+        let messages = messages.lock();
+        assert_eq!(messages.len(), 50);
+        for message in messages.iter() {
+            assert_eq!(message.channel(), message.payload());
+        }
+    }
+
+    assert_listener_stats(&channels, 10).await;
+
+    release_barrier.wait().await;
     for listener in listeners {
         listener.await.unwrap();
     }
+}
 
-    assert_eq!(messages.lock().len(), 50);
-    let messages = messages.lock();
-    for message in messages.iter() {
-        assert_eq!(message.channel(), message.payload());
+#[tokio::test]
+async fn test_notify_payload_with_quote() {
+    let test_id = Uuid::new_v4().simple().to_string();
+    let channel = format!("test_notify_quote_{test_id}");
+
+    let mut listener = PgListener::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .unwrap();
+    listener.listen(&channel).await.unwrap();
+
+    let mut notifier = PgConnection::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .unwrap();
+    notifier
+        .execute(format!("NOTIFY {channel}, 'it''s here'").as_str())
+        .await
+        .expect("NOTIFY with an escaped quote in the payload");
+
+    let notification = timeout(Duration::from_secs(10), listener.recv())
+        .await
+        .expect("notification within ten seconds")
+        .unwrap();
+    assert_eq!(notification.channel(), channel);
+    assert_eq!(notification.payload(), "it's here");
+}
+
+#[tokio::test]
+async fn test_unlisten_all_stops_notifications() {
+    let test_id = Uuid::new_v4().simple().to_string();
+    let channels = [
+        format!("unlisten_all_events_{test_id}"),
+        format!("unlisten_all_jobs_{test_id}"),
+    ];
+
+    let mut listener = PgListener::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .unwrap();
+    for channel in &channels {
+        listener.listen(channel).await.unwrap();
     }
+
+    let mut notifier = PgConnection::connect("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .unwrap();
+
+    for channel in &channels {
+        notifier
+            .execute(format!("NOTIFY {channel}, 'before'").as_str())
+            .await
+            .unwrap();
+        let notification = timeout(Duration::from_secs(10), listener.recv())
+            .await
+            .expect("notification within ten seconds")
+            .unwrap();
+        assert_eq!(notification.channel(), channel);
+        assert_eq!(notification.payload(), "before");
+    }
+
+    // Sends UNLISTEN *.
+    listener.unlisten_all().await.unwrap();
+
+    for channel in &channels {
+        notifier
+            .execute(format!("NOTIFY {channel}, 'after'").as_str())
+            .await
+            .unwrap();
+    }
+
+    let received = timeout(Duration::from_millis(500), listener.try_recv()).await;
+    assert!(
+        received.is_err(),
+        "no notification should arrive after UNLISTEN *, got {received:?}"
+    );
+}
+
+#[derive(Debug)]
+struct ListenerStats {
+    listeners: i64,
+    received: i64,
+    dropped: i64,
+}
+
+async fn assert_listener_stats(channels: &[String], expected_received: i64) {
+    let admin = admin_sqlx().await;
+    let stats = wait_for_listener_stats(&admin, channels, expected_received).await;
+
+    for (channel, stats) in channels.iter().zip(stats) {
+        assert_eq!(stats.listeners, 1, "{channel} listener count");
+        assert_eq!(
+            stats.received, expected_received,
+            "{channel} received count"
+        );
+        assert_eq!(stats.dropped, 0, "{channel} dropped count");
+    }
+}
+
+async fn wait_for_listener_stats(
+    admin: &Pool<Postgres>,
+    channels: &[String],
+    expected_received: i64,
+) -> Vec<ListenerStats> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = admin.fetch_all("SHOW LISTENERS").await.unwrap();
+            let stats = channels
+                .iter()
+                .filter_map(|channel| {
+                    rows.iter()
+                        .find(|row| row.get::<String, _>("channel") == *channel)
+                        .map(|row| ListenerStats {
+                            listeners: numeric_column(row, "listeners"),
+                            received: numeric_column(row, "received"),
+                            dropped: numeric_column(row, "dropped"),
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if stats.len() == channels.len()
+                && stats
+                    .iter()
+                    .all(|stats| stats.listeners >= 1 && stats.received >= expected_received)
+            {
+                return stats;
+            }
+
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn numeric_column(row: &sqlx::postgres::PgRow, column: &str) -> i64 {
+    row.get::<rust_decimal::Decimal, _>(column)
+        .to_i64()
+        .unwrap()
 }
 
 #[tokio::test]

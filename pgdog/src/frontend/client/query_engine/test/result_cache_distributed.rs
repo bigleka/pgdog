@@ -11,15 +11,15 @@ use pgdog_config::QueryParserLevel;
 use crate::{
     config::{config, set},
     result_cache::{
+        ResultCacheKey,
         lock::{Lock, RemoteLock},
         redis::RedisResultCache,
-        ResultCacheKey,
     },
 };
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, select_value, TestTable},
+    result_cache::{TestTable, enable_result_cache, select_value},
     result_cache_xfetch::set_xfetch_beta,
 };
 

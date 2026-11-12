@@ -1,6 +1,7 @@
 //! Network socket wrapper allowing us to treat secure, plain and UNIX
 //! connections the same across the code.
 use bytes::{BufMut, BytesMut};
+use futures::FutureExt;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::net::TcpStream;
@@ -22,16 +23,28 @@ enum StreamInner {
     Plain(#[pin] BufStream<TcpStream>),
     Tls(#[pin] BufStream<tokio_rustls::TlsStream<TcpStream>>),
     DevNull,
+    #[cfg(test)]
+    Memory(#[pin] BufStream<tokio::io::DuplexStream>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Clean,
+    DataPending,
+    Closed,
 }
 
 /// A network socket.
 #[pin_project]
 #[derive(Debug)]
-pub struct Stream {
+pub(crate) struct Stream {
     #[pin]
     inner: StreamInner,
     io_in_progress: bool,
     capacity: usize,
+    tls_identity: Option<String>,
+    tls_client_certificate: bool,
+    tls_server_end_point: Option<Vec<u8>>,
 }
 
 impl AsyncRead for Stream {
@@ -45,6 +58,8 @@ impl AsyncRead for Stream {
             StreamInnerProjection::Plain(stream) => stream.poll_read(cx, buf),
             StreamInnerProjection::Tls(stream) => stream.poll_read(cx, buf),
             StreamInnerProjection::DevNull => std::task::Poll::Ready(Ok(())),
+            #[cfg(test)]
+            StreamInnerProjection::Memory(stream) => stream.poll_read(cx, buf),
         }
     }
 }
@@ -60,6 +75,8 @@ impl AsyncWrite for Stream {
             StreamInnerProjection::Plain(stream) => stream.poll_write(cx, buf),
             StreamInnerProjection::Tls(stream) => stream.poll_write(cx, buf),
             StreamInnerProjection::DevNull => std::task::Poll::Ready(Ok(buf.len())),
+            #[cfg(test)]
+            StreamInnerProjection::Memory(stream) => stream.poll_write(cx, buf),
         }
     }
 
@@ -72,6 +89,8 @@ impl AsyncWrite for Stream {
             StreamInnerProjection::Plain(stream) => stream.poll_flush(cx),
             StreamInnerProjection::Tls(stream) => stream.poll_flush(cx),
             StreamInnerProjection::DevNull => std::task::Poll::Ready(Ok(())),
+            #[cfg(test)]
+            StreamInnerProjection::Memory(stream) => stream.poll_flush(cx),
         }
     }
 
@@ -84,72 +103,133 @@ impl AsyncWrite for Stream {
             StreamInnerProjection::Plain(stream) => stream.poll_shutdown(cx),
             StreamInnerProjection::Tls(stream) => stream.poll_shutdown(cx),
             StreamInnerProjection::DevNull => std::task::Poll::Ready(Ok(())),
+            #[cfg(test)]
+            StreamInnerProjection::Memory(stream) => stream.poll_shutdown(cx),
         }
     }
 }
 
 impl Stream {
     /// Memory used by the stream buffers.
-    pub fn memory_usage(&self) -> usize {
+    pub(crate) fn memory_usage(&self) -> usize {
         self.capacity * 2
     }
 
     /// Wrap an unencrypted TCP stream.
-    pub fn plain(stream: TcpStream, capacity: usize) -> Self {
+    pub(crate) fn plain(stream: TcpStream, capacity: usize) -> Self {
         Self {
             inner: StreamInner::Plain(BufStream::with_capacity(capacity, capacity, stream)),
             io_in_progress: false,
             capacity,
+            tls_identity: None,
+            tls_client_certificate: false,
+            tls_server_end_point: None,
         }
     }
 
     /// Wrap an encrypted TCP stream.
-    pub fn tls(stream: tokio_rustls::TlsStream<TcpStream>, capacity: usize) -> Self {
+    pub(crate) fn tls(
+        stream: tokio_rustls::TlsStream<TcpStream>,
+        capacity: usize,
+        tls_identity: Option<String>,
+        tls_client_certificate: bool,
+        tls_server_end_point: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             inner: StreamInner::Tls(BufStream::with_capacity(capacity, capacity, stream)),
             io_in_progress: false,
             capacity,
+            tls_identity,
+            tls_client_certificate,
+            tls_server_end_point,
         }
     }
 
     /// Create a dev null stream that discards all data.
-    pub fn dev_null() -> Self {
+    pub(crate) fn dev_null() -> Self {
         Self {
             inner: StreamInner::DevNull,
             io_in_progress: false,
             capacity: 0,
+            tls_identity: None,
+            tls_client_certificate: false,
+            tls_server_end_point: None,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory(stream: tokio::io::DuplexStream) -> Self {
+        let capacity = 4096;
+        Self {
+            inner: StreamInner::Memory(BufStream::with_capacity(capacity, capacity, stream)),
+            io_in_progress: false,
+            capacity,
+            tls_identity: None,
+            tls_client_certificate: false,
+            tls_server_end_point: None,
+        }
+    }
+
+    /// Get the identity (SAN dNSName, then SAN URI, falling back to Subject CN)
+    /// from the client's TLS certificate, if any.
+    pub(crate) fn tls_identity(&self) -> Option<&str> {
+        self.tls_identity.as_deref()
+    }
+
+    /// The client presented a TLS certificate, even one we can't name.
+    pub(crate) fn tls_client_certificate(&self) -> bool {
+        self.tls_client_certificate
+    }
+
     /// This is a TLS stream.
-    pub fn is_tls(&self) -> bool {
+    pub(crate) fn is_tls(&self) -> bool {
         matches!(self.inner, StreamInner::Tls(_))
+    }
+
+    /// `tls-server-end-point` binding for the certificate this connection
+    /// presented, snapshotted at accept so a later TLS reload cannot
+    /// change the hash mid-handshake.
+    pub(crate) fn tls_server_end_point(&self) -> Option<&[u8]> {
+        self.tls_server_end_point.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tls_server_end_point(&mut self, data: Vec<u8>) {
+        self.tls_server_end_point = Some(data);
     }
 
     /// Get peer address if any. We're not using UNIX sockets (yet)
     /// so the peer address should always be available.
-    pub fn peer_addr(&self) -> PeerAddr {
+    pub(crate) fn peer_addr(&self) -> PeerAddr {
         match &self.inner {
             StreamInner::Plain(stream) => stream.get_ref().peer_addr().ok().into(),
             StreamInner::Tls(stream) => stream.get_ref().get_ref().0.peer_addr().ok().into(),
             StreamInner::DevNull => PeerAddr { addr: None },
+            #[cfg(test)]
+            StreamInner::Memory(_) => PeerAddr { addr: None },
         }
     }
 
-    /// Check socket is okay while we wait for something else.
-    pub async fn check(&mut self) -> Result<(), crate::net::Error> {
+    pub(crate) fn liveness(&mut self) -> Liveness {
         let mut buf = [0u8; 1];
-        match &mut self.inner {
-            StreamInner::Plain(plain) => eof(plain.get_mut().peek(&mut buf).await)?,
-            StreamInner::Tls(tls) => eof(tls.get_mut().get_mut().0.peek(&mut buf).await)?,
-            StreamInner::DevNull => 0,
+        let peeked = match &mut self.inner {
+            StreamInner::Plain(plain) => plain.get_mut().peek(&mut buf).now_or_never(),
+            StreamInner::Tls(tls) => tls.get_mut().get_mut().0.peek(&mut buf).now_or_never(),
+            StreamInner::DevNull => return Liveness::Clean,
+            #[cfg(test)]
+            StreamInner::Memory(_) => return Liveness::Clean,
         };
 
-        Ok(())
+        match peeked {
+            None => Liveness::Clean,
+            Some(Ok(0)) => Liveness::Closed,
+            Some(Ok(_)) => Liveness::DataPending,
+            Some(Err(_)) => Liveness::Closed,
+        }
     }
 
     /// Get the current io_in_progress state.
-    pub fn io_in_progress(&self) -> bool {
+    pub(crate) fn io_in_progress(&self) -> bool {
         self.io_in_progress
     }
 
@@ -159,15 +239,20 @@ impl Stream {
     ///
     /// This is fast because the stream is buffered. Make sure to call [`Stream::send_flush`]
     /// for the last message in the exchange.
-    pub async fn send(&mut self, message: &impl Protocol) -> Result<usize, crate::net::Error> {
+    pub(crate) async fn send(
+        &mut self,
+        message: &impl Protocol,
+    ) -> Result<usize, crate::net::Error> {
         self.io_in_progress = true;
         let result = async {
-            let bytes = message.to_bytes()?;
+            let bytes = message.to_bytes();
 
             match &mut self.inner {
-                StreamInner::Plain(ref mut stream) => eof(stream.write_all(&bytes).await)?,
-                StreamInner::Tls(ref mut stream) => eof(stream.write_all(&bytes).await)?,
+                StreamInner::Plain(stream) => eof(stream.write_all(&bytes).await)?,
+                StreamInner::Tls(stream) => eof(stream.write_all(&bytes).await)?,
                 StreamInner::DevNull => (),
+                #[cfg(test)]
+                StreamInner::Memory(stream) => eof(stream.write_all(&bytes).await)?,
             }
 
             #[cfg(debug_assertions)]
@@ -197,7 +282,7 @@ impl Stream {
     ///
     /// This will flush all buffers and ensure the data is actually sent via the socket.
     /// Use this only for the last message in the exchange to avoid bottlenecks.
-    pub async fn send_flush(
+    pub(crate) async fn send_flush(
         &mut self,
         message: &impl Protocol,
     ) -> Result<usize, crate::net::Error> {
@@ -208,8 +293,33 @@ impl Stream {
         Ok(sent)
     }
 
+    /// Send pre-encoded Postgres protocol bytes and flush.
+    ///
+    /// `bytes` is expected to contain one or more complete protocol messages
+    /// (type byte + length + payload) concatenated.
+    pub(crate) async fn send_raw_flush(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<usize, crate::net::Error> {
+        self.io_in_progress = true;
+        let result = async {
+            match &mut self.inner {
+                StreamInner::Plain(stream) => eof(stream.write_all(bytes).await)?,
+                StreamInner::Tls(stream) => eof(stream.write_all(bytes).await)?,
+                StreamInner::DevNull => (),
+                #[cfg(test)]
+                StreamInner::Memory(stream) => eof(stream.write_all(bytes).await)?,
+            }
+            eof(self.flush().await)?;
+            Ok(bytes.len())
+        }
+        .await;
+        self.io_in_progress = false;
+        result
+    }
+
     /// Send multiple messages and flush the buffer.
-    pub async fn send_many(
+    pub(crate) async fn send_many(
         &mut self,
         messages: &[impl Protocol],
     ) -> Result<usize, crate::net::Error> {
@@ -222,26 +332,6 @@ impl Stream {
         Ok(sent)
     }
 
-    /// Send pre-encoded Postgres protocol bytes and flush.
-    ///
-    /// `bytes` is expected to contain one or more complete protocol messages
-    /// (type byte + length + payload) concatenated.
-    pub async fn send_raw_flush(&mut self, bytes: &[u8]) -> Result<usize, crate::net::Error> {
-        self.io_in_progress = true;
-        let result = async {
-            match &mut self.inner {
-                StreamInner::Plain(ref mut stream) => eof(stream.write_all(bytes).await)?,
-                StreamInner::Tls(ref mut stream) => eof(stream.write_all(bytes).await)?,
-                StreamInner::DevNull => (),
-            }
-            eof(self.flush().await)?;
-            Ok(bytes.len())
-        }
-        .await;
-        self.io_in_progress = false;
-        result
-    }
-
     /// Read a message from the stream.
     ///
     /// # Performance
@@ -249,13 +339,16 @@ impl Stream {
     /// The stream is buffered, so this is quite fast. The pooler will perform exactly
     /// one memory allocation per protocol message. It can be optimized to re-use an existing
     /// buffer but it's not worth the complexity.
-    pub async fn read(&mut self) -> Result<Message, crate::net::Error> {
+    pub(crate) async fn read(&mut self) -> Result<Message, crate::net::Error> {
         let mut buf = BytesMut::with_capacity(5);
         self.read_buf(&mut buf).await
     }
 
     /// Read data into a buffer, avoiding unnecessary allocations.
-    pub async fn read_buf(&mut self, bytes: &mut BytesMut) -> Result<Message, crate::net::Error> {
+    pub(crate) async fn read_buf(
+        &mut self,
+        bytes: &mut BytesMut,
+    ) -> Result<Message, crate::net::Error> {
         let result = async {
             let code = eof(self.read_u8().await)?;
             self.io_in_progress = true;
@@ -288,7 +381,7 @@ impl Stream {
     }
 
     /// Send an error to the client and disconnect gracefully.
-    pub async fn fatal(&mut self, error: ErrorResponse) -> Result<(), crate::net::Error> {
+    pub(crate) async fn fatal(&mut self, error: ErrorResponse) -> Result<(), crate::net::Error> {
         self.send_flush(&error).await?;
 
         Ok(())
@@ -296,7 +389,7 @@ impl Stream {
 
     /// Send an error to the client and let them know we are ready
     /// for more queries.
-    pub async fn error(
+    pub(crate) async fn error(
         &mut self,
         error: ErrorResponse,
         in_transaction: bool,
@@ -322,7 +415,7 @@ impl Stream {
     }
 }
 
-pub fn eof<T>(result: std::io::Result<T>) -> Result<T, crate::net::Error> {
+pub(crate) fn eof<T>(result: std::io::Result<T>) -> Result<T, crate::net::Error> {
     match result {
         Ok(val) => Ok(val),
         Err(err) => {
@@ -337,7 +430,7 @@ pub fn eof<T>(result: std::io::Result<T>) -> Result<T, crate::net::Error> {
 
 /// Wrapper around SocketAddr
 /// to make it easier to debug.
-pub struct PeerAddr {
+pub(crate) struct PeerAddr {
     addr: Option<SocketAddr>,
 }
 
@@ -367,6 +460,8 @@ impl std::fmt::Debug for PeerAddr {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use tokio::net::TcpListener;
 
@@ -386,5 +481,112 @@ mod tests {
         );
 
         client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_plain_stream_has_no_client_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let stream = Stream::plain(server_stream, 4096);
+
+        // No TLS handshake happened, so there is nothing to have presented.
+        assert!(!stream.is_tls());
+        assert!(!stream.tls_client_certificate());
+        assert_eq!(stream.tls_identity(), None);
+        assert_eq!(stream.tls_server_end_point(), None);
+
+        client.await.unwrap();
+    }
+
+    #[test]
+    fn test_dev_null_has_no_client_certificate() {
+        let stream = Stream::dev_null();
+
+        assert!(!stream.tls_client_certificate());
+        assert_eq!(stream.tls_identity(), None);
+    }
+
+    async fn connected_pair() -> (Stream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (ours, _) = listener.accept().await.unwrap();
+
+        (Stream::plain(ours, 4096), peer.await.unwrap())
+    }
+
+    async fn wait_for_liveness(stream: &mut Stream, expected: Liveness) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stream.liveness() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("socket did not reach expected liveness state");
+    }
+
+    #[tokio::test]
+    async fn test_liveness_clean_when_peer_idle() {
+        let (mut stream, _peer) = connected_pair().await;
+
+        assert_eq!(stream.liveness(), Liveness::Clean);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_liveness_does_not_block_on_idle_socket() {
+        let (mut stream, _peer) = connected_pair().await;
+
+        let checked =
+            tokio::time::timeout(Duration::from_secs(5), async { stream.liveness() }).await;
+
+        assert_eq!(
+            checked.expect("liveness() blocked on an idle socket"),
+            Liveness::Clean
+        );
+    }
+
+    #[tokio::test]
+    async fn test_liveness_reports_unsolicited_data() {
+        let (mut stream, mut peer) = connected_pair().await;
+
+        peer.write_all(b"E").await.unwrap();
+        peer.flush().await.unwrap();
+
+        wait_for_liveness(&mut stream, Liveness::DataPending).await;
+    }
+
+    #[tokio::test]
+    async fn test_liveness_reports_closed_peer() {
+        let (mut stream, peer) = connected_pair().await;
+
+        drop(peer);
+
+        wait_for_liveness(&mut stream, Liveness::Closed).await;
+    }
+
+    #[tokio::test]
+    async fn test_liveness_does_not_consume_pending_bytes() {
+        let (mut stream, mut peer) = connected_pair().await;
+
+        peer.write_all(b"hello").await.unwrap();
+        peer.flush().await.unwrap();
+
+        wait_for_liveness(&mut stream, Liveness::DataPending).await;
+        assert_eq!(stream.liveness(), Liveness::DataPending);
+
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn test_liveness_dev_null_is_clean() {
+        let mut stream = Stream::dev_null();
+
+        assert_eq!(stream.liveness(), Liveness::Clean);
     }
 }

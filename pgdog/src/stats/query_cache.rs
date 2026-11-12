@@ -1,21 +1,21 @@
 use crate::{
     frontend::{
-        router::parser::{cache::Stats, Cache},
         PreparedStatements,
+        router::parser::{Cache, cache::Stats},
     },
     stats::memory::MemoryUsage,
 };
 
 use super::*;
 
-pub struct QueryCacheMetric {
+pub(crate) struct QueryCacheMetric {
     name: String,
     help: String,
     value: usize,
     gauge: bool,
 }
 
-pub struct QueryCache {
+pub(crate) struct QueryCache {
     stats: Stats,
     len: usize,
     prepared_statements: usize,
@@ -70,6 +70,12 @@ impl QueryCache {
                 name: "query_cache_size".into(),
                 help: "Number of queries in the cache".into(),
                 value: self.len,
+                gauge: true,
+            }),
+            Metric::new(QueryCacheMetric {
+                name: "query_cache_memory".into(),
+                help: "Amount of memory consumed by cached query ASTs".into(),
+                value: self.stats.memory_allocated,
                 gauge: true,
             }),
             Metric::new(QueryCacheMetric {
@@ -170,6 +176,7 @@ mod tests {
                 multi: 4,
                 parse_time: Duration::ZERO,
                 fingerprints: 8,
+                memory_allocated: 1024,
             },
             len: 5,
             prepared_statements: 6,
@@ -186,6 +193,7 @@ mod tests {
                 "query_cache_direct".to_string(),
                 "query_cache_cross".to_string(),
                 "query_cache_size".to_string(),
+                "query_cache_memory".to_string(),
                 "query_cache_parse_time".to_string(),
                 "query_cache_fingerprints".to_string(),
                 "prepared_statements".to_string(),

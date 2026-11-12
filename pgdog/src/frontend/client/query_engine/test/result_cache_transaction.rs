@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, prime_cache, select_value, simple, TestTable},
+    result_cache::{TestTable, enable_result_cache, prime_cache, select_value, simple},
 };
 
 /// The cache, with `cache_read_only_transactions` set to `enabled`.
@@ -73,30 +73,33 @@ fn status(reply: &[Message]) -> char {
 
 #[tokio::test]
 async fn test_read_only_read_committed_uses_cache() {
-    let value =
-        read_in_transaction(false, &["BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED"]).await;
+    let value = Box::pin(read_in_transaction(
+        false,
+        &["BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED"],
+    ))
+    .await;
     assert_eq!(value, CACHED);
 }
 
 #[tokio::test]
 async fn test_start_transaction_read_committed_read_only_uses_cache() {
-    let value = read_in_transaction(
+    let value = Box::pin(read_in_transaction(
         false,
         &["START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"],
-    )
+    ))
     .await;
     assert_eq!(value, CACHED);
 }
 
 #[tokio::test]
 async fn test_set_transaction_read_committed_uses_cache() {
-    let value = read_in_transaction(
+    let value = Box::pin(read_in_transaction(
         false,
         &[
             "BEGIN READ ONLY",
             "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
         ],
-    )
+    ))
     .await;
     assert_eq!(value, CACHED);
 }
@@ -104,64 +107,71 @@ async fn test_set_transaction_read_committed_uses_cache() {
 /// The default isolation level can come from ALTER ROLE: only with the flag.
 #[tokio::test]
 async fn test_read_only_default_isolation_skips_cache() {
-    let value = read_in_transaction(false, &["BEGIN READ ONLY"]).await;
+    let value = Box::pin(read_in_transaction(false, &["BEGIN READ ONLY"])).await;
     assert_eq!(value, FROM_POSTGRES);
 }
 
 #[tokio::test]
 async fn test_read_only_default_isolation_uses_cache_with_flag() {
-    let value = read_in_transaction(true, &["BEGIN READ ONLY"]).await;
+    let value = Box::pin(read_in_transaction(true, &["BEGIN READ ONLY"])).await;
     assert_eq!(value, CACHED);
 }
 
 #[tokio::test]
 async fn test_read_write_transaction_skips_cache() {
-    let value = read_in_transaction(true, &["BEGIN ISOLATION LEVEL READ COMMITTED"]).await;
+    let value = Box::pin(read_in_transaction(
+        true,
+        &["BEGIN ISOLATION LEVEL READ COMMITTED"],
+    ))
+    .await;
     assert_eq!(value, FROM_POSTGRES);
 }
 
 #[tokio::test]
 async fn test_repeatable_read_skips_cache() {
-    let value =
-        read_in_transaction(true, &["BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ"]).await;
+    let value = Box::pin(read_in_transaction(
+        true,
+        &["BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ"],
+    ))
+    .await;
     assert_eq!(value, FROM_POSTGRES);
 }
 
 #[tokio::test]
 async fn test_set_transaction_serializable_skips_cache() {
-    let value = read_in_transaction(
+    let value = Box::pin(read_in_transaction(
         true,
         &[
             "BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED",
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
         ],
-    )
+    ))
     .await;
     assert_eq!(value, FROM_POSTGRES);
 }
 
 #[tokio::test]
 async fn test_session_default_serializable_skips_cache() {
-    let value = read_in_transaction(
+    let value = Box::pin(read_in_transaction(
         true,
         &[
             "SET default_transaction_isolation TO 'serializable'",
             "BEGIN READ ONLY",
         ],
-    )
+    ))
     .await;
     assert_eq!(value, FROM_POSTGRES);
 }
 
 #[tokio::test]
 async fn test_session_characteristics_serializable_skips_cache() {
-    let value = read_in_transaction(
+    let value = Box::pin(read_in_transaction(
         true,
         &[
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
             "BEGIN READ ONLY",
         ],
-    )
+    ))
     .await;
     assert_eq!(value, FROM_POSTGRES);
 }

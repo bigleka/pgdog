@@ -2,16 +2,18 @@
 
 use tracing::info;
 
-use crate::backend::replication::logical::admin::{Task, TaskType};
-use crate::backend::replication::orchestrator::Orchestrator;
+use crate::api::replication::ReplicationTask;
+use crate::api::run_task;
+use crate::api::schema_sync::SchemaSyncTask;
+use crate::backend::replication::resharding_state::ReshardingState;
 
 use super::prelude::*;
 
-pub struct Replicate {
-    pub from_database: String,
-    pub to_database: String,
-    pub publication: String,
-    pub replication_slot: Option<String>,
+pub(crate) struct Replicate {
+    pub(crate) from_database: String,
+    pub(crate) to_database: String,
+    pub(crate) publication: String,
+    pub(crate) replication_slot: Option<String>,
 }
 
 #[async_trait]
@@ -30,7 +32,13 @@ impl Command for Replicate {
                 publication: publication.to_owned(),
                 replication_slot: None,
             }),
-            ["replicate", from_database, to_database, publication, replication_slot] => Ok(Self {
+            [
+                "replicate",
+                from_database,
+                to_database,
+                publication,
+                replication_slot,
+            ] => Ok(Self {
                 from_database: from_database.to_owned(),
                 to_database: to_database.to_owned(),
                 publication: publication.to_owned(),
@@ -46,22 +54,32 @@ impl Command for Replicate {
             self.from_database, self.to_database, self.publication
         );
 
-        let orchestrator = Orchestrator::new(
-            &self.from_database,
-            &self.to_database,
-            &self.publication,
-            self.replication_slot.clone(),
-        )?;
+        let state = ReshardingState::builder()
+            .source(&self.from_database)
+            .destination(&self.to_database)
+            .publication(&self.publication)
+            .maybe_replication_slot(self.replication_slot.clone())
+            .build()?;
 
-        let waiter = orchestrator.replicate().await?;
-        let task_id = Task::register(TaskType::Replication(Box::new(waiter)));
+        let schema_sync = SchemaSyncTask::builder()
+            .databases(state.databases())
+            .publication(self.publication.clone());
+
+        let task_id = run_task(
+            ReplicationTask::builder()
+                .state(state)
+                .schema_sync(schema_sync)
+                .validate(false)
+                .build(),
+        )
+        .id();
 
         let mut dr = DataRow::new();
         dr.add(task_id.to_string());
 
         Ok(vec![
-            RowDescription::new(&[Field::text("task_id")]).message()?,
-            dr.message()?,
+            RowDescription::new(&[Field::text("task_id")]).message(),
+            dr.message(),
         ])
     }
 }

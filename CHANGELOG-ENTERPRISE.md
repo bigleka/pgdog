@@ -1,0 +1,127 @@
+# Changelog EE
+
+This file contains the list of changes made to the Enterprise edition of PgDog. Since it's being developed in a private repository, this seemed like
+the most optimal way to share those changes.
+
+### v2026-11-02
+
+**OS version**: [v0.1.63](CHANGELOG-UPSTREAM.md#v0163)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-11-02`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-11-02` |
+
+#### Features
+
+- Enterprise Docker images now use open source base images
+- Unify the resharding UI and add missing replication and resharding tasks
+- Use PGO (profile-guided optimization) for Docker images, which improves performance by 6% on x86 and 17% on ARM
+
+#### Bug fixes
+
+- Autodiscovery would not detect hostname changes during AWS RDS blue/green failover
+- Increase default Redis timeout on the control plane and make it configurable
+
+### v2026-10-16
+
+**OS version**: [v0.1.62](CHANGELOG-UPSTREAM.md#v0162)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-10-16`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-10-16` |
+
+#### Features
+
+- **Experimental** QoS write backoff: make clients sleep for a configurable amount of time before starting a transaction on the primary. This allows to reduce the write load on the database, allowing the vacuum to catch up.
+
+#### Bug fixes
+
+- Deployments with many RDS databases would hit RDS API limits. Control plane can now accept a list of tags which would cause it to only fetch data from those databases instead.
+
+### v2026-10-09
+
+**OS version**: [v0.1.61](CHANGELOG-UPSTREAM.md#v0161)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-10-09`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-10-09` |
+
+#### Features
+
+- Show the current value of all globally distributed sequences in the control plane
+- Allow to supply the control plane authentication token via environment variable (`helm-ee` chart supports this, too)
+- Show replication state during resharding in the control plane
+
+#### Bug fixes
+
+- Pool autoscaling would reload the configuration unnecessarily when pool sizes didn't change
+- PgDog better handles shutdown during resharding by sending final updates to the control plane
+- Better preserve resharding tasks state across PgDog restarts so the information in control plane information isn't lost
+- Autodiscovery would use delayed interval, causing `check_interval` to be larger than configured
+
+### v2026-09-17
+
+**OS version**: [v0.1.59](CHANGELOG-UPSTREAM.md#v0159)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-09-17`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-09-17` |
+
+#### Features
+
+- Support query cancellation in multi-node PgDog deployments by broadcasting the cancel query request to all pods in the deployment
+- Add read-only mode to control plane UI to prevent operators from making accidental changes
+- Add staging banner to the control plane UI, to let operators know they are _not_ using the production deployment of the control plane
+- Show `COPY_DATA` (resharding) tasks in the control plane UI
+- Add checkout timeout metric graph and Incident.io alert trigger
+
+#### Bug fixes
+
+- Autodiscovery with `replicas_only = true` would deadlock the pool due to a regression in load balancer target selection. Introduced in `v0.1.53` and fixed in `v0.1.59`.
+- **Experimental** Raft snapshot storage moved to the database on disk, reducing snapshot size 100x. The database now only occupies a few KB on disk.
+- **Experimental** Control plane nodes using Raft would restart upon leadership changes, causing unnecessary downtime. Fixed by rebooting the internal jobs instead, keeping all containers alive.
+- Query plans did not work correctly with the open source rewrite engine (in sharded deployments), planning the query the client sent, not the one executed by PgDog
+- Query plans would attempt to plan DDL, causing noise in the error log
+
+### v2026-09-10
+
+**OS version**: [v0.1.58](CHANGELOG-UPSTREAM.md#v0158)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-09-10`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-09-10` |
+
+#### Features
+
+- **Experimental** Globally-distributed monotonic integer sequences, powered by Raft. You can use them by calling `pgdog.nextval('any_sequence_name')`. PgDog automatically injects this into omnisharded `INSERT`s to make sure the primary key is the same on all shards (set `primary_key = "rewrite_omni_global"` in `pgdog.toml`)
+- **Breaking** Replaced Kubernetes lease-based [high availability](https://docs.pgdog.dev/enterprise_edition/control_plane/ha/) implementation with Raft. The leader is elected on startup, and followers are configured as reverse proxies, forwarding requests to the leader. This works well with a Kubernetes `Service`, since all pods report healthy but only one is actually serving requests. This also removes the dependency on Kubernetes for control plane HA.
+
+#### Bug fixes
+
+- Autodiscovery would drop and re-create connections when a replica was added/removed. This was caused by a bad connection pool compatibility check and fixed in the open source edition ([v0.1.58](CHANGELOG-UPSTREAM.md#v0.1.58)).
+
+### v2026-09-03
+
+**OS version**: [v0.1.57](CHANGELOG-UPSTREAM.md#v0157)
+
+| Application   | Docker image                                            |
+| ------------- | ------------------------------------------------------- |
+| PgDog         | `ghcr.io/pgdogdev/pgdog-enterprise:v2026-09-03`         |
+| Control plane | `ghcr.io/pgdogdev/pgdog-enterprise/control:v2026-09-03` |
+
+#### Features
+
+- Added a UI in the control plane to monitor resharding of databases. It tracks the resharding tasks in real-time, with progress reports and ETA.
+- Query plans are now sent asynchronously to the control plane, as they are captured by PgDog. This makes them available quicker in the control plane UI, and uses less network bandwidth. Corresponding settings were added to the control plane Helm chart `v0.2.18`.
+- Slow query indicator in the control plane is now configurable via the `slow_queries_threshold` [setting](https://github.com/pgdogdev/helm-ee/#state-store) instead of relying on the presence of a query plan.
+- Added the ability to trigger alerts on slow queries as detected by `slow_queries_threshold`. Requires the `slow_queries` setting to be [enabled](https://github.com/pgdogdev/helm-ee/#alerting).
+
+#### Bug fixes
+
+- Query blocking command in the admin database now uses correctly normalized SQL; it would previously lowercase the query first, potentially causing mismatching
+- PgDog would reload its config when a node would join the cluster, irrespective if connection pool autoscaling was enabled. This would cause connection pools to drop connections due to incompatible configuration changes between the new and old pools. This required the control plane to be enabled.

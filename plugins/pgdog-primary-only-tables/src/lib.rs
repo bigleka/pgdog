@@ -7,41 +7,41 @@ use std::{
 
 use arc_swap::ArcSwap;
 use once_cell::sync::Lazy;
-use pgdog_plugin::{
-    Context, PdConfig, ReadWrite, Route, Shard, macros, pg_query::NodeEnum, pg_query::NodeRef,
-};
+use pg_raw_parse::Node;
+use pg_raw_parse::walk::{self, Recurse};
+use pgdog_plugin::{Config as PluginConfig, Context, PdStr, Plugin, ReadWrite, Route, Shard};
 use serde::{Deserialize, Serialize};
+use std::ops::ControlFlow;
 use tracing::{error, info};
 
 static CONFIG: Lazy<ArcSwap<Config>> = Lazy::new(|| ArcSwap::from_pointee(Config::default()));
 
-macros::plugin!();
+pgdog_plugin::plugin!(PrimaryOnlyTables);
 
-#[macros::route]
-fn route(context: Context) -> Route {
-    route_query(context).unwrap_or(Route::unknown())
-}
+struct PrimaryOnlyTables;
 
-#[macros::config]
-fn config(config: PdConfig, result: *mut u8) {
-    let plugin_config = config.plugin_config.to_string();
-    if plugin_config.is_empty() {
-        unsafe {
-            *result = 0;
-        }
-        return;
+impl Plugin for PrimaryOnlyTables {
+    extern "C-unwind" fn version() -> PdStr<'static> {
+        env!("CARGO_PKG_VERSION").into()
     }
 
-    let path = PathBuf::from(plugin_config);
-    if let Err(err) = read_config(&path) {
-        error!("[pgdog_primary_only_tables] failed to load config: {}", err);
+    fn route(context: Context<'_>) -> Route {
+        route_query(context)
+    }
 
-        unsafe {
-            *result = 1;
+    extern "C-unwind" fn config(config: PluginConfig<'_>) -> bool {
+        let plugin_config = config.plugin_config;
+        if plugin_config.is_empty() {
+            return true;
         }
-    } else {
-        unsafe {
-            *result = 0;
+
+        let path = PathBuf::from(&*plugin_config);
+        if let Err(err) = read_config(&path) {
+            error!("[pgdog_primary_only_tables] failed to load config: {}", err);
+
+            false
+        } else {
+            true
         }
     }
 }
@@ -75,46 +75,32 @@ fn read_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn route_query(context: Context) -> Result<Route, Box<dyn std::error::Error>> {
-    let ast = context.statement().protobuf();
-
-    let root_node = ast
-        .stmts
-        .first()
-        .and_then(|s| s.stmt.as_ref())
-        .and_then(|s| s.node.as_ref());
-
-    let is_select = root_node.is_some_and(|node| match node {
-        NodeEnum::SelectStmt(_) => true,
-        NodeEnum::ExplainStmt(stmt) => stmt
-            .query
-            .as_ref()
-            .and_then(|q| q.node.as_ref())
-            .is_some_and(|n| matches!(n, NodeEnum::SelectStmt(_))),
-        _ => false,
-    });
-
-    if !is_select {
-        return Ok(Route::default());
-    }
+fn route_query(context: Context<'_>) -> Route {
+    let select = match &context.query.stmt() {
+        Node::SelectStmt(s) => s,
+        Node::ExplainStmt(stmt) if let Node::SelectStmt(s) = stmt.query() => s,
+        _ => return Route::default(),
+    };
 
     let config = CONFIG.load().clone();
 
-    for node in ast.nodes() {
-        if let NodeRef::RangeVar(range_var) = node.0 {
+    let route = walk::walk_manual(select.into(), |node| match node {
+        Node::RangeVar(range_var) => {
             for table in &config.tables {
-                let name_matches = table.name == range_var.relname;
+                let name_matches = Some(table.name.as_str()) == range_var.relname();
                 let schema_matches = match &table.schema {
-                    Some(schema) => schema == &range_var.schemaname,
+                    Some(schema) => Some(schema.as_str()) == range_var.schemaname(),
                     None => true,
                 };
 
                 if name_matches && schema_matches {
-                    return Ok(Route::new(Shard::Unknown, ReadWrite::Write));
+                    return ControlFlow::Break(Route::new(Shard::Unknown, ReadWrite::Write));
                 }
             }
+            Recurse::yes()
         }
-    }
+        _ => Recurse::yes(),
+    });
 
-    Ok(Route::default())
+    route.unwrap_or_default()
 }

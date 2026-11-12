@@ -28,7 +28,7 @@ const MAX_TIMESTAMP: u64 = (1 << TIMESTAMP_BITS) - 1;
 const PGDOG_EPOCH: u64 = 1764184395000; // Wednesday, November 26, 2025 11:13:15 AM GMT-08:00
 const NODE_SHIFT: u8 = SEQUENCE_BITS as u8; // 12
 const TIMESTAMP_SHIFT: u8 = (SEQUENCE_BITS + NODE_BITS) as u8; // 22
-                                                               // Maximum offset to ensure base_id + offset doesn't overflow i64
+// Maximum offset to ensure base_id + offset doesn't overflow i64
 const MAX_OFFSET: u64 = i64::MAX as u64
     - ((MAX_TIMESTAMP << TIMESTAMP_SHIFT) | (MAX_NODE_ID << NODE_SHIFT) | MAX_SEQUENCE);
 
@@ -149,7 +149,7 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("invalid node identifier: {0}")]
     InvalidNodeId(String),
 
@@ -164,7 +164,7 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-pub struct UniqueId {
+pub(crate) struct UniqueId {
     node_id: u64,
     id_offset: u64,
     standard: Mutex<State>,
@@ -175,7 +175,7 @@ pub struct UniqueId {
 impl UniqueId {
     /// Initialize the UniqueId generator.
     fn new(function: UniqueIdFunction) -> Result<Self, Error> {
-        let node_id = node_id().map_err(|_| Error::InvalidNodeId(instance_id().to_string()))?;
+        let node_id = node_id().ok_or_else(|| Error::InvalidNodeId(instance_id().to_string()))?;
 
         let min_id = config().config.general.unique_id_min;
 
@@ -208,7 +208,7 @@ impl UniqueId {
     }
 
     /// Get (and initialize, if necessary) the unique ID generator.
-    pub fn generator() -> Result<&'static UniqueId, Error> {
+    pub(crate) fn generator() -> Result<&'static UniqueId, Error> {
         UNIQUE_ID.get_or_try_init(|| {
             let config = config();
             Self::new(config.config.general.unique_id_function)
@@ -216,7 +216,7 @@ impl UniqueId {
     }
 
     /// Generate a globally unique, monotonically increasing identifier.
-    pub fn next_id(&self) -> i64 {
+    pub(crate) fn next_id(&self) -> i64 {
         match self.function {
             UniqueIdFunction::Compact => {
                 self.compact.lock().next_id(self.node_id, self.id_offset) as i64
@@ -230,7 +230,8 @@ impl UniqueId {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashSet, env::set_var};
+    use crate::test_utils::set_env_var;
+    use std::collections::HashSet;
 
     use super::*;
 
@@ -259,9 +260,7 @@ mod test {
 
     #[test]
     fn test_unique_ids() {
-        unsafe {
-            set_var("NODE_ID", "pgdog-1");
-        }
+        let _guard = set_env_var("NODE_ID", "pgdog-1");
         let num_ids = 10_000;
 
         let mut ids = HashSet::new();

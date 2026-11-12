@@ -3,26 +3,26 @@
 use crate::net::messages::{code, prelude::*};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum TransactionState {
+pub(crate) enum TransactionState {
     Idle,
     Error,
-    InTrasaction,
+    InTransaction,
 }
 
 // ReadyForQuery (F).
 #[derive(Debug, Clone, Copy)]
-pub struct ReadyForQuery {
-    pub status: char,
+pub(crate) struct ReadyForQuery {
+    pub(crate) status: char,
 }
 
 impl ReadyForQuery {
     /// New idle message.
-    pub fn idle() -> Self {
+    pub(crate) fn idle() -> Self {
         ReadyForQuery { status: 'I' }
     }
 
     /// In transaction message.
-    pub fn in_transaction(in_transaction: bool) -> Self {
+    pub(crate) fn in_transaction(in_transaction: bool) -> Self {
         if in_transaction {
             ReadyForQuery { status: 'T' }
         } else {
@@ -30,19 +30,15 @@ impl ReadyForQuery {
         }
     }
 
-    pub fn error() -> Self {
+    pub(crate) fn error() -> Self {
         ReadyForQuery { status: 'E' }
     }
 
-    pub fn is_transaction_aborted(&self) -> bool {
-        self.status == 'E'
-    }
-
     /// Get transaction state.
-    pub fn state(&self) -> Result<TransactionState, Error> {
+    pub(crate) fn state(&self) -> Result<TransactionState, Error> {
         match self.status {
             'E' => Ok(TransactionState::Error),
-            'T' => Ok(TransactionState::InTrasaction),
+            'T' => Ok(TransactionState::InTransaction),
             'I' => Ok(TransactionState::Idle),
             c => Err(Error::UnknownTransactionStateIdentifier(c)),
         }
@@ -50,11 +46,11 @@ impl ReadyForQuery {
 }
 
 impl ToBytes for ReadyForQuery {
-    fn to_bytes(&self) -> Result<bytes::Bytes, Error> {
+    fn to_bytes(&self) -> bytes::Bytes {
         let mut payload = Payload::named(self.code());
         payload.put_u8(self.status as u8);
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -72,5 +68,16 @@ impl FromBytes for ReadyForQuery {
 impl Protocol for ReadyForQuery {
     fn code(&self) -> char {
         'Z'
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::ReadyForQuery;
+
+    impl ReadyForQuery {
+        pub(crate) fn is_transaction_aborted(&self) -> bool {
+            self.status == 'E'
+        }
     }
 }

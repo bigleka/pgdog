@@ -2,10 +2,13 @@ use thiserror::Error;
 
 use crate::net::messages::ErrorResponse;
 
-use super::databases::User;
+use super::{
+    databases::User,
+    pool::connection::{aggregate::Error as AggregateError, multi_shard::Error as MultiShardError},
+};
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
@@ -33,12 +36,6 @@ pub enum Error {
     #[error("server not connected")]
     NotConnected,
 
-    #[error("direct-to-shard not connected")]
-    DirectToShardNotConnected,
-
-    #[error("multi-shard not connected")]
-    MultiShardNotConnected,
-
     #[error("multi shard copy not connected")]
     CopyNotConnected,
 
@@ -54,9 +51,6 @@ pub enum Error {
     #[error("no such user/database: {0}")]
     NoDatabase(User),
 
-    #[error("no cluster connected")]
-    NoCluster,
-
     #[error("database \"{0}\" has no schema owner")]
     NoSchemaOwner(String),
 
@@ -68,18 +62,6 @@ pub enum Error {
 
     #[error("{0}")]
     PreparedStatementError(Box<ErrorResponse>),
-
-    #[error("prepared statement \"{0}\" is missing")]
-    PreparedStatementMissing(String),
-
-    #[error("expected '1', got '{0}")]
-    ExpectedParseComplete(char),
-
-    #[error("expected '3', got '{0}'")]
-    ExpectedCloseComplete(char),
-
-    #[error("unsupported authentication algorithm")]
-    UnsupportedAuth,
 
     #[error("{0}")]
     Replication(#[from] crate::backend::replication::Error),
@@ -95,12 +77,6 @@ pub enum Error {
 
     #[error("rollback left server in inconsistent state")]
     RollbackFailed,
-
-    #[error("decoder is missing required data to decode row")]
-    DecoderRowError,
-
-    #[error("read timeout")]
-    ReadTimeout,
 
     #[error("router error: {0}")]
     Router(String),
@@ -120,11 +96,8 @@ pub enum Error {
     #[error("Azure Workload Identity token generation failed: {0}")]
     AzureWorkloadIdentityToken(String),
 
-    #[error("pub/sub channel disabled")]
-    PubSubDisabled,
-
-    #[error("mirror buffer empty")]
-    MirrorBufferEmpty,
+    #[error("Vault credentials fetch failed: {0}")]
+    VaultCredentials(String),
 
     #[error("{0}")]
     FrontendError(Box<crate::frontend::Error>),
@@ -135,11 +108,20 @@ pub enum Error {
     #[error("2pc commit supported with multi-shard binding only")]
     TwoPcMultiShardOnly,
 
-    #[error("unsupported aggregation {function}: {reason}")]
-    UnsupportedAggregation { function: String, reason: String },
+    #[error("{0}")]
+    Aggregate(#[from] AggregateError),
 
     #[error("toml: {0}")]
     TomlSer(#[from] toml::ser::Error),
+
+    #[error("cannot ignore response for message type: {0}")]
+    UnsupportedHandleIgnore(char),
+
+    #[error("missing canonical oid for type {0}")]
+    MissingCanonicalOid(String),
+
+    #[error("cannot switch shards in a direct-to-shard transaction")]
+    DirectShardMismatch,
 }
 
 impl From<crate::frontend::Error> for Error {
@@ -150,31 +132,51 @@ impl From<crate::frontend::Error> for Error {
 
 impl Error {
     /// Checkout timeout.
-    pub fn no_server(&self) -> bool {
+    pub(crate) fn no_server(&self) -> bool {
         use crate::backend::pool::Error as PoolError;
         match self {
             // These are recoverable errors.
             Error::Pool(PoolError::CheckoutTimeout) => true,
             Error::Pool(PoolError::AllReplicasDown) => true,
-            Error::Pool(PoolError::Banned) => true,
             _ => false,
         }
     }
 
+    /// It's not a supported feature so we should tell the client so.
+    pub(crate) fn is_unsupported(&self) -> bool {
+        use crate::backend::pool::Error as PoolError;
+        matches!(
+            self,
+            Self::Aggregate(AggregateError::UnsupportedAggregation { .. })
+                | Self::MultiShard(MultiShardError::Aggregate(
+                    AggregateError::UnsupportedAggregation { .. }
+                ))
+                | Self::Pool(PoolError::PubSubDisabled)
+        )
+    }
+
     /// Transient network/pool fault worth retrying.
-    pub fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::Io(_) => true,
             Self::Net(inner) => inner.is_retryable(),
             Self::Pool(inner) => inner.is_retryable(),
+            // Postgres ErrorResponse wrapped at the backend boundary, e.g. a destination shard
+            // returning FATAL 57P01 mid-replication-apply, or a transient connect-time error.
+            // Delegates to the single SQLSTATE retry list in ErrorResponse::is_retryable.
+            Self::ExecutionError(resp)
+            | Self::ConnectionError(resp)
+            | Self::PreparedStatementError(resp) => resp.is_retryable(),
             // Connection dropped between operations.
-            Self::NotConnected
-            | Self::DirectToShardNotConnected
-            | Self::MultiShardNotConnected
-            | Self::CopyNotConnected
-            | Self::ClusterNotConnected => true,
-            // Server stopped responding mid-stream.
-            Self::ReadTimeout => true,
+            Self::NotConnected | Self::CopyNotConnected | Self::ClusterNotConnected => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_auth(&self) -> bool {
+        match self {
+            Self::Auth(_) => true,
+            Self::ConnectionError(err) => err.code == "28000" || err.is_bad_password(),
             _ => false,
         }
     }

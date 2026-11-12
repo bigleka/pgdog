@@ -1,7 +1,8 @@
 use super::{code, prelude::*};
 
 #[derive(Debug, Copy, Clone, Default)]
-pub struct EmptyQueryResponse;
+#[allow(dead_code)]
+pub(crate) struct EmptyQueryResponse;
 
 impl FromBytes for EmptyQueryResponse {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
@@ -13,8 +14,8 @@ impl FromBytes for EmptyQueryResponse {
 }
 
 impl ToBytes for EmptyQueryResponse {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(Payload::named(self.code()).freeze())
+    fn to_bytes(&self) -> Bytes {
+        Payload::named(self.code()).freeze()
     }
 }
 

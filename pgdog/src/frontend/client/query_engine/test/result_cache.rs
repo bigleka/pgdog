@@ -5,11 +5,11 @@ use std::{ops::Deref, time::Duration};
 use futures::future::join_all;
 
 use pgdog_config::{QueryParserLevel, ResultCache};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 use crate::{
-    backend::{databases::reload_from_existing, server::test::test_server, Server},
-    config::{config, load_test, set},
+    backend::{Server, databases::reload_from_existing, server::test::test_server},
+    config::{config, load_test, load_test_sharded, set},
     net::{DataRow, Message, ReadyForQuery},
 };
 
@@ -20,7 +20,11 @@ const REDIS_URL: &str = "redis://127.0.0.1:6379";
 /// Enable the result cache, using a key prefix unique to this test run.
 pub(super) fn enable_result_cache(query_parser: QueryParserLevel) {
     load_test();
+    add_result_cache(query_parser);
+}
 
+/// Enable the result cache in the loaded test config.
+fn add_result_cache(query_parser: QueryParserLevel) {
     let mut config = config().deref().clone();
     config.config.general.query_parser = query_parser;
     config.config.result_cache = Some(ResultCache {
@@ -563,4 +567,28 @@ async fn test_query_with_write_after_read_not_cached() {
     table.drop().await;
 
     assert_eq!(value.as_deref(), Some("3"), "second UPDATE didn't run");
+}
+
+/// A query split into several requests gets one ReadyForQuery, after the
+/// last one: a cached reply, which ends with one, can't stand in for the
+/// others.
+#[tokio::test]
+async fn test_split_query_not_served_from_cache() {
+    load_test_sharded();
+    add_result_cache(QueryParserLevel::Auto);
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    for _ in 0..2 {
+        simple(
+            &mut client,
+            "SELECT 1 AS cached; SET statement_timeout TO '10s'",
+        )
+        .await;
+    }
+
+    assert_eq!(
+        select_value(&mut client, "SELECT 2").await.as_deref(),
+        Some("2"),
+        "client got an extra ReadyForQuery"
+    );
 }

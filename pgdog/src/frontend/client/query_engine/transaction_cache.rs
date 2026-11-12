@@ -9,13 +9,11 @@
 //! read, writes to temporary tables included, so its route can't tell what
 //! the statement does: only plain `SELECT`s go through the cache.
 
-use pg_query::{
-    protobuf::{a_const::Val, TransactionStmtKind},
-    Node, NodeEnum, ParseResult,
-};
+use pg_raw_parse::{Node, nodes::TransactionStmtKind::*};
 
 use crate::{
-    net::{parameter::ParameterValue, Parameters},
+    frontend::router::parser::Ast,
+    parameters::{ParameterStore, ParameterValue},
     result_cache::statements::plain_select,
 };
 
@@ -38,21 +36,16 @@ impl Isolation {
     }
 
     /// `ISOLATION LEVEL ...` among BEGIN or SET TRANSACTION options.
-    fn from_options(options: &[Node]) -> Option<Self> {
-        options
-            .iter()
-            .find_map(|option| match option.node.as_ref()? {
-                NodeEnum::DefElem(def) if def.defname == "transaction_isolation" => {
-                    match def.arg.as_ref()?.node.as_ref()? {
-                        NodeEnum::AConst(value) => match value.val.as_ref()? {
-                            Val::Sval(name) => Some(Self::from_name(&name.sval)),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
+    fn from_options<'a>(options: impl IntoIterator<Item = Node<'a>>) -> Option<Self> {
+        options.into_iter().find_map(|option| match option {
+            Node::DefElem(def) if def.defname() == Some("transaction_isolation") => {
+                match def.arg() {
+                    Node::A_Const(value) => value.val()?.string_value().map(Self::from_name),
+                    _ => None,
                 }
-                _ => None,
-            })
+            }
+            _ => None,
+        })
     }
 }
 
@@ -72,34 +65,27 @@ pub(super) struct TransactionCache {
 
 impl TransactionCache {
     /// Note what the statements do to the transaction.
-    pub(super) fn observe(&mut self, statements: &ParseResult) {
-        for statement in &statements.protobuf.stmts {
-            let Some(node) = statement.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) else {
-                self.changed = true;
-                continue;
-            };
-            match node {
-                NodeEnum::TransactionStmt(stmt)
-                    if matches!(
-                        stmt.kind(),
-                        TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart
-                    ) =>
+    pub(super) fn observe(&mut self, statements: &Ast) {
+        for statement in statements.ast.stmts() {
+            match statement {
+                Node::TransactionStmt(stmt)
+                    if matches!(stmt.kind, TRANS_STMT_BEGIN | TRANS_STMT_START) =>
                 {
-                    self.isolation = Isolation::from_options(&stmt.options);
+                    self.isolation = Isolation::from_options(stmt.options());
                     self.changed = false;
                 }
-                NodeEnum::TransactionStmt(_) | NodeEnum::VariableShowStmt(_) => (),
-                NodeEnum::VariableSetStmt(stmt) if stmt.name == "TRANSACTION" => {
-                    if let Some(isolation) = Isolation::from_options(&stmt.args) {
+                Node::TransactionStmt(_) | Node::VariableShowStmt(_) => (),
+                Node::VariableSetStmt(stmt) if stmt.name() == Some("TRANSACTION") => {
+                    if let Some(isolation) = Isolation::from_options(stmt.args()) {
                         self.isolation = Some(isolation);
                     }
                 }
-                NodeEnum::VariableSetStmt(stmt) if stmt.name == "SESSION CHARACTERISTICS" => {
-                    if let Some(isolation) = Isolation::from_options(&stmt.args) {
+                Node::VariableSetStmt(stmt) if stmt.name() == Some("SESSION CHARACTERISTICS") => {
+                    if let Some(isolation) = Isolation::from_options(stmt.args()) {
                         self.session_snapshot = isolation == Isolation::Snapshot;
                     }
                 }
-                NodeEnum::SelectStmt(select) if plain_select(select) => (),
+                Node::SelectStmt(select) if plain_select(select) => (),
                 _ => self.changed = true,
             }
         }
@@ -114,7 +100,7 @@ impl TransactionCache {
     /// plain reads so far, and is known to be `READ COMMITTED`, or doesn't
     /// name a level, nothing the client set makes its default stricter, and
     /// `assume_default` says the default is `READ COMMITTED`.
-    pub(super) fn cacheable(&self, params: &Parameters, assume_default: bool) -> bool {
+    pub(super) fn cacheable(&self, params: &ParameterStore, assume_default: bool) -> bool {
         if self.changed {
             return false;
         }
@@ -140,13 +126,13 @@ mod test {
     fn after(statements: &[&str]) -> TransactionCache {
         let mut transaction = TransactionCache::default();
         for statement in statements {
-            transaction.observe(&pg_query::parse(statement).unwrap());
+            transaction.observe(&Ast::parse(statement).unwrap());
         }
         transaction
     }
 
     fn cacheable(statements: &[&str], assume_default: bool) -> bool {
-        after(statements).cacheable(&Parameters::default(), assume_default)
+        after(statements).cacheable(&ParameterStore::default(), assume_default)
     }
 
     #[test]
@@ -228,22 +214,22 @@ mod test {
     #[test]
     fn test_session_default_parameter() {
         let transaction = after(&["BEGIN READ ONLY"]);
-        let mut params = Parameters::default();
-        params.insert("default_transaction_isolation", "serializable");
+        let mut params = ParameterStore::default();
+        params.set("default_transaction_isolation", "serializable");
         assert!(!transaction.cacheable(&params, true));
-        params.insert("default_transaction_isolation", "read committed");
+        params.set("default_transaction_isolation", "read committed");
         assert!(transaction.cacheable(&params, true));
     }
 
     #[test]
     fn test_unparsed_statement_stops_cache() {
-        let begin = pg_query::parse("BEGIN ISOLATION LEVEL READ COMMITTED").unwrap();
+        let begin = Ast::parse("BEGIN ISOLATION LEVEL READ COMMITTED").unwrap();
         let mut transaction = TransactionCache::default();
         transaction.observe(&begin);
         transaction.unknown();
-        assert!(!transaction.cacheable(&Parameters::default(), true));
+        assert!(!transaction.cacheable(&ParameterStore::default(), true));
         transaction.observe(&begin);
-        assert!(transaction.cacheable(&Parameters::default(), false));
+        assert!(transaction.cacheable(&ParameterStore::default(), false));
     }
 
     #[test]

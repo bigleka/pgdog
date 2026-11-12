@@ -7,15 +7,17 @@ use super::super::super::code;
 use super::super::super::prelude::*;
 use super::tuple_data::TupleData;
 
+/// WAL DELETE record. Use with [`Table::delete`](crate::backend::replication::logical::publisher::Table::delete).
 #[derive(Debug, Clone)]
-pub struct Delete {
-    pub oid: Oid,
-    pub key: Option<TupleData>,
-    pub old: Option<TupleData>,
+pub(crate) struct Delete {
+    pub(crate) oid: Oid,
+    pub(crate) key: Option<TupleData>,
+    pub(crate) old: Option<TupleData>,
 }
 
 impl Delete {
-    pub fn key_non_null(&self) -> Option<TupleData> {
+    /// Returns identity columns stripped of nulls, ready for [bind](crate::net::messages::replication::TupleData::to_bind).
+    pub(crate) fn key_non_null(&self) -> Option<TupleData> {
         if let Some(ref key) = self.key {
             let columns = key
                 .columns
@@ -32,18 +34,18 @@ impl Delete {
 }
 
 impl ToBytes for Delete {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         buf.put_u8(b'D');
         buf.put_u32(self.oid.0);
         if let Some(ref key) = self.key {
             buf.put_u8(b'K');
-            buf.put(key.to_bytes()?);
+            buf.put(key.to_bytes());
         } else if let Some(ref old) = self.old {
             buf.put_u8(b'O');
-            buf.put(old.to_bytes()?);
+            buf.put(old.to_bytes());
         }
-        Ok(buf.freeze())
+        buf.freeze()
     }
 }
 

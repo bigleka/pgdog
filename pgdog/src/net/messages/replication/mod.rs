@@ -1,27 +1,24 @@
-pub mod hot_standby_feedback;
-pub mod keep_alive;
-pub mod logical;
-pub mod status_update;
-pub mod xlog_data;
+pub(crate) mod hot_standby_feedback;
+pub(crate) mod keep_alive;
+pub(crate) mod logical;
+pub(crate) mod status_update;
+pub(crate) mod xlog_data;
 
-pub use hot_standby_feedback::HotStandbyFeedback;
-pub use keep_alive::KeepAlive;
-pub use logical::begin::Begin;
-pub use logical::commit::Commit;
-pub use logical::delete::Delete;
-pub use logical::insert::Insert;
-pub use logical::relation::Relation;
-pub use logical::stream_start::StreamStart;
-pub use logical::truncate::Truncate;
-pub use logical::tuple_data::TupleData;
-pub use logical::update::Update;
-pub use status_update::StatusUpdate;
-pub use xlog_data::XLogData;
+pub(crate) use hot_standby_feedback::HotStandbyFeedback;
+pub(crate) use keep_alive::KeepAlive;
+pub(crate) use logical::commit::Commit;
+pub(crate) use logical::delete::Delete;
+pub(crate) use logical::insert::Insert;
+pub(crate) use logical::relation::Relation;
+pub(crate) use logical::tuple_data::TupleData;
+pub(crate) use logical::update::UpdateIdentity;
+pub(crate) use status_update::StatusUpdate;
+pub(crate) use xlog_data::XLogData;
 
 use super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub enum ReplicationMeta {
+pub(crate) enum ReplicationMeta {
     HotStandbyFeedback(HotStandbyFeedback),
     KeepAlive(KeepAlive),
     StatusUpdate(StatusUpdate),
@@ -39,7 +36,7 @@ impl FromBytes for ReplicationMeta {
 }
 
 impl ToBytes for ReplicationMeta {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         match self {
             Self::HotStandbyFeedback(hot) => hot.to_bytes(),
             Self::StatusUpdate(status) => status.to_bytes(),
@@ -79,7 +76,7 @@ mod tests {
             ReplicationMeta::KeepAlive(keepalive.clone()),
             ReplicationMeta::StatusUpdate(status.clone()),
         ] {
-            let bytes = meta.to_bytes().expect("serialize replication meta");
+            let bytes = meta.to_bytes();
             let decoded = ReplicationMeta::from_bytes(bytes).expect("decode replication meta");
             match (meta, decoded) {
                 (
@@ -98,10 +95,49 @@ mod tests {
                     ReplicationMeta::StatusUpdate(actual),
                 ) => {
                     assert_eq!(actual.last_written, expected.last_written);
+                    assert_eq!(actual.last_flushed, expected.last_flushed);
+                    assert_eq!(actual.last_applied, expected.last_applied);
                     assert_eq!(actual.reply, expected.reply);
                 }
                 _ => panic!("replication meta variant mismatch"),
             }
         }
+    }
+
+    #[test]
+    fn unsigned_lsn_logical_messages_roundtrip() {
+        use super::logical::begin::Begin;
+
+        let begin = Begin {
+            final_transaction_lsn: 1 << 63,
+            commit_timestamp: -1,
+            xid: 1,
+        };
+        let decoded = Begin::from_bytes(begin.to_bytes()).expect("decode begin");
+        assert_eq!(decoded.final_transaction_lsn, 1 << 63);
+        assert_eq!(decoded.commit_timestamp, -1);
+
+        let commit = Commit {
+            flags: 0,
+            commit_lsn: 1 << 63,
+            end_lsn: u64::MAX,
+            commit_timestamp: -1,
+        };
+        let decoded = Commit::from_bytes(commit.to_bytes()).expect("decode commit");
+        assert_eq!(decoded.commit_lsn, 1 << 63);
+        assert_eq!(decoded.end_lsn, u64::MAX);
+        assert_eq!(decoded.commit_timestamp, -1);
+
+        let xlog = XLogData {
+            starting_point: 1 << 63,
+            current_end: u64::MAX,
+            system_clock: -1,
+            bytes: commit.to_bytes(),
+        };
+        let decoded = XLogData::from_bytes(xlog.to_bytes()).expect("decode xlog");
+        assert_eq!(decoded.starting_point, 1 << 63);
+        assert_eq!(decoded.current_end, u64::MAX);
+        assert_eq!(decoded.system_clock, -1);
+        assert_eq!(decoded.bytes, xlog.bytes);
     }
 }

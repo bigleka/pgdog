@@ -1,4 +1,5 @@
-use std::str::{from_utf8, FromStr};
+use std::borrow::Cow;
+use std::str::{FromStr, from_utf8};
 
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::{
 use bytes::Bytes;
 
 #[derive(Debug, Clone)]
-pub enum Data<'a> {
+pub(crate) enum Data<'a> {
     Text(&'a str),
     Binary(&'a [u8]),
     Integer(i64),
@@ -41,13 +42,13 @@ impl<'a> From<&'a Bytes> for Data<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Value<'a> {
+pub(crate) struct Value<'a> {
     data_type: DataType,
     data: Data<'a>,
 }
 
 impl<'a> Value<'a> {
-    pub fn new(data: impl Into<Data<'a>>, data_type: DataType) -> Self {
+    pub(crate) fn new(data: impl Into<Data<'a>>, data_type: DataType) -> Self {
         Self {
             data_type,
             data: data.into(),
@@ -56,12 +57,25 @@ impl<'a> Value<'a> {
 
     /// Convert parameter to value, given the data type
     /// and known encoding.
-    pub fn from_param(
+    pub(crate) fn from_param(
         param: &'a ParameterWithFormat<'a>,
         data_type: DataType,
     ) -> Result<Self, Error> {
         let data = param.data();
-        let format = param.format();
+        let mut format = param.format();
+        // Hacky workaround to make `$1::uuid` work if `$1` is a text
+        // parameter sent in binary format. Uuid is the only type we can safely
+        // detect this case for
+        // FIXME: This is a hack and we should remove it once the parser
+        // is able to be aware of the actual data type of parameters instead of
+        // guessing
+        if data_type == DataType::Uuid
+            && data.len() != 16
+            && let Ok(text) = from_utf8(data)
+            && Uuid::from_str(text).is_ok()
+        {
+            format = Format::Text
+        }
 
         match format {
             Format::Text => Ok(Self::new(from_utf8(data)?, data_type)),
@@ -69,7 +83,7 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn vector(&self) -> Result<Option<Vector>, Error> {
+    pub(crate) fn vector(&self) -> Result<Option<Vector>, Error> {
         if self.data_type == DataType::Vector {
             match self.data {
                 Data::Text(text) => Ok(Some(Vector::decode(text.as_bytes(), Format::Text)?)),
@@ -81,7 +95,7 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         match self.data_type {
             DataType::Bigint => match self.data {
                 Data::Text(text) => text.parse::<i64>().is_ok(),
@@ -103,11 +117,7 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn data(&self) -> &Data<'_> {
-        &self.data
-    }
-
-    pub fn integer(&self) -> Result<Option<i64>, Error> {
+    pub(crate) fn integer(&self) -> Result<Option<i64>, Error> {
         if self.data_type == DataType::Bigint {
             match self.data {
                 Data::Integer(int) => Ok(Some(int)),
@@ -127,7 +137,20 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn varchar(&self) -> Result<Option<&str>, Error> {
+    /// The value's canonical text form, used to translate binary
+    /// values through sharding key lookups. `None` for data types
+    /// without one, e.g. vectors. Text that is already in place is
+    /// borrowed, not copied.
+    pub(crate) fn to_text(&self) -> Result<Option<Cow<'_, str>>, Error> {
+        match self.data_type {
+            DataType::Bigint => Ok(self.integer()?.map(|int| Cow::Owned(int.to_string()))),
+            DataType::Varchar => Ok(self.varchar()?.map(Cow::Borrowed)),
+            DataType::Uuid => Ok(self.uuid()?.map(|uuid| Cow::Owned(uuid.to_string()))),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn varchar(&self) -> Result<Option<&str>, Error> {
         if self.data_type == DataType::Varchar {
             match self.data {
                 Data::Integer(_) => Ok(None),
@@ -139,7 +162,7 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn uuid(&self) -> Result<Option<Uuid>, Error> {
+    pub(crate) fn uuid(&self) -> Result<Option<Uuid>, Error> {
         if self.data_type != DataType::Uuid {
             return Ok(None);
         }
@@ -153,7 +176,7 @@ impl<'a> Value<'a> {
         Ok(Some(uuid))
     }
 
-    pub fn hash(&self, hasher: Hasher) -> Result<Option<u64>, Error> {
+    pub(crate) fn hash(&self, hasher: Hasher) -> Result<Option<u64>, Error> {
         match self.data_type {
             DataType::Bigint => match self.data {
                 Data::Text(text) => Ok(Some(
@@ -191,6 +214,41 @@ impl<'a> Value<'a> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn to_text_decodes_binary_values() -> Result<(), Error> {
+        let bigint = 42_i64.to_be_bytes();
+        let value = Value {
+            data_type: DataType::Bigint,
+            data: Data::Binary(&bigint),
+        };
+        assert_eq!(value.to_text()?.as_deref(), Some("42"));
+
+        let value = Value {
+            data_type: DataType::Varchar,
+            data: Data::Binary(b"tenant_a"),
+        };
+        assert_eq!(value.to_text()?.as_deref(), Some("tenant_a"));
+
+        let uuid_bytes = [0x11_u8; 16];
+        let value = Value {
+            data_type: DataType::Uuid,
+            data: Data::Binary(&uuid_bytes),
+        };
+        assert_eq!(
+            value.to_text()?.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+
+        // Text values pass through.
+        let value = Value {
+            data_type: DataType::Bigint,
+            data: Data::Text("42"),
+        };
+        assert_eq!(value.to_text()?.as_deref(), Some("42"));
+
+        Ok(())
+    }
 
     #[test]
     fn uuid_binary_parses_correctly() -> Result<(), Error> {

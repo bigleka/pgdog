@@ -1,27 +1,28 @@
-use fnv::FnvHashSet;
+use fnv::FnvHashMap;
 
-use crate::frontend::router::parser::statement::{AdvisoryLocks as ParserAdvisoryLocks, LockScope};
+use crate::frontend::router::parser::advisory_lock::{AdvisoryLock, AdvisoryLockId, LockScope};
 
 /// Tracks advisory locks held by the current client across requests.
 #[derive(Default, Debug)]
 pub(crate) struct AdvisoryLocks {
-    locks: FnvHashSet<i64>,
+    locks: FnvHashMap<AdvisoryLockId, AdvisoryLock>,
 }
 
 impl AdvisoryLocks {
-    pub(crate) fn merge(&mut self, locks: &ParserAdvisoryLocks) {
-        for lock in locks.iter() {
-            if lock.unlock {
+    pub(crate) fn merge<'a>(&mut self, locks: impl IntoIterator<Item = &'a AdvisoryLock>) {
+        for lock in locks {
+            if lock.unlock_all {
+                self.locks.clear();
+            } else if lock.unlock {
+                // An unresolved individual unlock cannot release every tracked lock.
                 if let Some(id) = lock.id {
                     self.locks.remove(&id);
-                } else {
-                    // pg_advisory_unlock_all() clears every advisory lock.
-                    self.locks.clear();
                 }
-            } else if let Some(id) = lock.id {
-                if lock.scope == LockScope::Session {
-                    self.locks.insert(id);
-                }
+            } else if let Some(id) = lock.id
+                && lock.scope == LockScope::Session
+                && !self.locks.contains_key(&id)
+            {
+                self.locks.insert(id, *lock);
             }
         }
     }
@@ -30,9 +31,13 @@ impl AdvisoryLocks {
         !self.locks.is_empty()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.locks.clear();
+    }
+
     #[cfg(test)]
-    pub(crate) fn contains(&self, id: i64) -> bool {
-        self.locks.contains(&id)
+    pub(crate) fn contains(&self, id: AdvisoryLockId) -> bool {
+        self.locks.contains_key(&id)
     }
 
     #[cfg(test)]

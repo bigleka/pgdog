@@ -1,4 +1,4 @@
-use rust::setup::connections_tokio;
+use crate::setup::connections_tokio;
 
 fn extract_simple_query_value(msgs: &[tokio_postgres::SimpleQueryMessage]) -> String {
     for msg in msgs {
@@ -46,17 +46,10 @@ async fn test_multi_set_with_timezone_interval() {
 }
 
 #[tokio::test]
-async fn test_multi_set_mixed_returns_error() {
+async fn test_multi_set_mixed_works() {
     for conn in connections_tokio().await {
-        let err = conn
-            .batch_execute("SET statement_timeout TO '10s'; SELECT 1")
+        conn.batch_execute("SET statement_timeout TO '10s'; SELECT 1")
             .await
-            .unwrap_err();
-        let db_err = err.as_db_error().expect("Expected a DbError");
-        let msg = db_err.message();
-        assert!(
-            msg.contains("multi-statement queries cannot mix SET with other commands"),
-            "unexpected error: {msg}",
-        );
+            .unwrap();
     }
 }

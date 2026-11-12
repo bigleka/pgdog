@@ -1,45 +1,33 @@
 //! Connection pool errors.
 use thiserror::Error;
 
-use crate::net::BackendKeyData;
+use crate::net::BackendPid;
 
 #[derive(Debug, Error, PartialEq, Clone, Copy)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("checkout timeout")]
     CheckoutTimeout,
 
     #[error("connect timeout")]
     ConnectTimeout,
 
-    #[error("replica checkout timeout")]
-    ReplicaCheckoutTimeout,
-
     #[error("server error")]
     ServerError,
+
+    #[error("server auth error")]
+    ServerAuth,
 
     #[error("manual ban")]
     ManualBan,
 
-    #[error("no replicas")]
-    NoReplicas,
-
     #[error("no such shard: {0}")]
     NoShard(usize),
-
-    #[error("pool is banned")]
-    Banned,
-
-    #[error("healthcheck timeout")]
-    HealthcheckTimeout,
 
     #[error("healthcheck error")]
     HealthcheckError,
 
-    #[error("primary lsn query failed")]
-    PrimaryLsnQueryFailed,
-
-    #[error("replica lsn query failed")]
-    ReplicaLsnQueryFailed,
+    #[error("server closed")]
+    ServerClosed,
 
     #[error("pool is shut down")]
     Offline,
@@ -50,35 +38,26 @@ pub enum Error {
     #[error("no databases")]
     NoDatabases,
 
-    #[error("config values contain null bytes")]
-    NullBytes,
-
     #[error("all replicas down")]
     AllReplicasDown,
 
-    #[error("router error")]
-    Router,
-
     #[error("pub/sub disabled")]
     PubSubDisabled,
-
-    #[error("pool {0} has no health target")]
-    PoolNoHealthTarget(u64),
 
     #[error("pool is not healthy")]
     PoolUnhealthy,
 
     #[error("checked in untracked connection: {0}")]
-    UntrackedConnCheckin(BackendKeyData),
-
-    #[error("mapping missing: {0}")]
-    MappingMissing(usize),
+    UntrackedConnCheckin(BackendPid),
 
     #[error("fast shutdown failed")]
     FastShutdown,
 
     #[error("replica lag")]
     ReplicaLag,
+
+    #[error("initial health check has not been successfully performed")]
+    InitialHealthCheck,
 }
 
 impl Error {
@@ -86,16 +65,13 @@ impl Error {
     ///
     /// Non-retryable: config errors, admin decisions, programming errors.
     /// Everything else (timeouts, server faults, lag, health misses) is transient.
-    pub fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         !matches!(
             self,
             // Config / wiring errors — retrying changes nothing.
-            Self::NullBytes
-                | Self::NoShard(_)
+            Self::NoShard(_)
                 | Self::NoDatabases
                 | Self::PubSubDisabled
-                | Self::PoolNoHealthTarget(_)
-                | Self::MappingMissing(_)
                 // Admin decisions — respect them.
                 | Self::ManualBan
                 // Programming errors.
@@ -114,16 +90,11 @@ mod tests {
     fn retryable() {
         assert!(Error::CheckoutTimeout.is_retryable());
         assert!(Error::ConnectTimeout.is_retryable());
-        assert!(Error::ReplicaCheckoutTimeout.is_retryable());
         assert!(Error::NoPrimary.is_retryable());
         assert!(Error::AllReplicasDown.is_retryable());
-        assert!(Error::Banned.is_retryable());
-        assert!(Error::NoReplicas.is_retryable());
         assert!(Error::ServerError.is_retryable());
-        assert!(Error::HealthcheckTimeout.is_retryable());
         assert!(Error::HealthcheckError.is_retryable());
-        assert!(Error::PrimaryLsnQueryFailed.is_retryable());
-        assert!(Error::ReplicaLsnQueryFailed.is_retryable());
+        assert!(Error::ServerClosed.is_retryable());
         assert!(Error::Offline.is_retryable());
         assert!(Error::ReplicaLag.is_retryable());
         assert!(Error::PoolUnhealthy.is_retryable());
@@ -132,11 +103,9 @@ mod tests {
     #[test]
     fn not_retryable() {
         assert!(!Error::ManualBan.is_retryable());
-        assert!(!Error::NullBytes.is_retryable());
         assert!(!Error::NoDatabases.is_retryable());
         assert!(!Error::PubSubDisabled.is_retryable());
         assert!(!Error::FastShutdown.is_retryable());
         assert!(!Error::NoShard(0).is_retryable());
-        assert!(!Error::MappingMissing(0).is_retryable());
     }
 }

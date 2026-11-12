@@ -1,26 +1,23 @@
 use bytes::BytesMut;
 use tracing::warn;
 
-use crate::net::messages::{CopyData, Message};
-
 use super::super::code;
 use super::super::prelude::*;
 use super::logical::begin::Begin;
 use super::logical::commit::Commit;
 use super::logical::delete::Delete;
 use super::logical::insert::Insert;
+use super::logical::message::Message;
 use super::logical::relation::Relation;
-use super::logical::stream_start::StreamStart;
-use super::logical::truncate::Truncate;
 use super::logical::update::Update;
 
 /// XLogData (B) message.
 #[derive(Clone)]
-pub struct XLogData {
-    pub starting_point: i64,
-    pub current_end: i64,
-    pub system_clock: i64,
-    pub bytes: Bytes,
+pub(crate) struct XLogData {
+    pub(crate) starting_point: u64,
+    pub(crate) current_end: u64,
+    pub(crate) system_clock: i64,
+    pub(crate) bytes: Bytes,
 }
 
 impl std::fmt::Debug for XLogData {
@@ -45,23 +42,8 @@ impl std::fmt::Debug for XLogData {
 }
 
 impl XLogData {
-    /// New relation message.
-    pub fn relation(system_clock: i64, relation: &Relation) -> Result<Self, Error> {
-        Ok(Self {
-            starting_point: 0,
-            current_end: 0,
-            system_clock: system_clock - 1, // simulates this to be an older message
-            bytes: relation.to_bytes()?,
-        })
-    }
-
-    /// Convert to message.
-    pub fn to_message(&self) -> Result<Message, Error> {
-        Ok(Message::new(CopyData::bytes(self.to_bytes()?).to_bytes()?))
-    }
-
     /// Extract payload.
-    pub fn payload(&self) -> Option<XLogPayload> {
+    pub(crate) fn payload(&self) -> Option<XLogPayload> {
         if self.bytes.is_empty() {
             return None;
         }
@@ -78,19 +60,19 @@ impl XLogData {
             'B' => Begin::from_bytes(self.bytes.clone())
                 .ok()
                 .map(XLogPayload::Begin),
-            'T' => Truncate::from_bytes(self.bytes.clone())
-                .ok()
-                .map(XLogPayload::Truncate),
+            'T' => Some(XLogPayload::Truncate),
             'U' => Update::from_bytes(self.bytes.clone())
                 .ok()
                 .map(XLogPayload::Update),
             'D' => Delete::from_bytes(self.bytes.clone())
                 .ok()
                 .map(XLogPayload::Delete),
-            'S' => StreamStart::from_bytes(self.bytes.clone())
-                .ok()
-                .map(XLogPayload::Start),
+            'S' => Some(XLogPayload::Start),
             'E' => Some(XLogPayload::End),
+            'M' => Message::from_bytes(self.bytes.clone())
+                .inspect_err(|err| warn!("skipping logical message: {}", err))
+                .ok()
+                .map(XLogPayload::Message),
             c => {
                 warn!("unknown xlog message: {}", c);
                 None
@@ -98,16 +80,8 @@ impl XLogData {
         }
     }
 
-    /// Get stored payload of type.
-    ///
-    /// Caller is responsible to make sure the message has the right code.
-    ///
-    pub fn get<T: FromBytes>(&self) -> Option<T> {
-        T::from_bytes(self.bytes.clone()).ok()
-    }
-
     /// Length.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }
 }
@@ -115,8 +89,8 @@ impl XLogData {
 impl FromBytes for XLogData {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
         code!(bytes, 'w');
-        let starting_point = bytes.get_i64();
-        let current_end = bytes.get_i64();
+        let starting_point = bytes.get_u64();
+        let current_end = bytes.get_u64();
         let system_clock = bytes.get_i64();
 
         Ok(Self {
@@ -129,14 +103,14 @@ impl FromBytes for XLogData {
 }
 
 impl ToBytes for XLogData {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = BytesMut::new();
         payload.put_u8(self.code() as u8);
-        payload.put_i64(self.starting_point);
-        payload.put_i64(self.current_end);
+        payload.put_u64(self.starting_point);
+        payload.put_u64(self.current_end);
         payload.put_i64(self.system_clock);
         payload.put(self.bytes.clone());
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -147,14 +121,17 @@ impl Protocol for XLogData {
 }
 
 #[derive(Debug, Clone)]
-pub enum XLogPayload {
+pub(crate) enum XLogPayload {
     Begin(Begin),
     Commit(Commit),
     Insert(Insert),
     Relation(Relation),
-    Truncate(Truncate),
+    Truncate,
     Update(Update),
     Delete(Delete),
     End,
-    Start(StreamStart),
+    Start,
+    /// Will be used in follow-up PR.
+    #[allow(dead_code)]
+    Message(Message),
 }

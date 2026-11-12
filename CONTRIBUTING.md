@@ -1,10 +1,11 @@
 # Contribution guidelines
 
-Contributions are welcome. If you see a bug, feel free to submit a PR with a fix or an issue to discuss. For any features, please open an issue to discuss first.
+If you see a bug or would like to request a feature, please create an [issue](https://github.com/pgdogdev/pgdog/issues). If you would like to submit a bug fix, please fork the repository and give us a link to your branch. Pull requests are currently restricted to project contributors.
 
 ## Necessary crates - cargo install <name>
 
 (if you use mise, these can be installed with `mise install`)
+
 - cargo-nextest
 - cargo-watch
 
@@ -17,8 +18,8 @@ Contributions are welcome. If you see a bug, feel free to submit a PR with a fix
    settings and creates the test databases. If any settings were changed, the script
    will exit with a notice — restart PostgreSQL and re-run the script before continuing.
 5. Run Redis (or Valkey/Dragonfly) on `127.0.0.1:6379`, needed by the result cache tests.
-6. Run the tests `cargo nextest run --profile dev`. If a test fails, try running it directly.
-7. Run the integration tests `bash integration/run.sh` or exact integration test with `bash integration/go/run.sh`.
+6. Run the unit tests with `cargo nextest run`. If some test fails, try running it directly.
+7. Run the integration tests `bash integration/run.sh` or exact integration test e.g. `bash integration/go/run.sh`.
 
 ## Coding
 

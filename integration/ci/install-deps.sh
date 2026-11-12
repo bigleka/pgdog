@@ -15,20 +15,22 @@ NEXTEST_VERSION="${NEXTEST_VERSION:-0.9.78}"
 LLVM_COV_VERSION="${LLVM_COV_VERSION:-0.6.10}"
 CMAKE_VERSION="${CMAKE_VERSION:-3.31.6}"
 
-if ! dpkg -s mold >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y --no-install-recommends mold
-fi
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64) NEXTEST_PLATFORM=linux ;;
+    aarch64) NEXTEST_PLATFORM=linux-arm ;;
+    *) echo "install-deps.sh: unsupported architecture ${ARCH}" >&2; exit 1 ;;
+esac
 
-# Result cache tests run against every supported Redis topology
-# (integration/ci/redis-topologies.sh): Redis, Sentinel and twemproxy.
-# Downloads from the runners fail now and then (connection reset, hung
-# transfers): retry them instead of failing the job.
-CURL_RETRY="--retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300"
-
-if ! dpkg -s redis-server redis-sentinel nutcracker >/dev/null 2>&1; then
+# Bencher compiles PgDog on the runner before assembling its runtime image.
+# pg-internals needs libclang plus PostgreSQL's default configure dependencies.
+build_packages=(
+    mold gdb clang libclang-dev pkg-config
+    libicu-dev libreadline-dev zlib1g-dev bison flex perl
+)
+if ! dpkg -s "${build_packages[@]}" >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends redis-server redis-sentinel nutcracker
+    sudo apt-get install -y --no-install-recommends "${build_packages[@]}"
 fi
 
 # The protocol_version smoke test needs a psql >= 18 client. The runner
@@ -36,7 +38,7 @@ fi
 # the highest installed major, so /usr/bin/psql will resolve to 18.
 if ! dpkg -s postgresql-client-18 >/dev/null 2>&1; then
     sudo install -d /usr/share/postgresql-common/pgdg
-    sudo curl $CURL_RETRY -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    sudo curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
         https://www.postgresql.org/media/keys/ACCC4CF8.asc
     . /etc/os-release
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
@@ -47,21 +49,32 @@ fi
 
 # Kitware prebuilt cmake pinned to the version pgdog expects. Much faster
 # than `pip install cmake` which compiles from source.
+CMAKE_DIR="$HOME/.local/cmake/cmake-${CMAKE_VERSION}-linux-${ARCH}"
+if [[ ! -x "$CMAKE_DIR/bin/cmake" ]]; then
+    mkdir -p "$HOME/.local/cmake"
+    curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${ARCH}.tar.gz" \
+        | tar xzf - -C "$HOME/.local/cmake"
+fi
 if ! cmake --version 2>/dev/null | head -1 | grep -q "$CMAKE_VERSION"; then
-    curl $CURL_RETRY -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
-        | sudo tar xzf - -C /opt
-    sudo ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/local/bin/cmake
-    sudo ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/ctest" /usr/local/bin/ctest
+    sudo ln -sf "$CMAKE_DIR/bin/cmake" /usr/local/bin/cmake
+    sudo ln -sf "$CMAKE_DIR/bin/ctest" /usr/local/bin/ctest
 fi
 
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$CARGO_BIN"
 
 if ! command -v cargo-nextest >/dev/null; then
-    curl $CURL_RETRY -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar zxf - -C "$CARGO_BIN"
+    curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/${NEXTEST_PLATFORM}" | tar zxf - -C "$CARGO_BIN"
 fi
 
 if ! command -v cargo-llvm-cov >/dev/null; then
-    curl $CURL_RETRY -LsSf "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" \
+    curl -LsSf "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${LLVM_COV_VERSION}/cargo-llvm-cov-${ARCH}-unknown-linux-gnu.tar.gz" \
         | tar zxf - -C "$CARGO_BIN"
+fi
+
+# cargo llvm-cov report needs llvm-profdata/llvm-cov from llvm-tools-preview.
+if command -v rustup >/dev/null 2>&1; then
+    if ! rustup component list --installed 2>/dev/null | grep -q llvm-tools; then
+        rustup component add llvm-tools-preview || true
+    fi
 fi

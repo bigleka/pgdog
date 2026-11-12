@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -8,25 +7,49 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tracing::info;
+use tokio::select;
+use tracing::{info, warn};
 
-use super::{Clients, MirrorStatsMetrics, Pools, QueryCache, ResultCache};
+use super::{
+    Clients, ClientsLocked, Listeners, LookupMetrics, MirrorStatsMetrics, Pools, QueryCache,
+    ResultCache, TokenCache, TwoPc,
+};
+use crate::tasks;
+use crate::util::server::accept;
 
 /// Everything the OpenMetrics endpoint serves.
 pub(crate) fn render() -> String {
     let clients = Clients::load();
+    let clients_locked = ClientsLocked::load();
     let pools = Pools::load();
     let mirror_stats: Vec<_> = MirrorStatsMetrics::load()
         .into_iter()
         .map(|m| m.to_string())
         .collect();
     let mirror_stats = mirror_stats.join("\n");
+    let lookup_stats: Vec<_> = LookupMetrics::load()
+        .into_iter()
+        .map(|m| m.to_string())
+        .collect();
+    let lookup_stats = lookup_stats.join("\n");
+    let listeners: Vec<_> = Listeners::load()
+        .into_iter()
+        .map(|m| m.to_string())
+        .collect();
+    let listeners = listeners.join("\n");
     let query_cache: Vec<_> = QueryCache::load()
         .metrics()
         .into_iter()
         .map(|m| m.to_string())
         .collect();
     let query_cache = query_cache.join("\n");
+    let token_cache: Vec<_> = TokenCache::load()
+        .metrics()
+        .into_iter()
+        .map(|m| m.to_string())
+        .collect();
+    let token_cache = token_cache.join("\n");
+    let two_pc = TwoPc::load();
     let result_cache: Vec<_> = ResultCache::metrics()
         .into_iter()
         .map(|m| m.to_string())
@@ -34,11 +57,21 @@ pub(crate) fn render() -> String {
     let result_cache = result_cache.join("\n");
     clients.to_string()
         + "\n"
+        + &clients_locked.to_string()
+        + "\n"
         + &pools.to_string()
         + "\n"
         + &mirror_stats
         + "\n"
+        + &lookup_stats
+        + "\n"
+        + &listeners
+        + "\n"
         + &query_cache
+        + "\n"
+        + &token_cache
+        + "\n"
+        + &two_pc.to_string()
         + "\n"
         + &result_cache
 }
@@ -56,22 +89,39 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
     Ok(response)
 }
 
-pub async fn server(port: u16) -> std::io::Result<()> {
-    info!("OpenMetrics endpoint http://0.0.0.0:{}", port);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
+pub(crate) async fn server(host: &str, port: u16) -> std::io::Result<()> {
+    let addr = format!("{}:{}", host, port);
+    info!("OpenMetrics endpoint http://{}", addr);
+    let listener = TcpListener::bind(&addr).await?;
+    let shutdown = tasks::shutdown_signal();
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = select! {
+            connection = accept(&listener) => connection,
+            _ = shutdown.cancelled() => break,
+        };
         let io = TokioIo::new(stream);
+        let shutdown = shutdown.clone();
 
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(metrics))
-                .await
-            {
-                eprintln!("OpenMetrics endpoint error: {:?}", err);
+        tasks::spawn("openmetrics http server", async move {
+            let connection = http1::Builder::new().serve_connection(io, service_fn(metrics));
+
+            tokio::select! {
+                result = connection => {
+                    if let Err(err) = result {
+                        // Clients (TCP health probes, scrapers that disconnect
+                        // mid-request, keep-alive teardown) routinely close the socket
+                        // before sending a complete request. That surfaces as
+                        // IncompleteMessage and is benign.
+                        if !err.is_incomplete_message() {
+                            warn!("OpenMetrics endpoint error: {:?}", err);
+                        }
+                    }
+                }
+                _ = shutdown.cancelled() => {}
             }
         });
     }
+
+    Ok(())
 }

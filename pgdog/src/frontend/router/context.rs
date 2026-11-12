@@ -1,78 +1,95 @@
 use super::{Error, ParameterHints};
+use crate::frontend::client::transaction_type::Transaction;
 use crate::{
     backend::{Cluster, Schema},
     frontend::{
-        client::{Sticky, TransactionType},
-        router::Ast,
         BufferedQuery, ClientRequest,
+        client::Sticky,
+        router::{Ast, RoutingComment, parser::StatementParameters, sharding::ResolvedLookups},
     },
-    net::{Bind, Parameters},
 };
 
-#[derive(Debug)]
-pub struct RouterContext<'a> {
+#[derive(Debug, Clone)]
+pub(crate) struct RouterContext<'a> {
     /// Bound parameters to the query.
-    pub bind: Option<&'a Bind>,
+    pub(super) bind: Option<StatementParameters<'a>>,
     /// Query we're looking it.
-    pub query: Option<BufferedQuery>,
+    pub(super) query: Option<BufferedQuery>,
     /// Cluster configuration.
-    pub cluster: &'a Cluster,
+    pub(super) cluster: &'a Cluster,
     /// Client parameters, e.g. search_path.
-    pub parameter_hints: ParameterHints<'a>,
+    pub(super) parameter_hints: ParameterHints<'a>,
     /// Client inside transaction,
-    pub transaction: Option<TransactionType>,
+    pub(super) transaction: Option<Transaction>,
     /// Currently executing COPY statement.
-    pub copy_mode: bool,
+    pub(super) copy_mode: bool,
     /// Do we have an executable buffer?
-    pub executable: bool,
+    pub(super) executable: bool,
     /// Two-pc enabled
-    pub two_pc: bool,
+    pub(super) two_pc: bool,
     /// Sticky omnisharded index.
-    pub sticky: Sticky,
-    /// Extended protocol.
-    pub extended: bool,
+    pub(super) sticky: Sticky,
     /// AST.
-    pub ast: Option<Ast>,
+    pub(super) ast: Option<&'a Ast>,
+    /// Was the AST loaded from the cache?
+    pub(super) cached: bool,
+    /// Routing comment on the original query
+    pub(super) comment: Option<&'a RoutingComment>,
     /// Schema.
-    pub schema: Schema,
-    /// Original client request.
-    pub client_request: &'a ClientRequest,
+    pub(super) schema: &'a Schema,
+    /// Sharding key translations resolved for this statement. Routing
+    /// reads these before the lookup cache, so a second routing pass
+    /// after resolving lookups can't miss.
+    pub(super) resolved_lookups: ResolvedLookups,
+    /// Using extended protocol.
+    pub(super) extended: bool,
 }
 
 impl<'a> RouterContext<'a> {
-    pub fn new(
+    pub(crate) fn new(
         buffer: &'a ClientRequest,
         cluster: &'a Cluster,
-        params: &'a Parameters,
-        transaction: Option<TransactionType>,
+        params: impl Into<ParameterHints<'a>>,
+        transaction: Option<Transaction>,
         sticky: Sticky,
     ) -> Result<Self, Error> {
         let query = buffer.query()?;
-        let bind = buffer.parameters()?;
+        let bind = buffer.parameters()?.map(|bind| bind.into());
         let copy_mode = buffer.is_copy();
 
         Ok(Self {
+            extended: query
+                .as_ref()
+                .map(|query| query.extended())
+                .unwrap_or_default(),
             bind,
-            parameter_hints: ParameterHints::from(params),
+            parameter_hints: params.into(),
             cluster,
             transaction,
             copy_mode,
             executable: buffer.is_executable(),
             two_pc: cluster.two_pc_enabled(),
             sticky,
-            extended: matches!(query, Some(BufferedQuery::Prepared(_))) || bind.is_some(),
             query,
-            ast: buffer.ast.clone(),
-            schema: cluster.schema(),
-            client_request: buffer,
+            ast: buffer.ast.as_deref(),
+            cached: buffer.cached,
+            comment: buffer.routing_comment.as_deref(),
+            schema: cluster.loaded_schema(),
+            resolved_lookups: ResolvedLookups::default(),
         })
     }
 
-    pub fn in_transaction(&self) -> bool {
+    /// Attach sharding key translations resolved for this statement.
+    pub(crate) fn with_resolved_lookups(mut self, resolved: ResolvedLookups) -> Self {
+        self.resolved_lookups = resolved;
+        self
+    }
+
+    pub(crate) fn in_transaction(&self) -> bool {
         self.transaction.is_some()
     }
 
-    pub fn transaction(&self) -> &Option<TransactionType> {
+    pub(crate) fn transaction(&self) -> &Option<Transaction> {
         &self.transaction
     }
 }

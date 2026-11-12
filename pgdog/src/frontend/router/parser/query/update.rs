@@ -3,23 +3,27 @@ use super::*;
 impl QueryParser {
     pub(super) fn update(
         &mut self,
-        stmt: &UpdateStmt,
+        stmt: pg_raw_parse::Node<'_>,
         context: &mut QueryParserContext,
     ) -> Result<Command, Error> {
-        let mut parser = StatementParser::from_update(
-            stmt,
-            context.router_context.bind,
-            &context.sharding_schema,
-            self.recorder_mut(),
-        );
+        let mut parser =
+            StatementParser::new(stmt, context.router_context.bind, context.sharding_schema)
+                .with_explain(self.recorder_mut().is_some());
+        parser.set_resolved_lookups(&context.router_context.resolved_lookups);
 
         let is_sharded = parser.is_sharded(
-            &context.router_context.schema,
+            context.router_context.schema,
             context.router_context.cluster.user(),
             context.router_context.parameter_hints.search_path,
         );
-
         let shard = parser.shard()?;
+        if let Some(recorder) = self.recorder_mut() {
+            recorder.extend(parser.take_explain());
+        }
+        let pending_lookups = parser.take_pending_lookups();
+        context.pending_lookups.extend(pending_lookups);
+        let omnisharded = !is_sharded && shard.is_none();
+
         if let Some(shard) = shard {
             if let Some(recorder) = self.recorder_mut() {
                 recorder.record_entry(
@@ -45,9 +49,11 @@ impl QueryParser {
             }
         }
 
-        Ok(Command::Query(Route::write(
-            context.shards_calculator.shard(),
-        )))
+        Ok(Command::Query(
+            Route::write(context.shards_calculator.shard())
+                .with_omnisharded(omnisharded)
+                .dml(),
+        ))
     }
 }
 
@@ -57,44 +63,31 @@ mod tests {
 
     #[test]
     fn update_preserves_decimal_values() {
-        let parsed = pgdog_plugin::pg_query::parse(
+        let parsed = pg_raw_parse::parse(
             "UPDATE transactions SET amount = 50.00, status = 'completed' WHERE id = 1",
         )
-        .expect("parse");
+        .unwrap();
 
-        let stmt = parsed
-            .protobuf
-            .stmts
-            .first()
-            .and_then(|node| node.stmt.as_ref())
-            .and_then(|node| node.node.as_ref())
-            .expect("statement node");
-
-        let update = match stmt {
-            NodeEnum::UpdateStmt(update) => update,
-            _ => panic!("expected update stmt"),
+        let Some(Node::UpdateStmt(update)) = parsed.stmts().next() else {
+            panic!("expected update stmt");
         };
 
         // Check that we can extract assignment values including decimals
         let mut found_decimal = false;
         let mut found_string = false;
 
-        for target in &update.target_list {
-            if let Some(NodeEnum::ResTarget(res)) = &target.node {
-                if let Some(val) = &res.val {
-                    let value = Value::try_from(&val.node).unwrap();
-                    match value {
-                        Value::Float(f) => {
-                            assert_eq!(f, 50.0);
-                            found_decimal = true;
-                        }
-                        Value::String(s) => {
-                            assert_eq!(s, "completed");
-                            found_string = true;
-                        }
-                        _ => {}
-                    }
+        for target in update.target_list() {
+            let value = Value::try_from(target.val()).unwrap();
+            match value {
+                Value::Float(f) => {
+                    assert_eq!(f, 50.0);
+                    found_decimal = true;
                 }
+                Value::String(s) => {
+                    assert_eq!(s, "completed");
+                    found_string = true;
+                }
+                _ => {}
             }
         }
         assert!(found_decimal, "Should have found decimal value");
@@ -104,33 +97,19 @@ mod tests {
     #[test]
     fn update_with_quoted_decimal() {
         let parsed =
-            pgdog_plugin::pg_query::parse("UPDATE transactions SET amount = '50.00' WHERE id = 1")
-                .expect("parse");
+            pg_raw_parse::parse("UPDATE transactions SET amount = '50.00' WHERE id = 1").unwrap();
 
-        let stmt = parsed
-            .protobuf
-            .stmts
-            .first()
-            .and_then(|node| node.stmt.as_ref())
-            .and_then(|node| node.node.as_ref())
-            .expect("statement node");
-
-        let update = match stmt {
-            NodeEnum::UpdateStmt(update) => update,
-            _ => panic!("expected update stmt"),
+        let Some(Node::UpdateStmt(update)) = parsed.stmts().next() else {
+            panic!("expected update stmt");
         };
 
         // Quoted decimals should be treated as strings
         let mut found_string = false;
-        for target in &update.target_list {
-            if let Some(NodeEnum::ResTarget(res)) = &target.node {
-                if let Some(val) = &res.val {
-                    let value = Value::try_from(&val.node).unwrap();
-                    if let Value::String(s) = value {
-                        assert_eq!(s, "50.00");
-                        found_string = true;
-                    }
-                }
+        for target in update.target_list() {
+            let value = Value::try_from(target.val()).unwrap();
+            if let Value::String(s) = value {
+                assert_eq!(s, "50.00");
+                found_string = true;
             }
         }
         assert!(found_string, "Should have found string value");

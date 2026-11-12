@@ -5,7 +5,7 @@ use crate::{
 
 use super::prelude::*;
 
-pub struct ShowServerMemory;
+pub(crate) struct ShowServerMemory;
 
 #[async_trait]
 impl Command for ShowServerMemory {
@@ -33,10 +33,10 @@ impl Command for ShowServerMemory {
             Field::numeric("net_buffer_bytes"),
             Field::numeric("total_bytes"),
         ]);
-        let mut messages = vec![rd.message()?];
+        let mut messages = vec![rd.message()];
 
         let stats = stats();
-        for (_, server) in stats {
+        for server in stats {
             let mut row = DataRow::new();
             let memory = &server.stats.memory;
 
@@ -45,7 +45,7 @@ impl Command for ShowServerMemory {
                 .add(server.addr.user.as_str())
                 .add(server.addr.host.as_str())
                 .add(server.addr.port as i64)
-                .add(server.stats.id.pid as i64)
+                .add(server.stats.id)
                 .add(memory.buffer.reallocs as i64)
                 .add(memory.buffer.reclaims as i64)
                 .add(memory.buffer.bytes_used as i64)
@@ -54,7 +54,7 @@ impl Command for ShowServerMemory {
                 .add(memory.stream as i64)
                 .add((memory.total()) as i64);
 
-            messages.push(row.message()?);
+            messages.push(row.message());
         }
 
         Ok(messages)

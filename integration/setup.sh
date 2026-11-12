@@ -2,11 +2,10 @@
 set -e
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-if [[ "$OS" == "darwin" ]]; then
-    ARCH=arm64
-else
-    ARCH=amd64
-fi
+case "$(uname -m)" in
+    arm64|aarch64) ARCH=arm64 ;;
+    *) ARCH=amd64 ;;
+esac
 
 # Verify and apply required PostgreSQL system settings.
 # ALTER SYSTEM cannot run inside a function/DO block, so checks are done in bash.
@@ -45,6 +44,13 @@ _pg_check_str wal_level                 logical
 _pg_check_int max_worker_processes      64
 _pg_check_int max_wal_senders           32
 _pg_check_int max_replication_slots     32
+# PostgreSQL 18 moved the replication origin limit from max_replication_slots to
+# max_active_replication_origins. Older versions do not have it and are covered above.
+# https://www.postgresql.org/docs/release/18.0/
+# https://www.postgresql.org/docs/18/runtime-config-replication.html#GUC-MAX-ACTIVE-REPLICATION-ORIGINS
+if [[ -n "$(psql -tAc "SELECT current_setting('max_active_replication_origins', true)")" ]]; then
+    _pg_check_int max_active_replication_origins 32
+fi
 
 if [[ "$_pg_needs_restart" == true ]]; then
     echo 'PostgreSQL settings changed. Restart PostgreSQL and re-run this script.'
@@ -59,8 +65,8 @@ for user in pgdog pgdog1 pgdog2 pgdog3; do
 done
 
 # GitHub fix
-if [[ "$USER" == "runner" ]]; then
-    psql -c "ALTER USER runner PASSWORD 'pgdog' LOGIN;"
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    psql -c "ALTER USER \"$(id -un)\" PASSWORD 'pgdog' LOGIN;"
 fi
 
 export PGPASSWORD='pgdog'
@@ -68,16 +74,25 @@ export PGHOST=127.0.0.1
 export PGPORT=5432
 export PGUSER='pgdog'
 
-for db in pgdog shard_0 shard_1 shard_2 shard_3; do
+pg_stat_monitor_available=$(psql -tAc "SELECT EXISTS (SELECT FROM pg_available_extensions WHERE name = 'pg_stat_monitor')")
+if [[ "$pg_stat_monitor_available" != t ]]; then
+    echo "WARNING: pg_stat_monitor extension is not available. The Rust subqueries integration test will fail." >&2
+    echo "WARNING: Install pg_stat_monitor and add it to shared_preload_libraries, then run this script again." >&2
+fi
+
+for db in testing pgdog shard_0 shard_1 shard_2 shard_3; do
     psql -c "DROP DATABASE $db" || true
     psql -c "CREATE DATABASE $db" || true
+    if [[ "$pg_stat_monitor_available" == t ]]; then
+        psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_monitor" ${db}
+    fi
     for user in pgdog pgdog1 pgdog2 pgdog3; do
         psql -c "GRANT ALL ON DATABASE $db TO ${user}"
         psql -c "GRANT ALL ON SCHEMA public TO ${user}" ${db}
     done
 done
 
-for db in pgdog shard_0 shard_1 shard_2 shard_3; do
+for db in testing pgdog shard_0 shard_1 shard_2 shard_3; do
     for table in sharded sharded_omni; do
             psql -c "DROP TABLE IF EXISTS ${table}" ${db} -U pgdog
             psql -c "CREATE TABLE IF NOT EXISTS ${table} (
@@ -95,7 +110,7 @@ for db in pgdog shard_0 shard_1 shard_2 shard_3; do
     psql -c "CREATE TABLE IF NOT EXISTS sharded_varchar (id_varchar VARCHAR)" ${db} -U pgdog
     psql -c "CREATE TABLE IF NOT EXISTS sharded_uuid (id_uuid UUID PRIMARY KEY)" -d "$db" -U pgdog
 
-    for table in list range; do
+    for table in list_deprecated range_deprecated list range mapping_hierarchy; do
         psql -c "CREATE TABLE IF NOT EXISTS sharded_${table} (id BIGINT)" ${db} -U pgdog
     done
 
@@ -107,8 +122,13 @@ done
 pushd ${SCRIPT_DIR}
 
 for bin in toxiproxy-server toxiproxy-cli; do
-    if [[ ! -f ${bin} ]]; then
-        curl -L https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/${bin}-${OS}-${ARCH} > ${bin}
+    if [[ ! -x ${bin} ]] && command -v ${bin} > /dev/null; then
+        ln -sf "$(command -v ${bin})" ${bin}
+    fi
+    if [[ ! -x ${bin} ]]; then
+        rm -f ${bin}
+        curl -fsSL --retry 5 --retry-all-errors -o ${bin} \
+            https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/${bin}-${OS}-${ARCH}
         chmod +x ${bin}
     fi
 done

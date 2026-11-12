@@ -9,7 +9,7 @@ use crate::config::{config, set};
 
 use super::{
     prelude::*,
-    result_cache::{enable_result_cache, select_value, simple, TestTable},
+    result_cache::{TestTable, enable_result_cache, select_value, simple},
 };
 
 fn use_redis(mode: RedisMode, url: &str, urls: &[&str]) {
@@ -66,20 +66,20 @@ async fn test_redis_cluster() {
             "redis://127.0.0.1:7002",
         ],
     );
-    cache_and_invalidate().await;
+    Box::pin(cache_and_invalidate()).await;
 }
 
 /// Seed list of one node: the rest of the cluster is discovered.
 #[tokio::test]
 async fn test_redis_cluster_from_redis_url() {
     use_redis(RedisMode::Cluster, "redis://127.0.0.1:7001", &[]);
-    cache_and_invalidate().await;
+    Box::pin(cache_and_invalidate()).await;
 }
 
 #[tokio::test]
 async fn test_proxy() {
     use_redis(RedisMode::Standalone, "redis://127.0.0.1:22121", &[]);
-    cache_and_invalidate().await;
+    Box::pin(cache_and_invalidate()).await;
 }
 
 /// With Redis down, the cache must get out of the way: queries go straight
@@ -213,7 +213,7 @@ fn use_sentinel(master: &str) {
 #[tokio::test]
 async fn test_redis_sentinel() {
     use_sentinel("pgdog-cache");
-    cache_and_invalidate().await;
+    Box::pin(cache_and_invalidate()).await;
 }
 
 /// After a Sentinel failover, PgDog moves to the new primary: writes through
@@ -277,10 +277,10 @@ async fn test_redis_sentinel_failover() {
                 .await
         }
         .await;
-        if let Ok(role) = role {
-            if matches!(role.first(), Some(redis::Value::BulkString(role)) if role == b"slave") {
-                break;
-            }
+        if let Ok(role) = role
+            && matches!(role.first(), Some(redis::Value::BulkString(role)) if role == b"slave")
+        {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,

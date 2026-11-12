@@ -8,16 +8,16 @@
 use std::time::Duration;
 
 use pgdog_config::{Database, QueryParserLevel, ReadWriteSplit, ResultCache, Role};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use tokio::time::sleep;
 
 use crate::{
     backend::{
-        databases::reload_from_existing, pool::Address, ConnectReason, Server, ServerOptions,
+        ConnectReason, Server, ServerOptions, databases::reload_from_existing, pool::Address,
     },
-    config::{set, ConfigAndUsers, User},
-    frontend::router::parser::OwnedTable,
+    config::{ConfigAndUsers, User, set},
     result_cache::redis::RedisResultCache,
+    result_cache::tables::OwnedTable,
 };
 
 use super::{
@@ -73,9 +73,14 @@ async fn connect(database: &str) -> Server {
         database_name: database.into(),
         ..Address::new_test()
     };
-    Server::connect(&address, ServerOptions::default(), ConnectReason::Other)
-        .await
-        .unwrap()
+    Server::connect(
+        &address,
+        ServerOptions::default(),
+        ConnectReason::Other,
+        Default::default(),
+    )
+    .await
+    .unwrap()
 }
 
 /// Table `(id, v)` holding `(1, 1)` on both the primary and the replica.
@@ -139,7 +144,7 @@ impl Table {
 #[tokio::test]
 async fn test_disabled_reads_stale_replica() {
     configure(|result_cache| result_cache.read_after_write_window_ms = Some(0));
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let mut writer = TestClient::new(Parameters::default()).await;
     let mut reader = TestClient::new(Parameters::default()).await;
 
@@ -153,7 +158,7 @@ async fn test_disabled_reads_stale_replica() {
 #[tokio::test]
 async fn test_session_reads_its_write() {
     configure(|_| ());
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let mut client = TestClient::new(Parameters::default()).await;
 
     simple(&mut client, &table.update(2)).await;
@@ -207,7 +212,7 @@ async fn test_no_replicas_no_primary_reads_counted() {
 #[tokio::test]
 async fn test_other_client_reads_write_and_caches_it() {
     configure(|_| ());
-    let mut table = Table::new().await;
+    let mut table = Box::pin(Table::new()).await;
     let mut writer = TestClient::new(Parameters::default()).await;
     let mut reader = TestClient::new(Parameters::default()).await;
 
@@ -233,7 +238,7 @@ async fn test_other_client_reads_write_and_caches_it() {
 #[tokio::test]
 async fn test_write_through_other_pgdog() {
     configure(|_| ());
-    let mut table = Table::new().await;
+    let mut table = Box::pin(Table::new()).await;
     let mut client = TestClient::new(Parameters::default()).await;
 
     table.primary.execute(table.update(2)).await.unwrap();
@@ -254,7 +259,7 @@ async fn test_write_through_other_pgdog() {
 #[tokio::test]
 async fn test_replicas_serve_reads_after_window() {
     configure(|_| ());
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let mut client = TestClient::new(Parameters::default()).await;
 
     simple(&mut client, &table.update(2)).await;
@@ -273,7 +278,7 @@ async fn test_replicas_serve_reads_after_window() {
 /// Reads PgDog doesn't cache still see the session's own writes.
 #[tokio::test]
 async fn test_session_reads_its_write_on_uncached_table() {
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let name = table.name.clone();
     configure(|result_cache| result_cache.cache_unsafe_table_list = vec![name]);
     let mut client = TestClient::new(Parameters::default()).await;
@@ -294,7 +299,7 @@ async fn test_session_reads_its_write_on_uncached_table() {
 #[tokio::test]
 async fn test_transaction_reads_session_write() {
     configure(|_| ());
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let mut client = TestClient::new(Parameters::default()).await;
 
     simple(&mut client, &table.update(2)).await;
@@ -329,7 +334,7 @@ async fn schema_of(table: &mut Table) -> String {
 /// see the write. Not cached, so only the session's own list sends it to
 /// the primary.
 async fn session_reads_its_write_by_other_name(qualified_write: bool) -> Option<String> {
-    let mut table = Table::new().await;
+    let mut table = Box::pin(Table::new()).await;
     let name = table.name.clone();
     configure(|result_cache| result_cache.cache_unsafe_table_list = vec![name]);
     let schema = schema_of(&mut table).await;
@@ -356,7 +361,7 @@ async fn session_reads_its_write_by_other_name(qualified_write: bool) -> Option<
 #[tokio::test]
 async fn test_session_reads_unqualified_write_by_schema() {
     assert_eq!(
-        session_reads_its_write_by_other_name(false)
+        Box::pin(session_reads_its_write_by_other_name(false))
             .await
             .as_deref(),
         Some("2"),
@@ -367,7 +372,9 @@ async fn test_session_reads_unqualified_write_by_schema() {
 #[tokio::test]
 async fn test_session_reads_qualified_write_unqualified() {
     assert_eq!(
-        session_reads_its_write_by_other_name(true).await.as_deref(),
+        Box::pin(session_reads_its_write_by_other_name(true))
+            .await
+            .as_deref(),
         Some("2"),
         "SELECT FROM t after UPDATE <schema>.t went to the stale replica"
     );
@@ -379,7 +386,7 @@ async fn test_session_reads_qualified_write_unqualified() {
 #[tokio::test]
 async fn test_read_only_transaction_on_replica_doesnt_cache_stale_result() {
     configure(|result_cache| result_cache.cache_read_only_transactions = true);
-    let table = Table::new().await;
+    let table = Box::pin(Table::new()).await;
     let mut writer = TestClient::new(Parameters::default()).await;
     let mut reader = TestClient::new(Parameters::default()).await;
     let mut other = TestClient::new(Parameters::default()).await;

@@ -3,7 +3,7 @@
 use super::prelude::*;
 use crate::backend::databases::reload;
 
-pub struct Reload;
+pub(crate) struct Reload;
 
 #[async_trait]
 impl Command for Reload {
@@ -16,7 +16,8 @@ impl Command for Reload {
     }
 
     async fn execute(&self) -> Result<Vec<Message>, Error> {
-        reload()?;
+        // false = NOT a force reload
+        reload(false)?;
         Ok(vec![])
     }
 }

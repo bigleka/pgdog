@@ -7,17 +7,17 @@
 
 use std::time::Duration;
 
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use tokio::{runtime::Handle, task::JoinHandle, time::sleep};
 use tracing::warn;
 
 use crate::stats::ResultCache as Stats;
 
 use super::{
+    ResultCacheKey,
     connection::Connection,
     entry::Entry,
     redis::{RedisResultCache, ResultCacheConfig},
-    ResultCacheKey,
 };
 
 /// How often a waiting PgDog checks for the result.

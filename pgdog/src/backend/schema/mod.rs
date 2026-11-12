@@ -1,9 +1,10 @@
 //! Schema operations.
-pub mod columns;
-pub mod relation;
-pub mod sync;
+pub(crate) mod cache;
+pub(crate) mod columns;
+pub(crate) mod relation;
+pub(crate) mod sync;
 
-pub use pgdog_stats::{
+pub(crate) use pgdog_stats::{
     Relation as StatsRelation, Relations as StatsRelations, Schema as StatsSchema, SchemaInner,
 };
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,10 @@ use std::ops::DerefMut;
 use std::{collections::HashMap, ops::Deref};
 use tracing::info;
 
-pub use relation::Relation;
+pub(crate) use cache::SchemaCache;
+pub(crate) use relation::Relation;
 
-use super::{pool::Request, Cluster, Error, Server};
+use super::{Cluster, Error, Server, pool::Request};
 use crate::frontend::router::parser::Table;
 use crate::net::parameter::ParameterValue;
 use sync::ShardConfig;
@@ -22,7 +24,7 @@ static SETUP: &str = include_str!("setup.sql");
 
 /// Load schema from database.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Hash)]
-pub struct Schema {
+pub(crate) struct Schema {
     inner: StatsSchema,
 }
 
@@ -42,7 +44,7 @@ impl DerefMut for Schema {
 
 impl Schema {
     /// Load schema from a server connection.
-    pub async fn load(server: &mut Server) -> Result<Self, Error> {
+    pub(crate) async fn load(server: &mut Server) -> Result<Self, Error> {
         let mut relations: StatsRelations = HashMap::new();
         for relation in Relation::load(server).await? {
             relations
@@ -60,9 +62,18 @@ impl Schema {
             .map(|p| p.trim().replace("\"", ""))
             .collect();
 
+        let aggregate_functions = server
+            .fetch_all::<String>(
+                "SELECT DISTINCT proname FROM pg_proc INNER JOIN pg_aggregate ON oid = aggfnoid",
+            )
+            .await?
+            .into_iter()
+            .collect();
+
         let inner = SchemaInner {
             search_path,
             relations,
+            aggregate_functions,
         };
 
         Ok(Self {
@@ -80,6 +91,15 @@ impl Schema {
         search_path: Vec<String>,
         relations: HashMap<(String, String), Relation>,
     ) -> Self {
+        Self::from_parts_with_agg(search_path, relations, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_with_agg(
+        search_path: Vec<String>,
+        relations: HashMap<(String, String), Relation>,
+        aggregate_functions: Vec<String>,
+    ) -> Self {
         let mut nested: StatsRelations = HashMap::new();
         for ((schema, name), relation) in relations {
             nested
@@ -91,12 +111,13 @@ impl Schema {
             inner: StatsSchema::new(SchemaInner {
                 search_path,
                 relations: nested,
+                aggregate_functions: aggregate_functions.into_iter().collect(),
             }),
         }
     }
 
     /// Install PgDog functions and schema.
-    pub async fn setup(server: &mut Server) -> Result<(), Error> {
+    pub(crate) async fn setup(server: &mut Server) -> Result<(), Error> {
         server.execute_checked(SETUP).await?;
         Ok(())
     }
@@ -130,7 +151,7 @@ impl Schema {
             for column in table.columns().iter().filter(|column| {
                 column.1.is_primary_key // Only primary keys.
                     && matches!(column.1.data_type.as_str(), "bigint" | "int8") // Only BIGINT.
-                                                                                // Only the ones that rely on a sequence.
+                // Only the ones that rely on a sequence.
             }) {
                 info!(
                     "[schema] creating sharded sequence for \"{}\".\"{}\".\"{}\"",
@@ -152,9 +173,9 @@ impl Schema {
     }
 
     /// Install PgDog-specific functions and triggers.
-    pub async fn install(cluster: &Cluster) -> Result<(), Error> {
+    pub(crate) async fn install(cluster: &Cluster) -> Result<(), Error> {
         let shards = cluster.shards();
-        let sharded_tables = cluster.sharded_tables();
+        let sharded_tables = cluster.sharded_tables().tables();
 
         if sharded_tables.is_empty() {
             return Ok(());
@@ -175,7 +196,7 @@ impl Schema {
     ///
     /// If the table has an explicit schema, looks up in that schema directly.
     /// Otherwise, iterates through the search_path to find the first match.
-    pub fn table(
+    pub(crate) fn table(
         &self,
         table: Table<'_>,
         user: &str,
@@ -210,7 +231,7 @@ impl Schema {
     }
 
     /// Get all tables.
-    pub fn tables(&self) -> Vec<&StatsRelation> {
+    pub(crate) fn tables(&self) -> Vec<&StatsRelation> {
         self.inner
             .relations
             .values()
@@ -219,18 +240,8 @@ impl Schema {
             .collect()
     }
 
-    /// Get all sequences.
-    pub fn sequences(&self) -> Vec<&StatsRelation> {
-        self.inner
-            .relations
-            .values()
-            .flat_map(|tables| tables.values())
-            .filter(|relation| relation.is_sequence())
-            .collect()
-    }
-
     /// Get search path components.
-    pub fn search_path(&self) -> &[String] {
+    pub(crate) fn search_path(&self) -> &[String] {
         &self.inner.search_path
     }
 }
@@ -261,8 +272,10 @@ mod test {
         Schema::setup(&mut conn).await.unwrap();
         let schema = Schema::load(&mut conn).await.unwrap();
         let seq = schema
-            .sequences()
-            .into_iter()
+            .relations
+            .values()
+            .flat_map(|tables| tables.values())
+            .filter(|relation| relation.is_sequence())
             .find(|seq| seq.schema() == "pgdog")
             .cloned()
             .unwrap();
@@ -554,5 +567,29 @@ mod test {
                 default.first(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_loading_aggregate_functions() {
+        let mut server = test_server().await;
+        server.execute_checked("BEGIN").await.unwrap();
+
+        let schema = Schema::load(&mut server).await.unwrap();
+        assert!(
+            !schema
+                .aggregate_functions
+                .contains(&String::from("pgdog_sum"))
+        );
+
+        server
+            .execute_checked("CREATE AGGREGATE pgdog_sum (int4) (sfunc = int4_sum, stype = bigint)")
+            .await
+            .unwrap();
+        let schema = Schema::load(&mut server).await.unwrap();
+        assert!(
+            schema
+                .aggregate_functions
+                .contains(&String::from("pgdog_sum"))
+        );
     }
 }

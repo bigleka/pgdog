@@ -4,7 +4,7 @@ use pgdog_config::Tcp;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 
-pub fn tweak(socket: &TcpStream, config: &Tcp) -> Result<()> {
+pub(crate) fn tweak(socket: &TcpStream, config: &Tcp) -> Result<()> {
     // Disable the Nagle algorithm.
     socket.set_nodelay(true)?;
 
@@ -17,6 +17,7 @@ pub fn tweak(socket: &TcpStream, config: &Tcp) -> Result<()> {
     if let Some(interval) = config.interval() {
         params = params.with_interval(interval);
     }
+    #[cfg(target_os = "linux")]
     if let Some(retries) = config.retries() {
         params = params.with_retries(retries);
     }

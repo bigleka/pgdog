@@ -4,7 +4,7 @@ use crate::util::millis;
 
 use super::prelude::*;
 
-pub struct ShowStats;
+pub(crate) struct ShowStats;
 
 #[async_trait]
 impl Command for ShowStats {
@@ -40,23 +40,33 @@ impl Command for ShowStats {
                         Field::numeric(&format!("{}_idle_xact_time", prefix)),
                         Field::numeric(&format!("{}_query_time", prefix)),
                         Field::numeric(&format!("{}_wait_time", prefix)),
-                        // Field::numeric(&format!("{}_client_parse_count", prefix)),
                         Field::numeric(&format!("{}_server_parse_count", prefix)),
                         Field::numeric(&format!("{}_bind_count", prefix)),
                         Field::numeric(&format!("{}_close_count", prefix)),
                         Field::numeric(&format!("{}_errors", prefix)),
+                        Field::numeric(&format!("{}_checkout_timeouts", prefix)),
                         Field::numeric(&format!("{}_cleaned", prefix)),
                         Field::numeric(&format!("{}_rollbacks", prefix)),
+                        Field::numeric(&format!("{}_idle_xact_timeouts", prefix)),
                         Field::numeric(&format!("{}_connect_time", prefix)),
                         Field::numeric(&format!("{}_connect_count", prefix)),
                         Field::numeric(&format!("{}_reads", prefix)),
                         Field::numeric(&format!("{}_writes", prefix)),
+                        Field::numeric(&format!("{}_auth_attempts", prefix)),
+                        Field::numeric(&format!("{}_rows_inserted", prefix)),
+                        Field::numeric(&format!("{}_rows_updated", prefix)),
+                        Field::numeric(&format!("{}_rows_deleted", prefix)),
+                        Field::numeric(&format!("{}_rows_copied", prefix)),
+                        Field::numeric(&format!("{}_tables_created", prefix)),
+                        Field::numeric(&format!("{}_tables_dropped", prefix)),
+                        Field::numeric(&format!("{}_ddl_commands", prefix)),
+                        Field::numeric(&format!("{}_dml_commands", prefix)),
                     ]
                 })
                 .collect::<Vec<Field>>(),
         );
 
-        let mut messages = vec![RowDescription::new(&fields).message()?];
+        let mut messages = vec![RowDescription::new(&fields).message()];
 
         let clusters = databases().all().clone();
 
@@ -94,15 +104,26 @@ impl Command for ShowStats {
                             .add(stat.bind_count)
                             .add(stat.close)
                             .add(stat.errors)
+                            .add(stat.checkout_timeouts)
                             .add(stat.cleaned)
                             .add(stat.rollbacks)
+                            .add(stat.idle_xact_timeouts)
                             .add(millis(stat.connect_time))
                             .add(stat.connect_count)
                             .add(stat.reads)
-                            .add(stat.writes);
+                            .add(stat.writes)
+                            .add(stat.auth_attempts)
+                            .add(stat.rows_inserted)
+                            .add(stat.rows_updated)
+                            .add(stat.rows_deleted)
+                            .add(stat.rows_copied)
+                            .add(stat.tables_created)
+                            .add(stat.tables_dropped)
+                            .add(stat.ddl_commands)
+                            .add(stat.dml_commands);
                     }
 
-                    messages.push(dr.message()?);
+                    messages.push(dr.message());
                 }
             }
         }

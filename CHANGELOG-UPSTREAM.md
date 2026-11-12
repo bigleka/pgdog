@@ -1,0 +1,460 @@
+# Changelog
+
+PgDog is released weekly, on Thursdays. Each release includes tagged Docker images, pre-built binaries and a documented list of changes.
+
+For the [Enterprise edition](https://docs.pgdog.dev/enterprise_edition/), see [CHANGELOG-ENTERPRISE.md](CHANGELOG-ENTERPRISE.md).
+
+### v0.1.63
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.63` |
+
+#### Features
+
+- Add support for recursive cross-shard subqueries (i.e., subquery inside another subquery) @jkaczman
+- Add support for `INSERT INTO [...] SELECT [...] FROM` subqueries @jkaczman
+- Add support for handling subqueries in right side of boolean expression in a WHERE clause @jkaczman
+- **Breaking** `prepared_statements_limit` is now set to 5,000 by default. This is to prevent statement leaks when that setting is not set and the pg client driver does not use prepared statements optimally (e.g., tokio-postgres). @levkk
+- Add a bunch of CLI tools to the production Docker image to help with debugging (e.g., netstat, dig, etc.)
+- Add `min_connections` OTEL/OpenMetrics gauge which tracks `min_pool_size` for each connection pool @meskill
+- Make `SIGTERM` behave like `SIGINT`, preventing common misuse in cloud-native environments @meskill
+- Cross-shard `ORDER BY` now supports `CASE` expressions @jkaczman
+- Partial support for `HAVING` in cross-shard aggregates @murex971
+- Support cumulative temporailty for OTEL metrics, allowing to export those metrics to servers that don't support incremental measurements, e.g., GCP @jkaczman
+- Parse `URI` on TLS certificates along with `dnsName` to be used as identity for client-to-PgDog mTLS @eidam @levkk
+
+#### Performance
+
+- Query router performance improvements (5-12% improvement in microbenchmarks). @jkaczman
+- Replace query cache mutex with a rwlock, decreasing contention on the AST cache. The cache now uses CLOCK (second chance) eviction to enforce the LRU policy. @jkaczman
+- Improve cross-shard INSERT handling by grouping tuples that belong to the same shard into a single statement. @jkaczman
+- Skip query routing logic in non-sharded single primary/replicas-only clusters. CPU utilization reduced by 1.3%. @jkaczman
+- Make PgDog production Docker images 35% smaller @meskill
+- Remove redundant clock reads in the hot path @jkaczman
+
+#### Bug fixes
+
+- Make `SET` more Postgres-compliant: return errors on incorrect parameter values, return correct `ParameterStatus` messages, handle `RESET` correctly for `DateStyle` and other parameters that have connection defaults, correctly return multiple `CommandComplete` messages for multi-query `SET` statements.
+- `min_pool_size` was incorrectly rejected on `[[users]]` entries when `passthrough_auth` was enabled @meskill
+- Logical replication couldn't handle tables with primary keys that cover all table columns @levkk
+- Extended protocol error recovery had an edge case that could cause PgDog to stall @levkk @frangz
+- Sharding key updates were incorrectly blocked to omnisharded tables wherie they were safe @levkk
+- [Enterprise] Cancelled replication tasks were incorrectly tracked as completed @meskill
+- Some resharding tasks could hang on cancellation @meskill
+- Some extended protocol messages (e.g., Describe) were incorrectly routed in cross-shard transactions @meskill
+- PgDog would crash if it would run out of available open file descriptions. Correct behavior is to return an error and continue operations. @meskill
+- Reject unsupported cross-shard aggregates with `HAVING` clause instead of returning wrong results @murex971
+- Correctly parse `-c` startup parameters in `Startup` message @meskill
+- Cross-shard `INSERT` transaction using `two_phase_commit_auto` would not automatically commit @meskill
+- Don't disconnect clients that attempt to use `LISTEN`/`NOTIFY` when `pub_sub_channel_size` is 0 @murex971
+- Correctly stick pg catalog omnisharded queries to one shard, allowing tools like `pg_dump` to work correctly with sharded databases @meskill
+- `GROUP BY 0` and other invalid values would crash PgDog @murex971
+
+#### Security
+
+- Prevent clients directly executing PgDog-prepared statements by internal name. This only affected users that were able to authenticate to PgDog, so multi-tenant publicly accessible deployments should consider upgrading. @levkk
+
+#### Code quality
+
+- Subquery test suite runs in parallel for all DML queries @jkaczman
+- Cleanup transaction handling to re-use the same simulated responses code @levkk
+- Use `pg_stat_monitor` extension in tests to validate correct statement routing @jkaczman
+- Move to self-hosted metal instances for performance regression testing @jkaczman
+- Updated to latest Tokio @meskill
+- Use instruction count instead of latency for microbenchmarks @jkaczman
+
+### v0.1.62
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.62` |
+
+#### Features
+
+- Basic support for cross-shard subqueries @jkaczman
+- Add `auth_type` config to user entries in `users.toml` @levkk @BABTUNA
+- Use replication origin to track replication progress during resharding. This makes it durable and allows us to recover progress after a crash (still a TODO). @meskill
+- Add row-level metrics for DML/DDL queries @murex971
+- Ensure non-deterministic functions like `now()` return consistent results in cross-shard DELETEs @jkaczman
+- Support parsing custom logical messages to handle DDL replication @jkaczman
+
+#### Bug fixes
+
+- `pg_try_advisory_lock` handling was optimistic / did not account for lock not being actually available. PgDog will only pin the session now if the lock was actually acquired. @levkk
+- `DISCARD ALL` returned wrong command tag, breaking JDBC driver prepared statements handling @levkk
+- `SET` now correctly overrides `SET LOCAL` inside a transaction @levkk
+- `RESET` now correctly restores startup parameters @levkk
+- `ROLLBACK` no longer undo's a `RESET` from previous transaction @levkk
+- Invalid parameter settings would leave server connection in a partial/dirty state @levkk
+- Parameter names were incorrectly escaped @levkk
+- `SET LOCAL [...] TO DEFAULT` would be incorrectly treated as `SET` @anna-poutanen
+- PgDog now compiles under FreeBSD @mahlonsmith
+- `COPY` identifiers (table name and column names) are now correctly escaped during resharding @BABTUNA
+- Correctly handle `ABORT` and `END` when query parser is off. This was regression introduced in v0.1.60. @levkk @valanor-vaelmir
+- Correctly detect sharding key in join clause @levkk @PeterZaitsev
+- Correctly check that each shard committed the transaction before returning success during resharding @jkaczman
+- Unsupported agggregate functions now return an `ERROR` instead of `FATAL` @levkk @PeterZaitsev
+- Fix `avg()` scale for cross-shard numerics @murex971 @PeterZaitsev
+
+#### Performance
+
+- Reduce memory usage of prepared statements cache after bursts of new statements are added and removed. This affects drivers like `tokio-postgres`, `go/pq`, `Postgrex` and others that prepare one-off prepared statements to execute queries
+
+#### Code quality
+
+- Improve replication benchmark @meskill
+- Microbenchmarks for our query engine @jkaczman
+
+### v0.1.61
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.61` |
+
+#### Performance
+
+- Improve resharding COPY read performance by over 10x on network-bound storage databases (e.g., RDS) with large toasted tables @jkaczman
+- Cache query ASTs regardless of comments, improving query parse time for queries that use comments for routing @sgrif
+- Use jemalloc in our query parser, decreasing memory usage for deployments using long queries @levkk
+- Improve schema loading times at PgDog startup by a factor of 10 @levkk @ariel-lahiany
+- Improve resharding replication performance by 80% by switching to async shard writes @jkaczman
+
+#### Bug fixes
+
+- `LISTEN` and `NOTIFY` didn't escape identifiers, breaking pub/sub for channel names and payloads containing non-escaped data @mhenrixon
+- Passthrough auth would block pool until configuration was reloaded if user connected with a bad password. We now check the password before adding the user into the in-memory config. @levkk
+- Backend connection recovery would commit implicit transactions for pipelined requests @murex971
+- Cross-shard `ORDER BY` would use wrong column if it was aliased in the target list @jkaczman
+- Account for WAL timeline to detect new primary after failover; tools like Patroni don't terminate failed primaries, so PgDog was confused when it was able to connect to one @levkk @roshangara
+- `LISTEN`/`NOTIFY` broker connection would not restart if terminated by Postgres @levkk @alphec
+- Fix crash if multi-statement query contained `RESET ALL` @levkk @roshangara
+- Regression in `LIMIT` not working without `ORDER BY` in cross-shard queries @levkk @nsavvide
+- Correctly handle `SET LOCAL` outside of transactions @murex971
+- `CREATE TEMP SEQUENCE` now correctly pins connections @murex971
+- Fix off-by-one error in sharding replication table LSNs @jkaczman
+- Don't rewrite client requests before mirroring, allowing mirrors to use a different sharding configuration @sgrif
+- Fix configuration reloads blocking traffic to existing databases temporarily while they run a health check if `require_healthcheck_on_discovery` was enabled @frodsan
+- Generate direct-to-shard and cross-shard variants for queries containing aggregates/ordering/limit/offset/etc. to make sure we don't rewrite the query if it uses direct-to-shard routing. @murex971
+- `pg_advisory_unlock(NULL)` incorrectly released all advisory locks @dipeshbabu
+- Correctly handle parameter casting for `UUID` parameters in query routing for sharded deployments @sgrif
+- Correctly handle `RESET ALL` @dipeshbabu
+
+#### Features
+
+- Allow to configure `auth_type` on users in `users.toml`
+- **[Breaking]** Plugins now have to process one statement at a time @sgrif
+- **[Experimental]** Support for RDS IAM passthrough authentication. PgDog attempts to connect to RDS with the token provided by the user, and if successful, caches that token for 15 minutes. This works reasonably well if clients use IAM tokens correctly (i.e., they cache them for 15 minutes, too) @levkk
+- **[Breaking]** For globally distributed sequences (EE-only), include the schema name into the sequence @murex971
+- Validate foreign key constraints after resharding is complete @meskill
+- Transactions now lazily connect to shards as needed. This allows direct-to-shard explicit transactions _not_ to connect to all shards at all times, improving connection pool efficiency. @levkk
+- Cross-shard `UPDATE` and `SELECT` queries that use non-deterministic functions (e.g., `now()`, `current_timestamp()`) now read/write consistent values across all shards (generated by PgDog instead of the database) @jkaczman
+- Show accurate memory usage for AST cache using Postgres arena allocator statistic @sgrif
+- Wait for resharding tasks to shutdown gracefully on PgDog shutdown @meskill
+- Send replication state to control plane (EE) @meskill
+
+#### Code quality
+
+- Sharded our CI, which is now 5 times faster @jkaczman
+- Benchmark each commit using Bencher to prevent performance regressions @jkaczman
+
+#### Note for contributors
+
+We stopped accepting pull requests on the repository due to large influx of AI-generated submissions. PgDog still accepts bug reports, feature requests, and fixes, as long as those are submitted via GitHub issues instead. If you want to provide code, please send us a branch from your own fork. We will probably rewrite it to match our code quality standards, but we'll credit you for the contribution.
+
+🙏 ❤️
+
+**Full Changelog**: https://github.com/pgdogdev/pgdog/compare/v0.1.60...v0.1.61
+
+### v0.1.60
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.60` |
+
+#### Performance
+
+- 40% faster handling of `SELECT` in sharded queries by removing redundant AST walks @jkaczman
+
+#### Bugs
+
+- 0.0 and -0.0 hashed to the same value, which broke `DISTINCT`, `count()` and other cross-shard functions @MaxFreedomPollard
+- `session_replication_role` should be set via `SET` command @levkk
+- `interval` type wasn't correctly parsed for some edge cases in cross-shard aggregates @dipeshbabu
+- `stddev` / `variance` failed on some `NULL` values in cross-shard aggregates @dipeshbabu
+- `count()` wouldn't preserve original input type / would cast everything to `bigint` @dipeshbabu
+- `NULL` was incorrectly handled in array elements in cross-shard queries @dipeshbabu
+- `timestamp`(tz) infinite values were not correctly parsed in cross-shard queries @dipeshbabu
+- `timestamp`(tz) fractional time wasn't correctly preserved in cross-shard queries @dipeshbabu
+- `jemalloc` would crash on ARM targets with page size >= 16k @dipeshbabu
+- client/server TLS wouldn't load the whole chain, so client keys signed by intermediates were rejected @dipeshbabu
+- don't run 2pc on direct-to-shard write transactions @rlittlefield
+- connection pool statistics are preserved on `RELOAD` @murex971
+- handle `numeric` infinite values correctly in cross-shard queries @dipeshbabu
+- fully-qualified columns were skipped in `DISTINCT ON` @jkaczman
+- sequence names are quoted to make sure they work with all table names @dipeshbabu
+- don't drop `SET check_function_bodies` in schema sync @meskill
+- pg deparser wasn't handling timezone operations correctly @meskill
+- correctly route advisory lock calls in sharded deployments & handle the two parameter variant @jkaczman
+- correctly track `pg_catalog.pg_advisory_*` fully qualified advisory lock calls @dipeshbabu
+
+#### Code quality
+
+- migrate replication/resharding to new tasks API @meskill
+- `unique_id` and `insert_splits` cleanup @sgrif
+- auto retries to some flaky spots in CI @jkaczman
+
+**Full Changelog**: https://github.com/pgdogdev/pgdog/compare/v0.1.59...v0.1.60
+
+### v0.1.59
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.59` |
+
+#### Bug fixes
+
+- **[Breaking]** Manual bans are now carried over to new connection pools after `RELOAD`. They were previously discarded, allowing traffic to flow through prematurely after configuration reload. Breaking because this changes existing behavior and may require operators to adjust migration scripts to issue a separate `UNBAN` command after `RELOAD`. @levkk
+- Schema reload was not triggered on certain DDL statements, e.g., `CREATE TYPE`, which caused incorrect `RowDescription` messages to be sent to clients for direct-to-shard and cross-shard queries which touched those new types. @levkk
+- 2pc WAL checkpointer could cause WAL corruption by removing segments necessary for recovery. Fixed by storing relationships between segments containing data about the same transaction, preventing dependent segments from being removed prematurely. @levkk
+- SCRAM authentication could cause DoS because it was moved to background Tokio threads, which were unbounded. Added `background_workers` setting (default 0, disabling this whole feature) to limit that concurrency. Moved SCRAM auth back to the Tokio async worker pool. @levkk
+- Fix segfault in query normalization (only affected the Enterprise edition) caused by a bug in our parser. Added `pg_raw_parse::normalize` to our regression test suite to prevent recurrences. @levkk
+- Setting `connection_recovery` to `drop` would cause connection churn for connection drivers using prepared statements. Fixed by ensuring we don't drop connections in this scenario. @levkk
+- Disable triggers on destination shards during resharding (by setting `session_replication_role` to `replica`). This prevents triggers from running twice and also ensures we can copy tables that use foreign keys and which delete / update relationships during resharding. @meskill
+- Prevent deadlock in extended protocol pipelines when a client sends a `Describe` out of a specific order @murex971
+- Correctly handle omnisharded to sharded joins where the sharding key is present in omnisharded tables @ygxio @levkk
+- Connections using `LISTEN` would incorrectly handle that command sent via extended protocol (returning `ReadyForQuery` prematurely) @murex971
+- When using passthrough auth, reloading the config would not carry over any user-specific settings configured in `users.toml` @mehcode
+- Role detection (`role = "auto"`) could cause deadlock in the pool for read-only clusters that served write transactions (e.g., `BEGIN`, _not_ `BEGIN READ ONLY`) @levkk
+- Query router wouldn't handle nested typecasts correctly for shard key detection @sgrif
+
+#### Performance
+
+- Improve performance of resharding copy data phase when using multiple replicas by more fairly distributing workloads between source databases @meskill
+
+#### Features
+
+- Support `LIMIT` and `OFFSET` in cross-shard statements sent via `PREPARE` and `EXECUTE` @jkaczman
+- Support cross-account RDS IAM authentication by using STS `assume-role` @lyupan-cb
+- Add `total_wait_time` and `avg_wait_time` to OpenMetrics (and OTEL) @rimrakhimov
+- Support Postgres foreign keys during resharding by disabling Postgres triggers during replication. This also ensures that triggers on the destination shards don't run, potentially causing double data insertion. @meskill
+- Inject correct time (e.g. `timestamp`, `timestamptz`, etc.) and UUID values in cross-shard and omnisharded `INSERT` queries, to make sure the values are identical on all shards. This replaces database-generated defaults without changing the schema. Enable by turning on `rewrite.non_deterministic_functions = "rewrite"`. @jkaczman
+- Add `checkout_timeout` metric to OpenMetrics (and OTEL) and admin database (`SHOW STATS`) which shows how many times clients hit the error for a particular pool @levkk
+
+#### Code quality
+
+- Fix typo in config example @joshuaharry
+- Refactor resharding copy data code to use the tasks API @meskill
+- Cleanup of omnisharded table handling during copy data phase @meskill
+- Remove redundant check in shard key update flow @sgrif
+- CI now uses Postgres 18 (used to be 16) @jkaczman
+- Make some tests more deterministic instead of relying on timing @dipeshbabu @ziomarco
+
+### v0.1.58
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.58` |
+
+#### Features
+
+- Database-specific TLS configuration (incl. mTLS), allowing different TLS certificates per host in `pgdog.toml` @rlittlefield
+- Correct handling of `DISCARD`, incl. `DISCARD TEMP` and `DISCARD ALL` @murex971
+- Add `FORCE_RELOAD` admin command which guarantees all subsequent queries are sent to new connection pools (vs. `RELOAD` which is async) @jkaczman
+- Query engine hooks for `pgdog.nextval` function (only available in EE) to generate globally unique, monotonically increasing integers with no gaps (using Raft in the control plane) @levkk
+
+#### Bugs
+
+- Allow omnisharded reads with a shard comment routing inside cross-shard write transactions @rlittlefield
+- Connections were unncessarily dropped and re-created when a replica was added (or removed) to (from) `pgdog.toml` @jkaczman
+- Correctly handle omnisharded writes inside CTEs @rlittlefield
+
+#### Code quality
+
+- Added `CHANGELOG.md` (this file) and `CHANGELOG-ENTERPRISE.md` to track changes to open source and enterprise edition @levkk
+
+### v0.1.57
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.57` |
+
+#### Performance
+
+- SCRAM client authentication (which uses expensive crypto) is now pushed to background threads, which will avoid blocking other clients from running queries during connection storms
+
+#### Features
+
+- Add `listen_backlog` configuration setting to control how many _new_, _concurrent_, TCP connections PgDog will allow until they are silently rejected @ryderhwang
+- `DISCARD` now clears client's prepared statement cache, advisory locks & notification channels @murex971
+- `CREATE TEMP TABLE` now pins the client connection until the table is dropped or the client disconnects @sgrif
+- Count and show number of idle-in-transaction timeouts as a pool statistic @murex971
+- Add support for `SCRAM-SHA-256-PLUS` client authentication @abnegate
+- Add `banned` gauge to OpenMetrics and OTEL indicating which database is currently blocked from reads by the load balancer @ChrisJr404
+
+#### Bugs
+
+- Fix cross-shard `variance()` crash when empty/null results returned by shards @sgrif
+- Prepared statements prepared via simple protocol now respect `prepared_statements_ttl` @jkaczman
+
+#### Code quality
+
+- Refactor resharding task queue to use more types @meskill
+- Clean up resharding logging @levkk
+- Refactor the query engine code to support cross-shard subqueries and CTEs @jkaczman
+
+### v0.1.56
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.56` |
+
+Hot fix for [v0.1.55](https://github.com/pgdogdev/pgdog/releases/tag/v0.1.55).
+
+#### Bug fixes
+
+- Don't set the thread stack size to 32MB by default and don't warn the user about a deprecated setting at runtime (`query_parser_engine`).
+
+### v0.1.55
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.55` |
+
+#### Security
+
+- Docker images now use keyless cosign attestation @dkarter
+
+#### Features
+
+- Support execution of multi-statement queries sent via the simple protocol, e.g., `SET statement_timeout TO 0; SELECT * FROM users;`. Previously, this would error out. Limitation: we don't automatically start a transaction, so only one DML statement per query is allowed. @levkk
+- Switch to our implementation of query normalization instead of using `pg_query` (only relevant if using the Enterprise edition) @sgrif @jkaczman
+
+#### Performance
+
+- Remove more unnecessary allocations @sgrif @meskill @jkaczman
+- Don't pin small future in hot path (1% performance improvement or so) @ygxio
+
+#### Bug fixes
+
+- Avoid `NoPrimary` errors when primary election is delayed (`role = "auto"` mode) @meskill
+- Preserve query case in admin commands before passing the string to the query parser @meskill
+- Proxy shutdown was sometimes delayed by a race condition in the load balancer monitor @meskill
+- Support parameter type casting in `EXECUTE` statements @murex971
+- Don't run unnecessary `SELECT` query during sharding key update @jkaczman
+
+#### Code quality
+
+- Add `query_parser_engine = "pg_query_protobuf"` deprecation warning and remove the setting from usage @jkaczman
+- Dead code removal @sgrif @meskill
+- Use `pub(crate)` instead of `pub` to help with dead code analysis @sgrif
+- Refactor the resharding task runner to use more types @meskill
+- Move pool configuration into `pgdog-config` crate, for easier use in Enterprise code @meskill
+- Fix flaky tests @jkaczman
+
+#### New Contributors
+
+- @dkarter made their first contribution in https://github.com/pgdogdev/pgdog/pull/1442
+
+### v0.1.54
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.54` |
+
+#### Performance
+
+- 8% performance improvement in the connection pooler by optimizing our use of Tokio futures @ygxio
+- Additional performance improvements by using Tokio futures correctly @sgrif
+- Remove several unnecessary memory allocations @ygxio
+
+#### Bugs
+
+- Don't validate replica identity during the schema sync & data sync phases of resharding if caller does not intend to use logical replication to sync real-time data @bhargavtheertham-cb
+- Extended protocol pipeline messages were incorrectly ordered in cross-shard queries @meskill
+- Schema sharding shouldn't trigger the incomplete omnisharded writes check @jkaczman
+- `DISTINCT` state was not reset between cross-shard queries in the same transaction @levkk
+
+#### Features
+
+- Make OpenMetrics host configurable with `openmetrics_host` @murex971
+- Block direct-to-shard queries when `SET pgdog.sharding_key` doesn't match a mapped value in list-based and range-based sharding configuration @jkaczman
+- Setting `read_only` on a user in `users.toml` will direct that user's traffic to replicas, if configured @jkaczman
+- Partial support for `PREPARE` and `EXECUTE` (including sharding); the prepared statement can be only executed with `EXECUTE` at the moment and cannot be executed using the extended protocol @levkk
+- Wait for health check to pass before allowing traffic on _newly_ added databases in `pgdog.toml` @sgrif
+- Optional FIPS mode (compile time flag: `cargo build -p pgdog --release --features fips`)
+
+#### Testing
+
+- Basic Haskell acceptance tests @levkk
+- Ensure we only generate a node id when `NODE_ID` is set @meskill
+
+#### Code quality
+
+- Remove library target and only build binary target, allowing us to more easily detect dead code @sgrif
+- Remove a bunch of dead code @sgrif
+- Cleanup multi-shard and row decoder code @levkk
+
+### v0.1.53
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.53` |
+
+#### New parser
+
+New parser is now **enabled by default**. Please test this release before launching in production. You should see 6x-8x speed improvements resulting in lower latency for query cache misses, and up to 90% memory usage reduction overall. This is not a typo! We fixed quite a few things here.
+
+This also makes the `query_parser_engine` setting redundant and obsolete. It will now be ignored.
+
+By @sgrif
+
+#### Bug fixes
+
+- Fix negative interval text format parsing in cross-shard aggregates @bryanmehall
+- Connection pools were giving clients closed server connections, causing intermittent errors @nsavvide
+- In `role = "auto"` mode, set all hosts to `role = "replica"` until proven otherwise; this unblocks reads faster during configuration changes @murex971
+- [New parser] Fix `GRANT` and `CREATE STATISTICS` DDL handling @levkk
+- When using schema-based sharding, ignore the inconsistent omnisharded tables write check @levkk
+- Include `sv_idle_xact` calculation into the example Datadog dashboard @zacharywelch
+- Fix crash when a cross-shard `avg()` calculation was done on empty tables @sgrif
+- `RESET PREPARED` admin command wasn't doing anything @IgorOhrimenko
+- Fix Mac OS build for the new parser @jkaczman
+- Fix pipelined queries using Postgres portals; specifically affected the Node JS Postgres drivers @nsavvide
+- Sending portal close messages could potentially close prepared statements that were identically named @meskill
+- Schema synchronization during resharding now restores `REPLICA IDENTITY` indexes in the post-data phase @rlittlefield
+- Cross-shard aggregates with passthrough columns now work correctly @jkaczman
+- `PREPARE` was leaking memory in the prepared statements cache @meskill
+- Fix incorrect handling of errors in mixed simple/extended protocol exchange @jkaczman
+
+#### Performance
+
+- Lower the number of memory allocations in prepared statements cache @meskill
+- Remove unnecessary statement allocation in the parser (50% allocation reduction in the hot path) @sgrif
+
+#### Features
+
+- Track selected, inserted and deleted rows, as reported by server connections @murex971
+- Support prepared statements cache TTL (time to live), automatically re-planning statements periodically; this sidesteps the stale execution plan problem @meskill
+
+#### Misc
+
+- Clippy pass over new parser code @sgrif
+- Bump Mac OS runner to `macos-26` (`macos-14` is about to be deprecated) @jkaczman
+- Docker compose demo wasn't saving Postgres data correctly @andyatkinson
+- Small refactor of pool health tracking @sgrif
+
+#### New Contributors
+
+- @bryanmehall made their first contribution in https://github.com/pgdogdev/pgdog/pull/1321
+- @zacharywelch made their first contribution in https://github.com/pgdogdev/pgdog/pull/1333
+- @jkaczman made their first contribution in https://github.com/pgdogdev/pgdog/pull/1336
+- @andyatkinson made their first contribution in https://github.com/pgdogdev/pgdog/pull/1343
+
+## Remaining releases
+
+Please see [GitHub releases](https://github.com/pgdogdev/pgdog/releases) for changelogs for previous releases.
+
+| Application | Docker image                     |
+| ----------- | -------------------------------- |
+| PgDog       | `ghcr.io/pgdogdev/pgdog:v0.1.54` |

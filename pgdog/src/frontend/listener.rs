@@ -3,53 +3,90 @@
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 
-use crate::backend::databases::{databases, reload, shutdown};
+use crate::backend::databases::{databases, reload};
 use crate::config::config;
-use crate::frontend::client::query_engine::two_pc::Manager;
-use crate::net::messages::{hello::SslReply, NegotiateProtocolVersion, Startup};
-use crate::net::{self, tls::acceptor};
-use crate::net::{tweak, Stream};
-use crate::sighup::Sighup;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::signal::ctrl_c;
-use tokio::time::timeout;
+use crate::net::messages::{FrontendPid, NegotiateProtocolVersion, Startup, hello::SslReply};
+use crate::net::tls::{acceptor, peer_certificate_present, peer_identity};
+use crate::net::{self, Stream, tweak};
+use crate::util::system::Sighup;
+use tokio::net::{TcpListener, TcpSocket, TcpStream, lookup_host};
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use super::{comms::comms, Client, Error};
+use super::{Client, Error, comms::comms};
+use crate::util::{safe_timeout, server::accept};
 
 /// Client connections listener and handler.
 #[derive(Debug, Clone)]
-pub struct Listener {
+pub(crate) struct Listener {
     addr: String,
-    /// Cancelled once shutdown is done; stays cancelled, so the accept
-    /// loop sees it even if it wasn't waiting at that moment.
     shutdown: CancellationToken,
 }
 
 impl Listener {
     /// Create new client listener.
-    pub fn new(addr: impl ToString) -> Self {
+    pub(crate) fn new(addr: impl ToString) -> Self {
         Self {
             addr: addr.to_string(),
             shutdown: CancellationToken::new(),
         }
     }
 
+    /// Bind the listening socket with the configured `listen_backlog`.
+    ///
+    /// `TcpListener::bind` hardcodes a backlog of 1024, which caps the queue of
+    /// pending connections regardless of `net.core.somaxconn`; large client fleets
+    /// reconnecting at once (e.g. a rolling deploy) overflow it and their SYNs are
+    /// silently dropped onto the retransmission timer.
+    async fn bind(addr: &str) -> Result<TcpListener, Error> {
+        let backlog = config().config.general.listen_backlog;
+        Ok(Self::bind_first(lookup_host(addr).await?, backlog, addr)?)
+    }
+
+    /// Bind to the first candidate address that accepts the bind, like
+    /// `TcpListener::bind` does, but with a configurable listen backlog.
+    fn bind_first(
+        candidates: impl Iterator<Item = SocketAddr>,
+        backlog: u32,
+        requested: &str,
+    ) -> Result<TcpListener, std::io::Error> {
+        let mut last_err = None;
+        for addr in candidates {
+            let socket = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            #[cfg(not(windows))]
+            socket.set_reuseaddr(true)?;
+            match socket.bind(addr) {
+                Ok(()) => return socket.listen(backlog),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no address to bind: {}", requested),
+            )
+        }))
+    }
+
     /// Listen for client connections and handle them.
-    pub async fn listen(&mut self) -> Result<(), Error> {
+    pub(crate) async fn listen(&mut self) -> Result<(), Error> {
         info!("🐕 PgDog listening on {}", self.addr);
-        let listener = TcpListener::bind(&self.addr).await?;
+        let listener = Self::bind(&self.addr).await?;
+        let mut sighup = Sighup::new();
         let shutdown_signal = comms().shutting_down();
-        let mut sighup = Sighup::new()?;
+        let mut shutting_down = false;
 
         loop {
             select! {
-                connection = listener.accept() => {
+                connection = accept(&listener) => {
                    let comms = comms();
-                   let (stream, addr) = connection?;
+                   let (stream, addr) = connection;
                    let offline = comms.offline();
 
                    let future = async move {
@@ -68,16 +105,17 @@ impl Listener {
                    }
                 }
 
-                _ = shutdown_signal.notified() => {
+                _ = shutdown_signal.cancelled(), if !shutting_down => {
+                    // start the shutdown process, but make sure to still accept
+                    // new connections until all current requests are processed.
+                    // It's to be able for admin to still connect to pgdog, the
+                    // new client connections will be rejected anyway.
+                    shutting_down = true;
                     self.start_shutdown();
                 }
 
-                _ = ctrl_c() => {
-                    self.start_shutdown();
-                }
-
-                _ = sighup.listen() => {
-                    if let Err(err) = reload() {
+                _ = sighup.recv() => {
+                    if let Err(err) = reload(false) {
                         error!("configuration reload error: {}", err);
                     }
                 }
@@ -91,20 +129,9 @@ impl Listener {
         Ok(())
     }
 
-    /// Shutdown this listener.
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
-    }
-
     fn start_shutdown(&self) {
-        comms().shutdown();
-
         let listener = self.clone();
-        spawn(async move {
-            listener.execute_shutdown().await;
-            Manager::get().shutdown().await; // wait for 2pc to flush
-            shutdown();
-        });
+        spawn(async move { listener.execute_shutdown().await });
     }
 
     async fn execute_shutdown(&self) {
@@ -118,10 +145,12 @@ impl Listener {
 
         let comms = comms();
 
-        if timeout(shutdown_timeout, comms.tracker().wait())
+        if safe_timeout(shutdown_timeout, comms.tracker().wait())
             .await
-            .is_err()
+            .is_ok()
         {
+            debug!("all clients finished their transactions, closing server connections");
+        } else {
             warn!(
                 "terminating {} client connections due to shutdown timeout",
                 comms.tracker().len()
@@ -134,15 +163,15 @@ impl Listener {
             {
                 // Shutdown timeout elapsed; cancel any still-running queries before tearing pools down.
                 let cancel_futures = comms.clients().into_keys().map(|id| async move {
-                    if let Err(err) = databases().cancel(&id).await {
+                    if let Err(err) = databases().cancel(id).await {
                         error!(?id, "cancel request failed during shutdown: {err}");
                     }
                 });
                 let cancel_all = futures::future::join_all(cancel_futures);
 
-                if timeout(termination_timeout, cancel_all).await.is_err() {
+                if safe_timeout(termination_timeout, cancel_all).await.is_err() {
                     error!(
-                        "forced shutdown: abandoning {} outstanding cancel requests after waiting {:.3}s" ,
+                        "forced shutdown: abandoning {} outstanding cancel requests after waiting {:.3}s (shutdown_termination_timeout)",
                         comms.clients().len(),
                         termination_timeout.as_secs_f64()
                     );
@@ -189,10 +218,23 @@ impl Listener {
                     if let Some(tls) = tls.as_ref() {
                         stream.send_flush(&SslReply::Yes).await?;
                         let plain = stream.take()?;
-                        let cipher = tls.accept(plain).await?;
+                        let cipher = match tls.accept(plain).await {
+                            Ok(cipher) => cipher,
+                            Err(err) => {
+                                // TLS failure should close the connection
+                                // without telling the client what happened (security).
+                                warn!("TLS handshake failed: {err} [{addr}]");
+                                return Ok(());
+                            }
+                        };
+                        let tls_identity = peer_identity(cipher.get_ref().1);
+                        let tls_client_certificate = peer_certificate_present(cipher.get_ref().1);
                         stream = Stream::tls(
                             tokio_rustls::TlsStream::Server(cipher),
                             config.config.memory.net_buffer,
+                            tls_identity,
+                            tls_client_certificate,
+                            tls.server_end_point().map(|data| data.to_vec()),
                         );
                     } else {
                         stream.send_flush(&SslReply::No).await?;
@@ -225,12 +267,16 @@ impl Listener {
                             .await?;
                     }
 
-                    Client::spawn(stream, params, addr, config, negotiated).await?;
+                    Box::pin(Client::spawn(stream, params, addr, config, negotiated)).await?;
                     break;
                 }
 
-                Startup::Cancel { id } => {
-                    let _ = databases().cancel(&id).await;
+                Startup::Cancel { ref id } => {
+                    if comms().verify_cancel(id) {
+                        let _ = databases().cancel(FrontendPid::from(id)).await;
+                    } else {
+                        super::ee::broadcast_cancel(id).await?;
+                    }
                     break;
                 }
             }
@@ -242,25 +288,48 @@ impl Listener {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use super::*;
 
-    use tokio::time::timeout;
-
-    use super::{comms, Listener};
-
-    /// On SIGINT the shutdown task can finish before the accept loop is
-    /// back in `select!`, e.g. on a busy single-CPU host: the loop must
-    /// still stop.
     #[tokio::test]
-    async fn test_shutdown_finished_before_listen_stops_loop() {
-        let mut listener = Listener::new("127.0.0.1:0");
-        comms().shutdown();
-        listener.execute_shutdown().await;
+    async fn test_bind_ipv4_applies_configured_backlog() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(addr.is_ipv4());
+        assert_ne!(addr.port(), 0);
+    }
 
-        let stopped = timeout(Duration::from_secs(2), listener.listen())
-            .await
-            .expect("listener missed the shutdown");
+    #[tokio::test]
+    async fn test_bind_ipv6() {
+        let listener = Listener::bind("[::1]:0").await.unwrap();
+        assert!(listener.local_addr().unwrap().is_ipv6());
+    }
 
-        assert!(stopped.is_ok(), "listen failed: {stopped:?}");
+    #[tokio::test]
+    async fn test_bind_unresolvable_address_errors() {
+        assert!(Listener::bind("host.invalid:0").await.is_err());
+    }
+
+    #[test]
+    fn test_bind_first_empty_resolution_errors() {
+        let err = Listener::bind_first(std::iter::empty(), 1024, "nowhere:0").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AddrNotAvailable);
+    }
+
+    #[tokio::test]
+    async fn test_bind_first_falls_back_to_next_candidate() {
+        // 198.51.100.1 (TEST-NET-2) is not a local interface, so the bind
+        // fails and the next candidate is tried, matching TcpListener::bind.
+        let candidates: Vec<SocketAddr> = vec![
+            "198.51.100.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ];
+        let listener = Listener::bind_first(candidates.into_iter(), 1024, "test:0").unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn test_bind_first_reports_last_bind_error() {
+        let candidates: Vec<SocketAddr> = vec!["198.51.100.1:0".parse().unwrap()];
+        assert!(Listener::bind_first(candidates.into_iter(), 1024, "test:0").is_err());
     }
 }

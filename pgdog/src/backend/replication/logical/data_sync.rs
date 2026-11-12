@@ -1,0 +1,719 @@
+use std::collections::HashMap;
+use std::time::Instant;
+
+use tokio::select;
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
+
+use pgdog_config::CopyFormat;
+use pgdog_stats::TaskId;
+
+use crate::backend::pool::Address;
+use crate::backend::replication::copy_statement::TableColumnSplit;
+use crate::backend::replication::publisher::ReplicationSlot;
+use crate::backend::replication::subscriber::copy::BackgroundSubscriber;
+use crate::backend::replication::{CopyStatement, publisher};
+use crate::backend::{Cluster, ConnectReason, Server, ServerOptions};
+use crate::config;
+use crate::frontend::router::parser::binary::header::Header;
+use crate::net::prelude::Protocol;
+use crate::net::{CopyData, DataRow, Format, ToBytes};
+use crate::util::escape_identifier;
+use crate::util::sql::quote_literal;
+use tokio_util::sync::CancellationToken;
+
+use super::Error;
+use super::ensure_validation;
+use super::publisher::Table;
+use super::subscriber::{CopySubscriber, connect_primary};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CopyProgress {
+    pub(crate) rows: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableEstimate {
+    pub(crate) rows: Option<u64>,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DataSync<'a> {
+    pub(crate) source: &'a Cluster,
+    pub(crate) dest: &'a Cluster,
+    pub(crate) format: CopyFormat,
+    pub(crate) task_id: TaskId,
+}
+
+impl DataSync<'_> {
+    /// Copy one table from a source shard to the destination cluster.
+    ///
+    /// Returns the table with the slot's consistent-point LSN on success.
+    pub(crate) async fn copy_table(
+        &self,
+        table: &Table,
+        address: &Address,
+        cancel: &CancellationToken,
+        mut on_progress: impl FnMut(CopyProgress),
+    ) -> Result<Table, Error> {
+        let mut table = table.clone();
+
+        info!(
+            "data sync for \"{}\".\"{}\" started [{}]",
+            table.table.schema, table.table.name, address
+        );
+
+        let started = cancel
+            .run_until_cancelled(Box::pin(self.prepare_copy(&mut table, address)))
+            .await;
+        let (mut bg_task, mut set) = match started {
+            Some(started) => started?,
+            None => {
+                warn!("aborting data sync for table {}", table.table);
+                return Err(Error::CopyAborted(table.table.clone()));
+            }
+        };
+
+        {
+            loop {
+                select! {
+                    biased;
+
+                    copy_progress = bg_task.fetch_copy_progress() => {
+                        let Some(copy_progress) = copy_progress else { break };
+                        on_progress(copy_progress);
+                    }
+
+                    _ = cancel.cancelled() => {
+                        warn!("aborting data sync for table {}", table.table);
+                        return Err(Error::CopyAborted(table.table.clone()))
+                    },
+
+                    // When a publisher is completely finished;
+                    // propagate errors, and, if all done, break the loop
+                    result = set.join_next() => {
+                        let Some(result) = result else { break };
+                        result??;
+                    }
+                }
+            }
+
+            let time_to_get_back_subscriber = Instant::now();
+
+            // Get back the `CopySubscriber` from the `BackgroundTask`,
+            // and get the final `CopyProgress`
+            let mut copy_sub = bg_task.get_back_subscriber().await?;
+            on_progress(bg_task.progress());
+
+            // If we break early because of copy_progress,
+            // ensure that none of the publishers encountered an Error before we COMMIT
+            while let Some(result) = set.join_next().await {
+                result??;
+            }
+
+            // Measure of how much backlog there was, where the subscriber
+            // can't keep up with our parallelized publishers.
+            //
+            // TODO: We could try some hacky workaround for parallelized writes
+            debug!(
+                "Took {:?}ms for the subscriber to catch up",
+                time_to_get_back_subscriber.elapsed()
+            );
+
+            // Manually send a singular EOF to the subscriber to prevent multiple publishers
+            // from each sending their own (and perhaps before all are finished)
+            if self.format == CopyFormat::Binary {
+                copy_sub.flush(vec![CopyData::new(&[255, 255])]).await?;
+            }
+
+            copy_sub.copy_done(cancel).await?;
+            if let Err(err) = copy_sub.disconnect().await {
+                warn!(
+                    "data sync for \"{}\".\"{}\" is committed, but the disconnect after it failed: {err} [{}]",
+                    table.table.schema, table.table.name, address
+                );
+            }
+
+            info!(
+                "data sync for \"{}\".\"{}\" finished at lsn {} [{}]",
+                table.table.schema, table.table.name, table.lsn, address
+            );
+        }
+
+        Ok(table)
+    }
+
+    /// Open the destination COPY, the temporary slot and the source readers.
+    async fn prepare_copy(
+        &self,
+        table: &mut Table,
+        address: &Address,
+    ) -> Result<(BackgroundSubscriber, JoinSet<Result<(), Error>>), Error> {
+        let (parallel_table_reads, table_col_split) = {
+            let mut parallel_table_reads = config::config()
+                .config
+                .general
+                .resharding_parallel_within_table_copies
+                .max(1);
+
+            let mut table_col_split =
+                TableColumnSplit::try_new(table, parallel_table_reads, address).await?;
+
+            // We want to make sure we're not unnecessarily parallelizing the reads;
+            // what if there's only 20 rows and a singular ctid block index?
+            // At that point, there would effectively be no split; all would go to the first one.
+            // Thus, downgrade if there's a minimal amount
+            let bn_range = table_col_split.blocks;
+            if (bn_range as usize) < parallel_table_reads {
+                parallel_table_reads = std::cmp::max(1, bn_range as usize);
+                table_col_split.split_statement_count = parallel_table_reads;
+            }
+
+            (parallel_table_reads, table_col_split)
+        };
+
+        // Publisher uses COPY [...] TO STDOUT.
+        // Subscriber uses COPY [...] FROM STDIN.
+        let stmt = CopyStatement::new(
+            &table.table,
+            &table
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            self.format,
+            table_col_split,
+        );
+
+        let (copy_sub, mut stream) = {
+            let mut copy_sub = CopySubscriber::new(&stmt, self.source, self.dest)?;
+            copy_sub.connect().await?;
+            copy_sub.start_copy().await?;
+
+            let slot = ReplicationSlot::new_temporary(&table.publication, address);
+            slot.set_task_id(self.task_id);
+
+            let mut stream = slot.create().await?;
+
+            table.lsn = stream.lsn();
+            table.reload(stream.server()).await?;
+
+            (copy_sub, stream)
+        };
+
+        // Re-use the `ReplicationSlot`'s snapshot across all of our parallel readers,
+        // so that they all have the same view of the table. This will prevent
+        // needing any synchronization (e.g., upserts) from a potential
+        // duplicate row being sent to the `CopyPublisher`.
+        let slot_snapshot: String = Self::fetch_slot_snapshot(stream.server()).await?;
+
+        // Run the subscriber in the background, to prevent waiting on flushing in our
+        // main loop. Read more about this on the `start_bg_task` comment
+        let (bg_task, rows) = BackgroundSubscriber::start_bg_task(copy_sub);
+
+        // Readers drop their personal header and trailer to prevent duplicates.
+        // We separately send the header and traler, ourselves, once.
+        if self.format == CopyFormat::Binary {
+            let _ = rows
+                .send(CopyData::new(&Header::default().to_bytes()))
+                .await;
+        }
+
+        // "parallel_table_reads" of `CopyPublisher`s; each run in their own
+        // Tokio task, and after completely done with copying their
+        // ctid range, returns back.
+        let mut set = JoinSet::new();
+        for index in 0..parallel_table_reads {
+            let server = Self::connect_reader(index, address, &stmt, &slot_snapshot).await?;
+            set.spawn(publisher::copy::data(server, self.format, rows.clone()));
+        }
+
+        drop(stream);
+
+        Ok((bg_task, set))
+    }
+
+    // Fetch the snapshot from the slot's server, and then create
+    // X amount of NEW servers, for us to fetch the COPY data from
+    //
+    // Avoids needing synchronization; we have the same view of the table
+    // from each
+    pub(crate) async fn fetch_slot_snapshot(server: &mut Server) -> Result<String, Error> {
+        server
+            .fetch_all::<String>("SELECT pg_export_snapshot()")
+            .await?
+            .pop()
+            .ok_or(Error::MissingData)
+    }
+
+    pub(crate) async fn connect_reader(
+        slot_index: usize,
+        address: &Address,
+        stmt: &CopyStatement,
+        slot_snapshot: &str,
+    ) -> Result<Server, Error> {
+        let mut server = Server::connect(
+            address,
+            ServerOptions::default(),
+            ConnectReason::Resharding,
+            Default::default(),
+        )
+        .await?;
+
+        // Sets it to use the same snapshot as the slot (thus, maintaining the same view
+        // as the table)
+        server
+            .execute("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
+            .await?;
+
+        let set_transaction_snapshot = format!("SET TRANSACTION SNAPSHOT '{slot_snapshot}'");
+        server.execute(set_transaction_snapshot).await?;
+
+        // The initial COPY
+        publisher::copy::start(&mut server, stmt, slot_index).await?;
+
+        Ok(server)
+    }
+}
+
+/// Get the estimation of number of rows and bytes occupied by
+/// the table
+pub(crate) async fn estimate_table(
+    table: &Table,
+    address: &Address,
+) -> Result<TableEstimate, Error> {
+    let sql = format!(
+        "SELECT c.reltuples::bigint, \
+         pg_relation_size(c.oid) + CASE WHEN c.reltoastrelid <> 0 \
+         THEN pg_total_relation_size(c.reltoastrelid) ELSE 0 END \
+         FROM pg_class c WHERE c.oid = {}::regclass",
+        source_regclass(table)
+    );
+    let mut server = Server::connect(
+        address,
+        ServerOptions::default(),
+        ConnectReason::Resharding,
+        Default::default(),
+    )
+    .await?;
+    let row: DataRow = server
+        .fetch_all(sql)
+        .await?
+        .pop()
+        .ok_or(Error::MissingData)?;
+    let rows: i64 = row.get(0, Format::Text).ok_or(Error::MissingData)?;
+    let bytes: i64 = row.get(1, Format::Text).ok_or(Error::MissingData)?;
+    Ok(TableEstimate {
+        rows: u64::try_from(rows).ok(),
+        bytes: bytes as u64,
+    })
+}
+
+pub(super) fn source_regclass(table: &Table) -> String {
+    quote_literal(&format!(
+        "\"{}\".\"{}\"",
+        escape_identifier(&table.table.schema),
+        escape_identifier(&table.table.name)
+    ))
+}
+
+/// Returns `true` if any reachable destination shard holds rows from a prior COPY
+/// attempt. Emits a single WARN listing the shards that do hold rows.
+pub(crate) async fn validate_destination_has_rows(table: &Table, dest: &Cluster) -> bool {
+    let schema = &table.table.schema;
+    let name = &table.table.name;
+    let sql = format!(
+        "SELECT 1 FROM \"{}\".\"{}\" LIMIT 1",
+        escape_identifier(schema),
+        escape_identifier(name),
+    );
+
+    let mut shards_with_rows = vec![];
+    for shard in dest.shards().iter() {
+        let result: Result<bool, Error> = async {
+            let mut server = connect_primary(shard).await?;
+            Ok(server
+                .execute_checked(sql.as_str())
+                .await?
+                .iter()
+                .any(|m| m.code() == 'D'))
+        }
+        .await;
+
+        let shard = shard.number();
+        match result {
+            Ok(true) => shards_with_rows.push(shard),
+            Ok(false) => debug!("destination \"{schema}\".\"{name}\" is empty on shard {shard}"),
+            Err(err) => warn!(
+                "could not verify rows of destination \"{schema}\".\"{name}\" on shard {shard}: {err}; \
+                 proceeding as if empty"
+            ),
+        }
+    }
+
+    if !shards_with_rows.is_empty() {
+        warn!(
+            "destination \"{schema}\".\"{name}\" holds rows from a prior COPY attempt on shard(s) {shards_with_rows:?}; \
+                 truncate before re-running the copy: TRUNCATE \"{schema}\".\"{name}\";",
+        );
+    }
+
+    !shards_with_rows.is_empty()
+}
+
+/// Check that every table has a usable replica identity.
+pub(crate) fn validate_replica_identity(tables: &HashMap<usize, Vec<Table>>) -> Result<(), Error> {
+    let validation_errors: Vec<_> = tables
+        .values()
+        .flat_map(|t| t.iter())
+        .filter_map(|t| t.valid().err())
+        .collect();
+
+    ensure_validation!(validation_errors);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::super::publisher::{PublicationTable, ReplicaIdentity};
+    use super::super::tables_sync::tables_sync;
+    use super::*;
+    use crate::backend::replication::publisher::Lsn;
+    use crate::backend::server::test::test_replication_server;
+    use crate::config::config;
+    use pgdog_postgres_types::Oid;
+
+    /// Tables without a primary key or replica identity index must be rejected
+    /// before the copy starts, not after, with one entry per bad table.
+    #[tokio::test]
+    async fn validation_rejects_no_pk_tables() {
+        crate::logger();
+
+        let mut server = test_replication_server().await;
+        for ddl in &[
+            "CREATE TABLE IF NOT EXISTS publication_test_no_pk   (data TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS publication_test_no_pk_2 (payload JSONB)",
+            "CREATE TABLE IF NOT EXISTS publication_test_no_pk_3 (ts TIMESTAMPTZ NOT NULL DEFAULT now(), value FLOAT8)",
+            "DROP PUBLICATION IF EXISTS publication_no_pk_validation",
+            "CREATE PUBLICATION publication_no_pk_validation FOR TABLE publication_test_no_pk, publication_test_no_pk_2, publication_test_no_pk_3",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+
+        let source = Cluster::new_test(&config());
+        source.launch();
+
+        let tables = tables_sync(
+            &source,
+            source.sharded_tables(),
+            "publication_no_pk_validation",
+        )
+        .await
+        .unwrap();
+        let result = validate_replica_identity(&tables);
+
+        let err = result.expect_err("validation must fail for a publication with no-pk tables");
+
+        assert_eq!(
+            err.to_string(),
+            "Table validation failed:\n\
+            \ttable \"pgdog\".\"publication_test_no_pk\": has no replica identity columns\n\
+            \ttable \"pgdog\".\"publication_test_no_pk_2\": has no replica identity columns\n\
+            \ttable \"pgdog\".\"publication_test_no_pk_3\": has no replica identity columns",
+        );
+
+        source.shutdown();
+        for ddl in &[
+            "DROP PUBLICATION IF EXISTS publication_no_pk_validation",
+            "DROP TABLE IF EXISTS publication_test_no_pk_3",
+            "DROP TABLE IF EXISTS publication_test_no_pk_2",
+            "DROP TABLE IF EXISTS publication_test_no_pk",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+    }
+
+    /// `REPLICA IDENTITY NOTHING` must be rejected by validation. This test
+    /// executes against a real Postgres instance so it validates the full
+    /// metadata-fetch + valid() path.
+    #[tokio::test]
+    async fn validation_rejects_replica_identity_nothing() {
+        crate::logger();
+
+        let mut server = test_replication_server().await;
+        for ddl in &[
+            "CREATE TABLE IF NOT EXISTS pub_test_nothing (data TEXT NOT NULL)",
+            "ALTER TABLE pub_test_nothing REPLICA IDENTITY NOTHING",
+            "DROP PUBLICATION IF EXISTS pub_full_identity_nothing_test",
+            "CREATE PUBLICATION pub_full_identity_nothing_test FOR TABLE pub_test_nothing",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+
+        let source = Cluster::new_test(&config());
+        source.launch();
+
+        let tables = tables_sync(
+            &source,
+            source.sharded_tables(),
+            "pub_full_identity_nothing_test",
+        )
+        .await
+        .unwrap();
+        let result = validate_replica_identity(&tables);
+
+        let err = result.expect_err("validation must fail for REPLICA IDENTITY NOTHING table");
+        assert!(
+            err.to_string().contains("REPLICA IDENTITY NOTHING"),
+            "expected NOTHING in error message, got: {err}"
+        );
+
+        source.shutdown();
+        for ddl in &[
+            "DROP PUBLICATION IF EXISTS pub_full_identity_nothing_test",
+            "DROP TABLE IF EXISTS pub_test_nothing",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+    }
+
+    /// Leftover rows on the destination must be detected, also after the
+    /// cluster's pools are shut down (RELOAD replaces the cluster mid-copy).
+    #[tokio::test]
+    async fn destination_row_check_detects_leftover_rows() {
+        crate::logger();
+
+        let mut server = test_replication_server().await;
+        for ddl in &[
+            "CREATE TABLE IF NOT EXISTS data_sync_leftover_rows (id BIGINT PRIMARY KEY)",
+            "TRUNCATE data_sync_leftover_rows",
+            "DROP PUBLICATION IF EXISTS pub_data_sync_leftover_rows",
+            "CREATE PUBLICATION pub_data_sync_leftover_rows FOR TABLE data_sync_leftover_rows",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+
+        let cluster = Cluster::new_test(&config());
+        cluster.launch();
+
+        let tables = tables_sync(
+            &cluster,
+            cluster.sharded_tables(),
+            "pub_data_sync_leftover_rows",
+        )
+        .await
+        .unwrap();
+        let table = tables
+            .values()
+            .flatten()
+            .next()
+            .expect("publication holds one table")
+            .clone();
+
+        assert!(
+            !validate_destination_has_rows(&table, &cluster).await,
+            "an empty destination must report no rows"
+        );
+
+        server
+            .execute("INSERT INTO data_sync_leftover_rows VALUES (1)")
+            .await
+            .unwrap();
+        assert!(
+            validate_destination_has_rows(&table, &cluster).await,
+            "a destination with rows must be detected"
+        );
+
+        cluster.shutdown();
+        assert!(
+            validate_destination_has_rows(&table, &cluster).await,
+            "a shut-down pool must not hide rows"
+        );
+
+        for ddl in &[
+            "DROP PUBLICATION IF EXISTS pub_data_sync_leftover_rows",
+            "DROP TABLE IF EXISTS data_sync_leftover_rows",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_row_check_is_scoped_to_partition() {
+        crate::logger();
+
+        let mut server = test_replication_server().await;
+        for ddl in &[
+            "DROP PUBLICATION IF EXISTS pub_data_sync_partition_rows",
+            "DROP TABLE IF EXISTS data_sync_partition_rows",
+            "CREATE TABLE data_sync_partition_rows (id BIGINT NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id)",
+            "CREATE TABLE data_sync_partition_rows_p1 PARTITION OF data_sync_partition_rows FOR VALUES FROM (0) TO (100)",
+            "CREATE TABLE data_sync_partition_rows_p2 PARTITION OF data_sync_partition_rows FOR VALUES FROM (100) TO (200)",
+            "CREATE PUBLICATION pub_data_sync_partition_rows FOR TABLE data_sync_partition_rows",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+
+        let cluster = Cluster::new_test(&config());
+        cluster.launch();
+
+        let tables = tables_sync(
+            &cluster,
+            cluster.sharded_tables(),
+            "pub_data_sync_partition_rows",
+        )
+        .await
+        .unwrap();
+        let partition = |name: &str| {
+            tables
+                .values()
+                .flatten()
+                .find(|table| table.table.name == name)
+                .unwrap_or_else(|| panic!("publication holds partition {name}"))
+                .clone()
+        };
+        let p1 = partition("data_sync_partition_rows_p1");
+        let p2 = partition("data_sync_partition_rows_p2");
+        assert_eq!(p1.table.parent_name, "data_sync_partition_rows");
+        assert_eq!(p2.table.parent_name, "data_sync_partition_rows");
+
+        server
+            .execute("INSERT INTO data_sync_partition_rows VALUES (150)")
+            .await
+            .unwrap();
+
+        assert!(
+            !validate_destination_has_rows(&p1, &cluster).await,
+            "rows of a sibling partition must not block the retry of this partition"
+        );
+        assert!(
+            validate_destination_has_rows(&p2, &cluster).await,
+            "rows of this partition must be detected"
+        );
+
+        cluster.shutdown();
+        for ddl in &[
+            "DROP PUBLICATION IF EXISTS pub_data_sync_partition_rows",
+            "DROP TABLE IF EXISTS data_sync_partition_rows",
+        ] {
+            server.execute(*ddl).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn estimates_track_table_lifecycle() {
+        crate::logger();
+
+        let mut server = test_replication_server().await;
+        server
+            .execute("DROP TABLE IF EXISTS public.data_sync_estimate")
+            .await
+            .unwrap();
+
+        let table = Table {
+            publication: String::new(),
+            table: PublicationTable {
+                schema: "public".into(),
+                name: "data_sync_estimate".into(),
+                ..Default::default()
+            },
+            identity: ReplicaIdentity {
+                oid: Oid(0),
+                identity: String::new(),
+                kind: String::new(),
+            },
+            columns: vec![],
+            lsn: Lsn::default(),
+        };
+
+        let addr = Address::new_test();
+
+        assert!(
+            estimate_table(&table, &addr).await.is_err(),
+            "a missing table must fail the estimate"
+        );
+
+        server
+            .execute(
+                "CREATE TABLE public.data_sync_estimate (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        let fresh = estimate_table(&table, &addr).await.unwrap();
+        assert!(
+            fresh.rows.is_none(),
+            "a never-analyzed table has no row estimate"
+        );
+        assert_eq!(
+            fresh.bytes, 8192,
+            "an empty table stores only the TOAST index metapage"
+        );
+
+        server
+            .execute(
+                "INSERT INTO public.data_sync_estimate \
+                 SELECT g, repeat('x', 500) FROM generate_series(1, 1000) g",
+            )
+            .await
+            .unwrap();
+        server
+            .execute("ANALYZE public.data_sync_estimate")
+            .await
+            .unwrap();
+        let after_insert = estimate_table(&table, &addr).await.unwrap();
+        assert_eq!(after_insert.rows, Some(1000));
+        assert!(
+            after_insert.bytes >= 1000 * 500,
+            "1000 rows with 500-byte payloads need at least the raw data size: {} bytes",
+            after_insert.bytes
+        );
+
+        server
+            .execute(
+                "INSERT INTO public.data_sync_estimate \
+                 SELECT g, repeat('y', 500) FROM generate_series(1001, 1500) g",
+            )
+            .await
+            .unwrap();
+        server
+            .execute("ANALYZE public.data_sync_estimate")
+            .await
+            .unwrap();
+        let after_more = estimate_table(&table, &addr).await.unwrap();
+        assert_eq!(after_more.rows, Some(1500));
+        assert!(
+            after_more.bytes >= 1500 * 500,
+            "1500 rows with 500-byte payloads need at least the raw data size: {} bytes",
+            after_more.bytes
+        );
+
+        server
+            .execute("DELETE FROM public.data_sync_estimate")
+            .await
+            .unwrap();
+        server
+            .execute("ANALYZE public.data_sync_estimate")
+            .await
+            .unwrap();
+        let after_delete = estimate_table(&table, &addr).await.unwrap();
+        assert_eq!(after_delete.rows, Some(0));
+        assert!(
+            after_delete.bytes <= after_more.bytes,
+            "DELETE must not grow the heap; VACUUM may shrink it: {} > {}",
+            after_delete.bytes,
+            after_more.bytes
+        );
+
+        server
+            .execute("DROP TABLE public.data_sync_estimate")
+            .await
+            .unwrap();
+        assert!(
+            estimate_table(&table, &addr).await.is_err(),
+            "a dropped table must fail the estimate"
+        );
+    }
+}

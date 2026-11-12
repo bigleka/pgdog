@@ -9,7 +9,7 @@ use super::Pool;
 
 /// Pool state.
 #[derive(Debug)]
-pub struct State {
+pub(crate) struct State {
     inner: pgdog_stats::State,
 }
 
@@ -40,12 +40,13 @@ impl State {
                 total: guard.total(),
                 online: guard.online,
                 empty: guard.idle() == 0,
-                config: *guard.config,
+                config: guard.config,
                 paused: guard.paused,
                 waiting: guard.waiting.len(),
                 errors: guard.errors,
                 out_of_sync: guard.out_of_sync,
                 re_synced: guard.re_synced,
+                locked: guard.count_locked_connections(),
                 stats: *guard.stats,
                 maxwait: guard
                     .waiting

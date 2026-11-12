@@ -1,11 +1,12 @@
 use std::time::Instant;
 
-use crate::config::config;
+use crate::{config::config, tasks};
 
 use super::*;
 
+use crate::util::safe_interval;
 use pgdog_stats::ReplicaLag;
-use tokio::{select, spawn, task::JoinHandle, time::interval};
+use tokio::{select, task::JoinHandle};
 use tracing::debug;
 
 static MAINTENANCE: Duration = Duration::from_millis(333);
@@ -22,7 +23,7 @@ impl Monitor {
             replicas: replicas.clone(),
         };
 
-        spawn(async move {
+        tasks::spawn("lb monitor", async move {
             monitor.run().await;
         })
     }
@@ -36,7 +37,7 @@ impl Monitor {
     }
 
     async fn run(&self) {
-        let mut interval = interval(MAINTENANCE);
+        let mut interval = safe_interval(MAINTENANCE);
 
         debug!("replicas monitor running");
         let config = config();
@@ -52,25 +53,9 @@ impl Monitor {
         };
 
         loop {
-            let mut check_offline = false;
-
             select! {
                 _ = interval.tick() => {}
-                _ = self.replicas.maintenance.notified() => {
-                    check_offline = true;
-                }
-            }
-
-            if check_offline {
-                let offline = self
-                    .replicas
-                    .targets
-                    .iter()
-                    .all(|target| !target.pool.lock().online);
-
-                if offline {
-                    break;
-                }
+                _ = self.replicas.maintenance.cancelled() => break,
             }
 
             self.ban_check(&replica_ban_threshold);
@@ -83,12 +68,12 @@ impl Monitor {
     /// This is pub(super) to enable testing.
     pub(super) fn ban_check(&self, replica_ban_threshold: &ReplicaLag) {
         let now = Instant::now();
-        let mut banned = 0;
+        let mut unavailable = 0;
         let mut ban_targets = Vec::new();
         let targets = &self.replicas.targets;
 
         for (i, target) in targets.iter().enumerate() {
-            let healthy = target.health.healthy();
+            let healthy = target.health().healthy();
             let replica_lag_bad = target
                 .pool
                 .replica_lag()
@@ -103,10 +88,6 @@ impl Monitor {
             let should_ban = !healthy || replica_lag_bad;
 
             if should_ban && bannable {
-                if target.ban.banned() || should_ban {
-                    banned += 1;
-                }
-
                 let reason = if replica_lag_bad {
                     Error::ReplicaLag
                 } else {
@@ -115,12 +96,24 @@ impl Monitor {
 
                 ban_targets.push((i, reason));
             }
+
+            // A target can't serve reads if it's already banned or about to be
+            // banned this round. Bans applied outside the monitor (e.g. a failed
+            // checkout in `get_internal`) can leave a target banned even while it
+            // reports healthy, so the current ban state must be counted too.
+            if target.ban.banned() || (should_ban && bannable) {
+                unavailable += 1;
+            }
         }
 
-        // Clear all bans if all targets are unhealthy.
-        if targets.len() == banned {
+        // If every target is unavailable, banning provides no benefit: there's
+        // nowhere to redirect reads. Clear all bans so reads can retry, even if
+        // the targets are healthy (they were banned by a transient failure).
+        // Manual bans are preserved (`unban(true)`) since they reflect operator
+        // intent.
+        if targets.len() == unavailable {
             targets.iter().for_each(|target| {
-                target.ban.unban(false);
+                target.ban.unban(true, UnbanReason::AllTargetsBanned);
             });
         } else {
             for (i, reason) in ban_targets {

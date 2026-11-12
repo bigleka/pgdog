@@ -1,17 +1,20 @@
 use bytes::Buf;
 use std::io::Cursor;
 
+use crate::net::Prepare;
+
 use super::{
-    Bind, Close, CopyData, CopyDone, CopyFail, Describe, Execute, Flush, FromBytes, Message, Parse,
-    Protocol, Query, Sync, ToBytes,
+    Bind, Close, CopyData, CopyDone, CopyFail, Describe, Execute, Fastpath, Flush, FromBytes,
+    Message, Parse, Protocol, Query, Sync, ToBytes,
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ProtocolMessage {
+pub(crate) enum ProtocolMessage {
     Bind(Bind),
     Parse(Parse),
     Describe(Describe),
-    Prepare { name: String, statement: String },
+    EnsurePrepared(Prepare),
+    PrepareFromClient(Prepare),
     Execute(Execute),
     Close(Close),
     Query(Query),
@@ -19,11 +22,12 @@ pub enum ProtocolMessage {
     CopyData(CopyData),
     CopyFail(CopyFail),
     CopyDone(CopyDone),
+    Fastpath(Fastpath),
     Sync(Sync),
 }
 
 impl ProtocolMessage {
-    pub fn extended(&self) -> bool {
+    pub(crate) fn is_extended(&self) -> bool {
         use ProtocolMessage::*;
         matches!(
             self,
@@ -31,7 +35,7 @@ impl ProtocolMessage {
         )
     }
 
-    pub fn anonymous(&self) -> bool {
+    pub(crate) fn anonymous(&self) -> bool {
         use ProtocolMessage::*;
 
         match self {
@@ -42,12 +46,24 @@ impl ProtocolMessage {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn anonymize(&mut self) {
+        use ProtocolMessage::*;
+
+        match self {
+            Bind(bind) => bind.anonymize(),
+            Parse(parse) => parse.anonymize(),
+            Describe(describe) => describe.anonymize(),
+            _ => (),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Bind(bind) => bind.len(),
             Self::Parse(parse) => parse.len(),
             Self::Describe(describe) => describe.len(),
-            Self::Prepare { statement, .. } => statement.len() + 1 + 1 + 4, // NULL + code + len
+            Self::EnsurePrepared(prepare) => prepare.len(),
+            Self::PrepareFromClient(prepare) => prepare.len(),
             Self::Execute(execute) => execute.len(),
             Self::Close(close) => close.len(),
             Self::Query(query) => query.len(),
@@ -55,6 +71,7 @@ impl ProtocolMessage {
             Self::CopyData(data) => data.len(),
             Self::Sync(sync) => sync.len(),
             Self::CopyDone(copy_done) => copy_done.len(),
+            Self::Fastpath(fp) => fp.len(),
             Self::CopyFail(copy_fail) => copy_fail.len(),
         }
     }
@@ -66,7 +83,7 @@ impl Protocol for ProtocolMessage {
             Self::Bind(bind) => bind.code(),
             Self::Parse(parse) => parse.code(),
             Self::Describe(describe) => describe.code(),
-            Self::Prepare { .. } => 'Q',
+            Self::EnsurePrepared { .. } | Self::PrepareFromClient { .. } => 'Q',
             Self::Execute(execute) => execute.code(),
             Self::Close(close) => close.code(),
             Self::Query(query) => query.code(),
@@ -75,6 +92,7 @@ impl Protocol for ProtocolMessage {
             Self::Sync(sync) => sync.code(),
             Self::CopyFail(copy_fail) => copy_fail.code(),
             Self::CopyDone(copy_done) => copy_done.code(),
+            Self::Fastpath(fp) => fp.code(),
         }
     }
 }
@@ -93,20 +111,20 @@ impl FromBytes for ProtocolMessage {
             'S' => Ok(Self::Sync(Sync::from_bytes(bytes)?)),
             'f' => Ok(Self::CopyFail(CopyFail::from_bytes(bytes)?)),
             'c' => Ok(Self::CopyDone(CopyDone::from_bytes(bytes)?)),
+            'F' => Ok(Self::Fastpath(Fastpath::from_bytes(bytes)?)),
             _ => Ok(Self::Other(Message::from_bytes(bytes)?)),
         }
     }
 }
 
 impl ToBytes for ProtocolMessage {
-    fn to_bytes(&self) -> Result<bytes::Bytes, crate::net::Error> {
+    fn to_bytes(&self) -> bytes::Bytes {
         match self {
             Self::Bind(bind) => bind.to_bytes(),
             Self::Parse(parse) => parse.to_bytes(),
             Self::Describe(describe) => describe.to_bytes(),
-            Self::Prepare { statement, name } => {
-                Query::new(format!("PREPARE {} AS {}", name, statement)).to_bytes()
-            }
+            Self::EnsurePrepared(prepare) => prepare.to_bytes(),
+            Self::PrepareFromClient(prepare) => prepare.to_bytes(),
             Self::Execute(execute) => execute.to_bytes(),
             Self::Close(close) => close.to_bytes(),
             Self::Query(query) => query.to_bytes(),
@@ -115,6 +133,7 @@ impl ToBytes for ProtocolMessage {
             Self::Sync(sync) => sync.to_bytes(),
             Self::CopyFail(copy_fail) => copy_fail.to_bytes(),
             Self::CopyDone(copy_done) => copy_done.to_bytes(),
+            Self::Fastpath(fp) => fp.to_bytes(),
         }
     }
 }
@@ -175,7 +194,7 @@ impl From<Sync> for ProtocolMessage {
 
 impl From<Flush> for ProtocolMessage {
     fn from(value: Flush) -> Self {
-        Self::Other(value.message().unwrap())
+        Self::Other(value.message())
     }
 }
 
@@ -188,5 +207,11 @@ impl From<CopyDone> for ProtocolMessage {
 impl From<CopyFail> for ProtocolMessage {
     fn from(value: CopyFail) -> Self {
         Self::CopyFail(value)
+    }
+}
+
+impl From<Fastpath> for ProtocolMessage {
+    fn from(value: Fastpath) -> Self {
+        Self::Fastpath(value)
     }
 }

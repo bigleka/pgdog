@@ -3,20 +3,29 @@ on:
   push:
     branches:
       - main
+    paths:
+      - ".github/workflows/plugin-ci.yml"
+      - "integration/ci/**"
+      - "**/*.rs"
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/plugin-ci.yml"
+      - "integration/ci/**"
+      - "**/*.rs"
 
 jobs:
   plugin-unit-tests:
     runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 30
+    container:
+      image: ghcr.io/pgdogdev/pgdog-ci:v5
     steps:
-      - uses: actions/checkout@v4
-      - name: Install CI deps
-        run: bash integration/ci/install-deps.sh
+      - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "plugin-unit-v2"
+          shared-key: plugin-unit
       - name: Run plugin unit tests
         run: cargo nextest run -E 'package(pgdog-example-plugin)' --no-fail-fast

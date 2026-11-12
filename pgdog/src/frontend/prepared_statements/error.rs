@@ -1,13 +1,10 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum Error {
-    #[error("prepared statement \"{0}\" is missing from cache")]
-    MissingPreparedStatement(String),
-
+pub(crate) enum Error {
     #[error("{0}")]
     Net(#[from] crate::net::Error),
 
-    #[error("wrong message")]
-    WrongMessage,
+    #[error("prepared statement \"{0}\" does not exist")]
+    MissingStatement(String),
 }

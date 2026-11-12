@@ -10,7 +10,7 @@ use crate::net::messages::*;
 use crate::util::format_time;
 
 /// Show clients command.
-pub struct ShowClients {
+pub(crate) struct ShowClients {
     filter: NamedRow,
 }
 
@@ -77,7 +77,7 @@ impl Command for ShowClients {
             let row = self
                 .filter
                 .clone()
-                .add("id", client.id.pid as i64)
+                .add("id", client.key.pid())
                 .add("user", user)
                 .add("database", client.paramters.get_default("database", user))
                 .add("addr", client.addr.ip().to_string())
@@ -121,10 +121,10 @@ impl Command for ShowClients {
                 .add("locked", client.stats.locked)
                 .add("prepared_statements", client.stats.prepared_statements)
                 .data_row();
-            rows.push(row.message()?);
+            rows.push(row.message());
         }
 
-        let mut messages = vec![self.filter.row_description().message()?];
+        let mut messages = vec![self.filter.row_description().message()];
         messages.extend(rows);
 
         Ok(messages)

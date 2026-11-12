@@ -7,7 +7,7 @@ use super::code;
 use super::prelude::*;
 
 #[derive(Clone, PartialEq)]
-pub struct Execute {
+pub(crate) struct Execute {
     payload: Bytes,
     portal_len: usize,
 }
@@ -27,7 +27,7 @@ impl Debug for Execute {
 }
 
 impl Execute {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut payload = Payload::named('E');
         payload.put_string("");
         payload.put_i32(0);
@@ -37,7 +37,8 @@ impl Execute {
         }
     }
 
-    pub fn new_portal(name: &str) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_portal(name: &str) -> Self {
         let mut payload = Payload::named('E');
         payload.put_string(name);
         payload.put_i32(0);
@@ -49,7 +50,8 @@ impl Execute {
 
     /// Create an Execute message for a named portal with a row limit.
     /// A limit of 0 means fetch all rows.
-    pub fn new_portal_limit(name: &str, max_rows: i32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_portal_limit(name: &str, max_rows: i32) -> Self {
         let mut payload = Payload::named('E');
         payload.put_string(name);
         payload.put_i32(max_rows);
@@ -59,7 +61,7 @@ impl Execute {
         }
     }
 
-    pub fn portal(&self) -> &str {
+    pub(crate) fn portal(&self) -> &str {
         let start = 5;
         let end = start
             + if self.portal_len > 0 {
@@ -71,14 +73,25 @@ impl Execute {
         from_utf8(buf).unwrap_or("")
     }
 
-    /// Number of rows to return.
-    pub fn max_rows(&self) -> i32 {
-        let mut buf = &self.payload[5 + self.portal_len..];
-        buf.get_i32()
+    pub(crate) fn len(&self) -> usize {
+        self.payload.len()
     }
 
-    pub fn len(&self) -> usize {
-        self.payload.len()
+    /// Most rows to return, 0 for all of them.
+    pub(crate) fn max_rows(&self) -> i32 {
+        // After the portal name and its terminating NUL.
+        let Some(start) = self.payload[5..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|nul| 5 + nul + 1)
+        else {
+            return 0;
+        };
+        self.payload
+            .get(start..start + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_be_bytes)
+            .unwrap_or(0)
     }
 }
 
@@ -94,8 +107,8 @@ impl FromBytes for Execute {
 }
 
 impl ToBytes for Execute {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(self.payload.clone())
+    fn to_bytes(&self) -> Bytes {
+        self.payload.clone()
     }
 }
 
@@ -118,9 +131,15 @@ mod test {
 
         let execute = Execute::from_bytes(msg).unwrap();
         assert_eq!(execute.portal(), "test");
-        assert_eq!(execute.max_rows(), 25);
 
         let exec = Execute::new_portal("test1");
         assert_eq!(exec.portal(), "test1");
+    }
+
+    #[test]
+    fn test_max_rows() {
+        assert_eq!(Execute::new_portal_limit("p", 25).max_rows(), 25);
+        assert_eq!(Execute::new_portal_limit("", 3).max_rows(), 3);
+        assert_eq!(Execute::new().max_rows(), 0);
     }
 }

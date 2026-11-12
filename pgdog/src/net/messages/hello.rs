@@ -1,11 +1,10 @@
 //! Startup, SSLRequest messages.
 
 use crate::net::{
-    c_string,
+    Error, c_string,
     messages::{BackendKeyData, ProtocolVersion},
-    parameter::{ParameterValue, Parameters},
-    Error,
 };
+use crate::parameters::{ParameterValue, Parameters};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::debug;
@@ -19,7 +18,7 @@ use super::{super::Parameter, FromBytes, Payload, Protocol, ToBytes};
 ///
 /// See: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
 #[derive(Debug, PartialEq)]
-pub enum Startup {
+pub(crate) enum Startup {
     /// SSLRequest (F)
     Ssl,
     /// GSSENCRequest (F)
@@ -36,7 +35,7 @@ pub enum Startup {
 
 impl Startup {
     /// Read Startup message from a stream.
-    pub async fn from_stream(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, Error> {
+    pub(crate) async fn from_stream(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, Error> {
         let len = stream.read_i32().await?;
         let code = stream.read_i32().await?;
 
@@ -73,7 +72,7 @@ impl Startup {
                     return Err(Error::UnsupportedStartup(code));
                 }
 
-                let mut params = Parameters::default();
+                let mut startup = vec![];
                 let mut unrecognized_options = vec![];
                 loop {
                     let name = c_string(stream).await?;
@@ -91,33 +90,24 @@ impl Startup {
                         unrecognized_options.push(name);
                     } else if name == "search_path" {
                         let value = search_path(&value);
-                        params.insert(name, value);
+                        startup.push((name, value));
                     } else if name == "options" {
-                        let kvs = value.split("-c");
-                        for kv in kvs {
-                            let mut nvs = kv.split("=");
-                            let name = nvs.next();
-                            let value = nvs.next();
-
-                            if let Some(name) = name {
-                                if let Some(value) = value {
-                                    let name = name.trim().to_string();
-                                    let value = value.trim().to_string();
-                                    if !name.is_empty() && !value.is_empty() {
-                                        let value = if name == "search_path" {
-                                            search_path(&value)
-                                        } else {
-                                            ParameterValue::from(value)
-                                        };
-                                        params.insert(name, value);
-                                    }
-                                }
+                        for (name, value) in parse_options(&value) {
+                            if !name.is_empty() && !value.is_empty() {
+                                let value = if name == "search_path" {
+                                    search_path(&value)
+                                } else {
+                                    ParameterValue::from(value)
+                                };
+                                startup.push((name, value));
                             }
                         }
                     } else {
-                        params.insert(name, value);
+                        startup.push((name, value.into()));
                     }
                 }
+
+                let params = Parameters::new(startup);
 
                 Ok(Startup::Startup {
                     version,
@@ -128,23 +118,13 @@ impl Startup {
         }
     }
 
-    /// Get a startup parameter by name.
-    ///
-    /// If no such parameter exists, `None` is returned.
-    pub fn parameter(&self, name: &str) -> Option<&str> {
-        match self {
-            Startup::Ssl | Startup::GssEnc | Startup::Cancel { .. } => None,
-            Startup::Startup { params, .. } => params.get(name).and_then(|s| s.as_str()),
-        }
-    }
-
     /// Create new startup message from config.
-    pub fn new(user: &str, database: &str, params: Vec<Parameter>) -> Self {
+    pub(crate) fn new(user: &str, database: &str, params: Vec<Parameter>) -> Self {
         Self::new_with_protocol_version(ProtocolVersion::V3_0, user, database, params)
     }
 
     /// Create new startup message with a specific protocol version.
-    pub fn new_with_protocol_version(
+    pub(crate) fn new_with_protocol_version(
         version: ProtocolVersion,
         user: &str,
         database: &str,
@@ -168,18 +148,13 @@ impl Startup {
     }
 
     /// Create new startup TLS request.
-    pub fn tls() -> Self {
+    pub(crate) fn tls() -> Self {
         Self::Ssl
-    }
-
-    /// Create new GSSENC request.
-    pub fn gss_enc() -> Self {
-        Self::GssEnc
     }
 }
 
 impl super::ToBytes for Startup {
-    fn to_bytes(&self) -> Result<bytes::Bytes, Error> {
+    fn to_bytes(&self) -> bytes::Bytes {
         match self {
             Startup::Ssl => {
                 let mut buf = BytesMut::new();
@@ -187,7 +162,7 @@ impl super::ToBytes for Startup {
                 buf.put_i32(8);
                 buf.put_i32(80877103);
 
-                Ok(buf.freeze())
+                buf.freeze()
             }
 
             Startup::GssEnc => {
@@ -196,7 +171,7 @@ impl super::ToBytes for Startup {
                 buf.put_i32(8);
                 buf.put_i32(80877104);
 
-                Ok(buf.freeze())
+                buf.freeze()
             }
 
             Startup::Cancel { id } => {
@@ -206,7 +181,7 @@ impl super::ToBytes for Startup {
                 payload.put_i32(id.pid);
                 payload.put_slice(id.secret.as_slice());
 
-                Ok(payload.freeze())
+                payload.freeze()
             }
 
             Startup::Startup {
@@ -218,7 +193,7 @@ impl super::ToBytes for Startup {
 
                 for (name, value) in params.deref() {
                     if let ParameterValue::String(value) = value {
-                        params_buf.put_slice(name.as_bytes());
+                        params_buf.put_slice(name.as_str().as_bytes());
                         params_buf.put_u8(0);
 
                         params_buf.put(value.as_bytes());
@@ -232,7 +207,7 @@ impl super::ToBytes for Startup {
                 payload.put(params_buf);
                 payload.put_u8(0); // Terminating null character.
 
-                Ok(payload.freeze())
+                payload.freeze()
             }
         }
     }
@@ -240,17 +215,17 @@ impl super::ToBytes for Startup {
 
 /// Reply to a SSLRequest (F) message.
 #[derive(Debug, PartialEq)]
-pub enum SslReply {
+pub(crate) enum SslReply {
     Yes,
     No,
 }
 
 impl ToBytes for SslReply {
-    fn to_bytes(&self) -> Result<bytes::Bytes, Error> {
-        Ok(match self {
+    fn to_bytes(&self) -> bytes::Bytes {
+        match self {
             SslReply::Yes => Bytes::from("S"),
             SslReply::No => Bytes::from("N"),
-        })
+        }
     }
 }
 
@@ -295,8 +270,54 @@ fn search_path(value: &str) -> ParameterValue {
     ParameterValue::Tuple(value)
 }
 
+fn parse_options(options: &str) -> Vec<(String, String)> {
+    let mut tokens = vec![];
+    let mut current = String::new();
+    let mut chars = options.chars();
+
+    // treat the whitespaces with \\ like non-split whitespace
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => current.extend(chars.next()),
+            c if c.is_whitespace() => tokens.push(std::mem::take(&mut current)),
+            c => current.push(c),
+        }
+    }
+    tokens.push(current);
+
+    let mut params = vec![];
+    let mut tokens = tokens.into_iter().filter(|token| !token.is_empty());
+
+    while let Some(token) = tokens.next() {
+        let setting = if let Some(setting) = token.strip_prefix("--") {
+            Some(setting.to_string())
+        } else if let Some(setting) = token.strip_prefix("-c") {
+            if setting.is_empty() {
+                tokens.next()
+            } else {
+                Some(setting.to_string())
+            }
+        } else {
+            None
+        };
+
+        if let Some((name, value)) = setting.as_deref().and_then(|s| s.split_once('=')) {
+            params.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    params
+}
+
 #[cfg(test)]
 mod test {
+    impl Startup {
+        fn gss_enc() -> Self {
+            Self::GssEnc
+        }
+    }
+
+    use crate::net::FrontendPid;
     use crate::net::messages::{BackendKeyData, ProtocolVersion, ToBytes};
 
     use super::*;
@@ -306,7 +327,7 @@ mod test {
     #[test]
     fn test_ssl() {
         let ssl = Startup::Ssl;
-        let mut bytes = ssl.to_bytes().unwrap();
+        let mut bytes = ssl.to_bytes();
 
         assert_eq!(bytes.get_i32(), 8); // len
         assert_eq!(bytes.get_i32(), 80877103); // request code
@@ -315,7 +336,7 @@ mod test {
     #[test]
     fn test_gssenc() {
         let gss = Startup::gss_enc();
-        let mut bytes = gss.to_bytes().unwrap();
+        let mut bytes = gss.to_bytes();
 
         assert_eq!(bytes.get_i32(), 8); // len
         assert_eq!(bytes.get_i32(), 80877104); // request code
@@ -339,7 +360,7 @@ mod test {
             unrecognized_options: vec![],
         };
 
-        let bytes = startup.to_bytes().unwrap();
+        let bytes = startup.to_bytes();
 
         assert_eq!(bytes.clone().get_i32(), 41);
     }
@@ -368,7 +389,7 @@ mod test {
                 "postgres",
                 vec![],
             );
-            write.write_all(&startup.to_bytes().unwrap()).await.unwrap();
+            write.write_all(&startup.to_bytes()).await.unwrap();
         });
 
         let startup = Startup::from_stream(&mut read).await.unwrap();
@@ -415,12 +436,83 @@ mod test {
         assert_eq!(unrecognized_options, vec!["_pq_.command_tag"]);
     }
 
+    async fn startup_with_options(options: &str) -> Startup {
+        let (mut write, mut read) = tokio::io::duplex(128);
+        let options = options.to_string();
+        tokio::spawn(async move {
+            let mut payload = BytesMut::new();
+            payload.put_i32(ProtocolVersion::V3_0.as_i32());
+            payload.put_slice(b"user\0postgres\0");
+            payload.put_slice(b"database\0postgres\0");
+            payload.put_slice(b"options\0");
+            payload.put_slice(options.as_bytes());
+            payload.put_u8(0);
+            payload.put_u8(0);
+
+            let mut bytes = BytesMut::new();
+            bytes.put_i32(payload.len() as i32 + 4);
+            bytes.put(payload);
+            write.write_all(&bytes).await.unwrap();
+        });
+        Startup::from_stream(&mut read).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_options_space_encoded() {
+        // options=-c pgdog.role=replica  (space decoded from %20 by libpq)
+        let startup = startup_with_options("-c pgdog.role=replica").await;
+        let Startup::Startup { params, .. } = startup else {
+            panic!("expected startup message");
+        };
+        assert_eq!(
+            params.get("pgdog.role").and_then(|v| v.as_str()),
+            Some("replica")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_options_long_form() {
+        let startup =
+            startup_with_options("--pgdog.sharding_key=YWJj== --application_name=app=web").await;
+        let Startup::Startup { params, .. } = startup else {
+            panic!("expected startup message");
+        };
+        assert_eq!(
+            params.get("pgdog.sharding_key").and_then(|v| v.as_str()),
+            Some("YWJj==")
+        );
+        assert_eq!(
+            params.get("application_name").and_then(|v| v.as_str()),
+            Some("app=web")
+        );
+    }
+
+    #[test]
+    fn test_parse_options() {
+        let parsed = parse_options(
+            "-c pgdog.sharding_key=270b77fd-c30e-4c1a-9cfe-0d1d2c3b4a5f -capplication_name=my-client --a=b=c -c x=1+2 -c y=two\\ words -c z=a\\\\ -c w=b",
+        );
+        let expected: Vec<(String, String)> = [
+            ("pgdog.sharding_key", "270b77fd-c30e-4c1a-9cfe-0d1d2c3b4a5f"),
+            ("application_name", "my-client"),
+            ("a", "b=c"),
+            ("x", "1+2"),
+            ("y", "two words"),
+            ("z", "a\\"),
+            ("w", "b"),
+        ]
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(parsed, expected);
+    }
+
     #[tokio::test]
     async fn test_cancel_roundtrip_extended_secret() {
         let cancel = Startup::Cancel {
-            id: BackendKeyData::new_client(ProtocolVersion::V3_2),
+            id: BackendKeyData::new_frontend(ProtocolVersion::V3_2, FrontendPid::new()),
         };
-        let bytes = cancel.to_bytes().unwrap();
+        let bytes = cancel.to_bytes();
 
         let (mut write, mut read) = tokio::io::duplex(512);
         tokio::spawn(async move {

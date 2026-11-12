@@ -1,0 +1,2790 @@
+use std::collections::HashSet;
+use std::time::Duration;
+use tokio::task::yield_now;
+use tokio::time::{Instant, sleep, timeout};
+
+use crate::backend::pool::{Address, Config, Error, PoolConfig, Request};
+use crate::backend::replication::publisher::Lsn;
+use crate::config::{LoadBalancingStrategy, Role};
+use crate::frontend::router::Route;
+use crate::frontend::router::parser::ShardWithPriority;
+use itertools::*;
+use pgdog_stats::{LsnStats as StatsLsnStats, ReplicaLag};
+
+use super::*;
+use monitor::Monitor;
+
+mod primary_reads;
+mod role_detection;
+
+fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
+    create_test_pool_config_with_db_num(host, port, Default::default())
+}
+
+fn create_test_pool_config_with_db_num(
+    host: &str,
+    port: u16,
+    database_number: usize,
+) -> PoolConfig {
+    PoolConfig {
+        address: test_addr(host, port, database_number),
+        config: test_config(Default::default()),
+    }
+}
+
+fn test_addr(host: &str, port: u16, database_number: usize) -> Address {
+    Address {
+        host: host.into(),
+        port,
+        user: "pgdog".into(),
+        passwords: vec!["pgdog".into()],
+        database_name: "pgdog".into(),
+        configured_role: Role::Replica,
+        database_number,
+        ..Default::default()
+    }
+}
+
+fn test_config(config: Config) -> Config {
+    Config {
+        max: 1,
+        checkout_timeout: Duration::from_millis(1000),
+        ban_timeout: Duration::from_millis(100),
+        ..config
+    }
+}
+
+fn create_auto_test_pool_config(host: &str, port: u16) -> PoolConfig {
+    let mut config = create_test_pool_config(host, port);
+    config.address.configured_role = Role::Auto;
+    config.config.role_detection = true;
+    config.config.checkout_timeout = Duration::from_millis(50);
+    config
+}
+
+fn setup_test_replicas() -> LoadBalancer {
+    let pool_config1 = create_test_pool_config("127.0.0.1", 5432);
+    let pool_config2 = create_test_pool_config("localhost", 5432);
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+    replicas
+}
+
+fn set_lsn_stats(target: &Target, replica: bool, lsn: u64) {
+    let stats: crate::backend::pool::lsn_monitor::LsnStats = StatsLsnStats {
+        replica,
+        lsn: Lsn::from_u64(lsn),
+        offset_bytes: lsn,
+        fetched: std::time::SystemTime::now(),
+        ..Default::default()
+    }
+    .into();
+    *target.pool.inner().lsn_stats.write() = stats;
+}
+
+impl LoadBalancer {
+    /// Replica pools handle.
+    pub(crate) fn pools(&self) -> Vec<&Pool> {
+        self.targets.iter().map(|target| &target.pool).collect()
+    }
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_only_primary() {
+    let mut primary = create_test_pool_config("127.0.0.1", 5432);
+    primary.address.configured_role = Role::Primary;
+    let pool = Pool::new(&primary);
+
+    let lb = LoadBalancer::new(
+        &Some(pool),
+        &[],
+        LoadBalancingStrategy::default(),
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+        Default::default(),
+    );
+
+    lb.launch();
+
+    let conn = lb.get(&Request::default()).await.unwrap();
+    drop(conn);
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_replica_ban_recovery_after_timeout() {
+    let replicas = setup_test_replicas();
+
+    // Ban the first replica with very short timeout
+    let ban = &replicas.targets[0].ban;
+    ban.ban(Error::ServerError, Duration::from_millis(50));
+
+    assert!(ban.banned());
+
+    // Wait for ban to expire
+    sleep(Duration::from_millis(60)).await;
+
+    // Check if ban would be removed (simulate monitor behavior)
+    let now = std::time::Instant::now();
+    let unbanned = ban.unban_if_expired(now);
+
+    assert!(unbanned);
+    assert!(!ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_replica_manual_unban() {
+    let replicas = setup_test_replicas();
+
+    // Ban the first replica
+    let ban = &replicas.targets[0].ban;
+    ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    assert!(ban.banned());
+
+    // Manually unban
+    ban.unban(false, UnbanReason::Manual);
+
+    assert!(!ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_replica_ban_error_retrieval() {
+    let replicas = setup_test_replicas();
+
+    let ban = &replicas.targets[0].ban;
+
+    // No error initially
+    assert!(ban.error().is_none());
+
+    // Ban with specific error
+    ban.ban(Error::ServerError, Duration::from_millis(100));
+
+    // Should return the ban error
+    let error = ban.error().unwrap();
+    assert!(matches!(error, Error::ServerError));
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_multiple_replica_banning() {
+    let replicas = setup_test_replicas();
+
+    // Ban both replicas
+    for i in 0..2 {
+        let ban = &replicas.targets[i].ban;
+        ban.ban(Error::ServerError, Duration::from_millis(100));
+
+        assert!(ban.banned());
+    }
+
+    // Both should be banned
+    assert_eq!(
+        replicas.targets.iter().filter(|r| r.ban.banned()).count(),
+        2
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_replica_ban_idempotency() {
+    let replicas = setup_test_replicas();
+
+    let ban = &replicas.targets[0].ban;
+
+    // First ban should succeed
+    let first_ban = ban.ban(Error::ServerError, Duration::from_millis(100));
+    assert!(first_ban);
+    assert!(ban.banned());
+
+    // Second ban of same replica should not create new ban
+    let second_ban = ban.ban(Error::ConnectTimeout, Duration::from_millis(200));
+    assert!(!second_ban);
+    assert!(ban.banned());
+
+    // Error should still be the original one
+    assert!(matches!(ban.error().unwrap(), Error::ServerError));
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_pools_with_roles_and_bans() {
+    let replicas = setup_test_replicas();
+
+    let pools_info = replicas.pools_with_roles_and_bans();
+
+    // Should have 2 replica pools (no primary in this test)
+    assert_eq!(pools_info.len(), 2);
+
+    // All should be replica role
+    for (role, _ban, _pool) in &pools_info {
+        assert!(matches!(role, crate::config::Role::Replica));
+    }
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_primary_pool_banning() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Test primary ban exists
+    assert!(replicas.primary_target().is_some());
+
+    let primary_ban = &replicas.primary_target().unwrap().ban;
+
+    // Ban primary for reads
+    primary_ban.ban(Error::ServerError, Duration::from_millis(100));
+
+    assert!(primary_ban.banned());
+
+    // Check pools with roles includes primary
+    let pools_info = replicas.pools_with_roles_and_bans();
+    assert_eq!(pools_info.len(), 2); // 1 replica + 1 primary
+
+    let has_primary = pools_info
+        .iter()
+        .any(|(role, _ban, _pool)| matches!(role, crate::config::Role::Primary));
+    assert!(has_primary);
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_ban_timeout_not_expired() {
+    let replicas = setup_test_replicas();
+
+    let ban = &replicas.targets[0].ban;
+    ban.ban(Error::ServerError, Duration::from_millis(1000)); // Long timeout
+
+    assert!(ban.banned());
+
+    // Check immediately - should not be expired
+    let now = std::time::Instant::now();
+    let unbanned = ban.unban_if_expired(now);
+
+    assert!(!unbanned);
+    assert!(ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_unban_if_expired_checks_pool_health() {
+    let replicas = setup_test_replicas();
+
+    let ban = &replicas.targets[0].ban;
+    let pool = &replicas.targets[0].pool;
+
+    ban.ban(Error::ServerError, Duration::from_millis(50));
+    assert!(ban.banned());
+
+    pool.inner().health.toggle(false);
+
+    sleep(Duration::from_millis(60)).await;
+
+    let now = std::time::Instant::now();
+    let unbanned = ban.unban_if_expired(now);
+
+    assert!(!unbanned);
+    assert!(ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_replica_ban_clears_idle_connections() {
+    let replicas = setup_test_replicas();
+
+    // Get a connection and return it to create idle connections
+    let request = Request::default();
+    let conn = replicas.pools()[0]
+        .get(&request)
+        .await
+        .expect("Should be able to get connection from launched pool");
+
+    // Verify we have a valid connection
+    assert!(!conn.error());
+
+    drop(conn); // Return to pool as idle
+
+    // Give a moment for the connection to be properly returned to idle state
+    sleep(Duration::from_millis(10)).await;
+
+    // Check that we have idle connections before banning
+    let idle_before = replicas.pools()[0].lock().idle();
+    assert!(
+        idle_before > 0,
+        "Should have idle connections before banning, but found {}",
+        idle_before
+    );
+
+    let ban = &replicas.targets[0].ban;
+
+    // Ban should trigger dump_idle() on the pool
+    ban.ban(Error::ServerError, Duration::from_millis(100));
+
+    // Verify the ban was applied
+    assert!(ban.banned());
+
+    // Verify that idle connections were cleared
+    let idle_after = replicas.pools()[0].lock().idle();
+    assert_eq!(
+        idle_after, 0,
+        "Idle connections should be cleared after banning"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_automatic_ban_expiration() {
+    let replicas = setup_test_replicas();
+
+    // Ban the first replica with very short timeout
+    let ban = &replicas.targets[0].ban;
+    ban.ban(Error::ServerError, Duration::from_millis(100));
+
+    assert!(ban.banned());
+
+    // Wait longer than the ban timeout to allow monitor to process
+    // The monitor runs every 333ms, so we wait for at least one cycle
+    sleep(Duration::from_millis(400)).await;
+
+    // The monitor should have automatically unbanned the replica
+    // Note: Since the monitor runs in a background task spawned during Replicas::new(),
+    // and we can't easily control its timing in tests, we check that the ban
+    // can be expired when checked
+    let now = std::time::Instant::now();
+    let would_be_unbanned = ban.unban_if_expired(now);
+
+    // Either it was already unbanned by the monitor, or it would be unbanned now
+    assert!(!ban.banned() || would_be_unbanned);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Try getting connections multiple times and verify primary is never used
+    let mut replica_ids = HashSet::new();
+    for _ in 0..100 {
+        let conn = replicas.get(&request).await.unwrap();
+        replica_ids.insert(conn.pool.id());
+    }
+
+    // Should only use replica pools, not primary
+    assert_eq!(replica_ids.len(), 2);
+
+    // Verify primary pool ID is not in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!replica_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_lsn_filtering() {
+    let primary = Pool::new(&create_test_pool_config("127.0.0.1", 5432));
+    let primary_id = primary.id();
+    let replicas = LoadBalancer::new(
+        &Some(primary),
+        &[
+            create_test_pool_config("127.0.0.1", 5432),
+            create_test_pool_config("localhost", 5432),
+        ],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+    // Include positions across the high bit of the unsigned LSN.
+    for (behind, caught_up, ahead) in [(100, 200, 201), ((1 << 63) - 1, 1 << 63, (1 << 63) + 1)] {
+        set_lsn_stats(&replicas.targets[0], true, behind);
+        set_lsn_stats(&replicas.targets[1], true, caught_up);
+
+        let mut route = Route::read(ShardWithPriority::default());
+        route.lsn = Some(caught_up);
+        let request = Request::new(Default::default(), &route, false);
+
+        // A replica exactly at the requested LSN is eligible; the lagging one is not.
+        for _ in 0..4 {
+            let conn = replicas.get(&request).await.expect("caught-up replica");
+            assert_eq!(conn.pool.id(), replicas.targets[1].pool.id());
+        }
+
+        // Fall back to primary when every replica is behind the requested LSN.
+        route.lsn = Some(ahead);
+        let request = Request::new(Default::default(), &route, false);
+        let conn = replicas.get(&request).await.expect("primary fallback");
+        assert_eq!(conn.pool.id(), primary_id);
+    }
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_lag() {
+    let primary = Pool::new(&create_test_pool_config("127.0.0.1", 5432));
+    let primary_id = primary.id();
+    let replicas = LoadBalancer::new(
+        &Some(primary),
+        &[
+            create_test_pool_config("127.0.0.1", 5432),
+            create_test_pool_config("localhost", 5432),
+        ],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaLag,
+        Default::default(),
+    );
+    replicas.launch();
+    set_lsn_stats(&replicas.targets[0], true, 100);
+    set_lsn_stats(&replicas.targets[1], true, 200);
+
+    for read_only in [false, true] {
+        let mut route = Route::read(ShardWithPriority::default());
+        for lsn in [None, Some(200), Some(201)] {
+            route.lsn = lsn;
+            let request = Request::new(Default::default(), &route, read_only);
+
+            // Round robin must never select the primary while an eligible replica exists.
+            for _ in 0..4 {
+                let conn = replicas.get(&request).await.expect("read connection");
+                match lsn {
+                    None => assert_ne!(conn.pool.id(), primary_id),
+                    Some(200) => assert_eq!(conn.pool.id(), replicas.targets[1].pool.id()),
+                    _ => assert_eq!(conn.pool.id(), primary_id),
+                }
+            }
+        }
+    }
+
+    replicas.shutdown();
+}
+
+/// Sets the `Request.read_only` (normally derived from `User.read_only`) to true,
+/// then ensures that the primary is not chosen for reads. We have replicas available.
+#[tokio::test]
+async fn test_user_read_only_include_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    // Use `IncludePrimary`
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Notice that we `read` to true and `read_only` to true.
+    let request = Request::new(
+        Default::default(),
+        &Route::read(ShardWithPriority::default()),
+        true,
+    );
+
+    // Try getting connections multiple times and verify primary is never used
+    let mut replica_ids = HashSet::new();
+    for _ in 0..100 {
+        let conn = replicas.get(&request).await.unwrap();
+        replica_ids.insert(conn.pool.id());
+    }
+
+    // Should only use replica pools, not primary
+    assert_eq!(replica_ids.len(), 2);
+
+    // Verify primary pool ID is not in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!replica_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+/// Sets the `Request.read_only` (normally derived from `User.read_only`) to true,
+/// then ensures that the primary IS chosen for reads. We have no usable replicas.
+#[tokio::test]
+async fn test_user_read_only_include_primary_no_replicas() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Ban the replica
+    let replica_ban = &replicas.targets[0].ban;
+    replica_ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    // `read_only` is set to true. This would usually override `IncludePrimary`,
+    // but we have no replicas available.
+    let request = Request::new(
+        Default::default(),
+        &Route::read(ShardWithPriority::default()),
+        true,
+    );
+
+    // Should only use primary since replica is banned
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should only use primary pool since replica is banned
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is in the set of used pools
+    let primary_id = replicas.targets.last().unwrap().pool.id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_include_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Try getting connections multiple times and verify both primary and replica can be used
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..20 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should use both primary and replica pools
+    assert_eq!(used_pool_ids.len(), 2);
+
+    // Verify primary pool ID is in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+/// Composition contract for `prefer_primary`.
+///
+/// `prefer_primary` lives in the router and only decides read-vs-write: a default
+/// query becomes a *write* and never reaches this load balancer. The only request
+/// that arrives here as a *read* is one that explicitly opted into replicas
+/// (`SET pgdog.role = replica`, `SET LOCAL ...`, or a `/* pgdog_role: replica */`
+/// comment). That read is a plain read — it is NOT pinned replica-only — so where it
+/// lands is governed entirely by `read_write_split`, independently of `prefer_primary`.
+///
+/// This verifies that handoff for every `read_write_split` value: the same opt-in read
+/// follows the split's rules, which is why `prefer_primary` +
+/// `include_primary_if_replica_banned` yields "default to primary, opt into replicas,
+/// fall back to primary when replicas are banned".
+#[tokio::test]
+async fn test_prefer_primary_optin_read_honors_read_write_split() {
+    async fn used_ids(split: ReadWriteSplit) -> (HashSet<u64>, u64) {
+        let primary_pool = Pool::new(&create_test_pool_config("127.0.0.1", 5432));
+        primary_pool.launch();
+        let primary_id = primary_pool.id();
+
+        let replica_configs = [
+            create_test_pool_config("localhost", 5432),
+            create_test_pool_config("127.0.0.1", 5432),
+        ];
+
+        let lb = LoadBalancer::new(
+            &Some(primary_pool),
+            &replica_configs,
+            LoadBalancingStrategy::RoundRobin,
+            split,
+            Default::default(),
+        );
+        lb.launch();
+
+        let request = Request::default();
+        let mut ids = HashSet::new();
+        for _ in 0..50 {
+            let conn = lb.get(&request).await.unwrap();
+            ids.insert(conn.pool.id());
+        }
+        lb.shutdown();
+        (ids, primary_id)
+    }
+
+    // exclude_primary: opt-in reads stay on replicas only.
+    let (ids, primary_id) = used_ids(ReadWriteSplit::ExcludePrimary).await;
+    assert!(!ids.contains(&primary_id));
+    assert_eq!(ids.len(), 2);
+
+    // include_primary: opt-in reads may still be served by the primary.
+    let (ids, primary_id) = used_ids(ReadWriteSplit::IncludePrimary).await;
+    assert!(ids.contains(&primary_id));
+
+    // include_primary_if_replica_banned: with no bans, opt-in reads stay on replicas.
+    let (ids, primary_id) = used_ids(ReadWriteSplit::IncludePrimaryIfReplicaBanned).await;
+    assert!(!ids.contains(&primary_id));
+    assert_eq!(ids.len(), 2);
+
+    // prefer_primary: opt-in reads stay on replicas (like exclude_primary); the
+    // primary-by-default behavior is enforced upstream in the router, not here.
+    let (ids, primary_id) = used_ids(ReadWriteSplit::PreferPrimary).await;
+    assert!(!ids.contains(&primary_id));
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary_no_replicas() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Try getting connections multiple times and we have primary in the set
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..2 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should use only primary
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    // Shutdown
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary_no_primary() {
+    // Test exclude primary setting when no primary exists
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Should work normally with just replicas
+    let mut replica_ids = HashSet::new();
+    for _ in 0..100 {
+        let conn = replicas.get(&request).await.unwrap();
+        replica_ids.insert(conn.pool.id());
+    }
+
+    assert_eq!(replica_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary_all_replicas_banned() {
+    let primary_pool = Pool::new(&create_test_pool_config("127.0.0.1", 5432));
+    primary_pool.launch();
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &[
+            create_test_pool_config("localhost", 5432),
+            create_test_pool_config("127.0.0.1", 5432),
+        ],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+    replicas.targets[1]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    let result = replicas.get(&Request::default()).await;
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "exclude_primary must not send reads to the primary when all replicas are banned"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary_one_replica_banned() {
+    let primary_pool = Pool::new(&create_test_pool_config("127.0.0.1", 5432));
+    primary_pool.launch();
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &[
+            create_test_pool_config("localhost", 5432),
+            create_test_pool_config("127.0.0.1", 5432),
+        ],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    let healthy_id = replicas.targets[1].pool.id();
+    let request = Request::default();
+    for _ in 0..20 {
+        let conn = replicas.get(&request).await.unwrap();
+        assert_eq!(conn.pool.id(), healthy_id);
+    }
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_include_primary_no_primary() {
+    // Test include primary setting when no primary exists
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Should work normally with just replicas
+    let mut replica_ids = HashSet::new();
+    for _ in 0..100 {
+        let conn = replicas.get(&request).await.unwrap();
+        replica_ids.insert(conn.pool.id());
+    }
+
+    // Should use both replica pools
+    assert_eq!(replica_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_with_banned_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Ban the primary
+    let primary_ban = &replicas.targets.last().unwrap().ban;
+    primary_ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    let request = Request::default();
+
+    // Should only use replica even though primary inclusion is enabled
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should only use replica pool since primary is banned
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is not in the set of used pools
+    let primary_id = replicas.targets.last().unwrap().pool.id();
+    assert!(!used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_with_banned_replicas() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Ban the replica
+    let replica_ban = &replicas.targets[0].ban;
+    replica_ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    let request = Request::default();
+
+    // Should only use primary since replica is banned
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should only use primary pool since replica is banned
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is in the set of used pools
+    let primary_id = replicas.targets.last().unwrap().pool.id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_prefer_primary_with_banned_replicas_falls_back_to_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::PreferPrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let replica_ban = &replicas.targets[0].ban;
+    replica_ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    let request = Request::default();
+
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    assert_eq!(used_pool_ids.len(), 1);
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_read_write_split_exclude_primary_with_round_robin() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Collect pool IDs from multiple requests to verify round-robin behavior
+    let mut pool_sequence = Vec::new();
+    for _ in 0..8 {
+        let conn = replicas.get(&request).await.unwrap();
+        pool_sequence.push(conn.pool.id());
+    }
+
+    // Should use both replicas (round-robin)
+    let unique_ids: HashSet<_> = pool_sequence.iter().collect();
+    assert_eq!(unique_ids.len(), 2);
+
+    // Verify primary is never used
+    let primary_id = replicas.targets.last().unwrap().pool.id();
+    assert!(!pool_sequence.contains(&primary_id));
+
+    // Verify round-robin pattern: each pool should be different from the previous one
+    for i in 1..pool_sequence.len() {
+        assert_ne!(
+            pool_sequence[i],
+            pool_sequence[i - 1],
+            "Round-robin pattern broken: consecutive pools are the same at positions {} and {}",
+            i - 1,
+            i
+        );
+    }
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_shuts_down_immediately() {
+    let pool_config1 = create_test_pool_config("127.0.0.1", 5432);
+    let pool_config2 = create_test_pool_config("localhost", 5432);
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    replicas
+        .targets
+        .iter()
+        .for_each(|target| target.pool.launch());
+    let monitor_handle = Monitor::spawn(&replicas);
+
+    replicas.shutdown();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), monitor_handle).await;
+
+    assert!(
+        result.is_ok(),
+        "Monitor should shut down within timeout after notify"
+    );
+    assert!(
+        result.unwrap().is_ok(),
+        "Monitor task should complete successfully"
+    );
+}
+
+#[tokio::test]
+async fn test_monitor_bans_unhealthy_target() {
+    let replicas = setup_test_replicas();
+
+    replicas.targets[0].health().toggle(false);
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(replicas.targets[0].ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_clears_expired_bans() {
+    let replicas = setup_test_replicas();
+
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(50));
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!replicas.targets[0].ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_does_not_ban_single_target() {
+    let pool_config = create_test_pool_config("127.0.0.1", 5432);
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    replicas.targets[0].health().toggle(false);
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!replicas.targets[0].ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_unbans_all_when_all_unhealthy() {
+    let replicas = setup_test_replicas();
+
+    replicas.targets[0].health().toggle(false);
+    replicas.targets[1].health().toggle(false);
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!replicas.targets[0].ban.banned());
+    assert!(!replicas.targets[1].ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_does_not_ban_with_zero_ban_timeout() {
+    let pool_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            checkout_timeout: Duration::from_millis(1000),
+            ban_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    };
+
+    let pool_config2 = PoolConfig {
+        address: Address {
+            host: "localhost".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            checkout_timeout: Duration::from_millis(1000),
+            ban_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    };
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    replicas.targets[0].health().toggle(false);
+
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(!replicas.targets[0].ban.banned());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_monitor_health_state_race() {
+    use tokio::spawn;
+
+    let replicas = setup_test_replicas();
+    let target = replicas.targets[0].clone();
+
+    let toggle_task = spawn(async move {
+        for _ in 0..50 {
+            target.health().toggle(false);
+            sleep(Duration::from_micros(100)).await;
+            target.health().toggle(true);
+            sleep(Duration::from_micros(100)).await;
+        }
+    });
+
+    sleep(Duration::from_millis(500)).await;
+
+    toggle_task.await.unwrap();
+
+    let banned = replicas.targets[0].ban.banned();
+    let healthy = replicas.targets[0].health().healthy();
+
+    assert!(
+        !banned || !healthy,
+        "Pool should not be banned if healthy after race"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_no_bans() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // When no replicas are banned, primary should NOT be used
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..20 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should only use replica pool
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is not in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_with_ban() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let replicas = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+        Default::default(),
+    );
+    replicas.launch();
+
+    // Ban the replica
+    let replica_ban = &replicas.targets[0].ban;
+    replica_ban.ban(Error::ServerError, Duration::from_millis(1000));
+
+    let request = Request::default();
+
+    // When replica is banned, primary SHOULD be used
+    let mut used_pool_ids = HashSet::new();
+    for _ in 0..20 {
+        let conn = replicas.get(&request).await.unwrap();
+        used_pool_ids.insert(conn.pool.id());
+    }
+
+    // Should only use primary pool since replica is banned
+    assert_eq!(used_pool_ids.len(), 1);
+
+    // Verify primary pool ID is in the set of used pools
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(used_pool_ids.contains(&primary_id));
+
+    // Shutdown both primary and replicas
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_has_replicas_with_replicas() {
+    let replicas = setup_test_replicas();
+
+    assert!(replicas.has_replicas());
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_has_replicas_with_primary_and_replicas() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config("localhost", 5432)];
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    assert!(lb.has_replicas());
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_has_replicas_primary_only() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    assert!(!lb.has_replicas());
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_has_replicas_empty() {
+    let lb = LoadBalancer::new(
+        &None,
+        &[],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    assert!(!lb.has_replicas());
+}
+
+#[tokio::test]
+async fn test_set_role() {
+    let replicas = setup_test_replicas();
+
+    // Initially all targets are replicas
+    assert_eq!(replicas.targets[0].role(), Role::Replica);
+    assert_eq!(replicas.targets[1].role(), Role::Replica);
+
+    // Setting replica to replica returns false (no change)
+    let changed = replicas.targets[0].set_role(Role::Replica);
+    assert!(!changed);
+    assert_eq!(replicas.targets[0].role(), Role::Replica);
+
+    // Setting replica to primary returns true (changed)
+    let changed = replicas.targets[0].set_role(Role::Primary);
+    assert!(changed);
+    assert_eq!(replicas.targets[0].role(), Role::Primary);
+
+    // Setting primary to primary returns false (no change)
+    let changed = replicas.targets[0].set_role(Role::Primary);
+    assert!(!changed);
+    assert_eq!(replicas.targets[0].role(), Role::Primary);
+
+    // Setting primary to replica returns true (changed)
+    let changed = replicas.targets[0].set_role(Role::Replica);
+    assert!(changed);
+    assert_eq!(replicas.targets[0].role(), Role::Replica);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_move_conns_to_with_removed_replica_matches_by_address() {
+    // Old LB: three replica [127.0.0.1, 8.8.8.8, 1.1.1.1]
+    // New LB: two replica [8.8.8.8, 1.1.1.1] (shifted backwards by 1; numbers changed)
+    // After they move, verify [8.8.8.8, 1.1.1.1] maintains its connections.
+    let lb_old = LoadBalancer::new(
+        &None,
+        &[
+            create_test_pool_config_with_db_num("127.0.0.1", 5432, 1),
+            create_test_pool_config_with_db_num("8.8.8.8", 5432, 2),
+            create_test_pool_config_with_db_num("1.1.1.1", 5432, 3),
+        ],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb_old.launch();
+
+    let lb_new = LoadBalancer::new(
+        &None,
+        &[
+            create_test_pool_config_with_db_num("8.8.8.8", 5432, 1),
+            create_test_pool_config_with_db_num("1.1.1.1", 5432, 2),
+        ],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb_new.launch();
+
+    // Record the role on the old target [8.8.8.8]; verify it was persisted.
+    lb_old.targets[1].set_role(Role::Primary);
+
+    // Verify [1.1.1.1, 8.8.8.8] moved connections
+    // (no actual connections here, but it passed the 'check')
+    assert_eq!(lb_old.move_conns_to(&lb_new).unwrap(), 2);
+
+    // The matching new target [8.8.8.8] should have inherited the role.
+    let new_target_for_existing = lb_new
+        .targets
+        .iter()
+        .find(|t| t.pool.addr().host == "8.8.8.8")
+        .expect("should have target for 8.8.8.8");
+    assert_eq!(new_target_for_existing.role(), Role::Primary);
+
+    lb_new.shutdown();
+}
+
+#[tokio::test]
+async fn test_move_conns_to_with_added_replica_matches_by_address() {
+    // Old LB: one replica at 127.0.0.1.
+    // New LB: same replica plus a brand-new one at localhost.
+    // After the move the existing pool's connections land in the correct new
+    // pool (address match), and the new pool starts empty.
+    let pool_config1 = create_test_pool_config("127.0.0.1", 5432);
+    let pool_config2 = create_test_pool_config("localhost", 5432);
+
+    let lb_old = LoadBalancer::new(
+        &None,
+        std::slice::from_ref(&pool_config1),
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb_old.launch();
+
+    let lb_new = LoadBalancer::new(
+        &None,
+        &[pool_config1.clone(), pool_config2.clone()],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb_new.launch();
+
+    // Record the role on the old target so we can verify it was carried over.
+    lb_old.targets[0].set_role(Role::Primary);
+
+    // Verify [127.0.0.1] moved connections
+    // (no actual connections here, but it passed the 'check')
+    assert_eq!(lb_old.move_conns_to(&lb_new).unwrap(), 1);
+
+    // The matching new target (same address) should have inherited the role.
+    let new_target_for_existing = lb_new
+        .targets
+        .iter()
+        .find(|t| t.pool.addr().host == "127.0.0.1")
+        .expect("should have target for 127.0.0.1");
+    assert_eq!(new_target_for_existing.role(), Role::Primary);
+
+    // The brand-new target (localhost) should not have been touched.
+    let new_target_for_added = lb_new
+        .targets
+        .iter()
+        .find(|t| t.pool.addr().host == "localhost")
+        .expect("should have target for localhost");
+    assert_eq!(new_target_for_added.role(), Role::Replica);
+
+    lb_new.shutdown();
+}
+
+#[tokio::test]
+async fn test_redetect_roles_marks_added_auto_target_replica_when_primary_unchanged() {
+    let primary_config = create_auto_test_pool_config("127.0.0.1", 5432);
+    let existing_replica_config = create_auto_test_pool_config("localhost", 5432);
+
+    let old_primary = Pool::new(&primary_config);
+    let lb_old = LoadBalancer::new(
+        &Some(old_primary),
+        std::slice::from_ref(&existing_replica_config),
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    set_lsn_stats(&lb_old.targets[0], true, 100);
+    set_lsn_stats(&lb_old.targets[1], false, 200);
+    assert!(!lb_old.redetect_roles());
+    assert!(lb_old.role_detection_enabled());
+
+    let added_replica_config = create_auto_test_pool_config("localhost", 5433);
+
+    let new_primary = Pool::new(&primary_config);
+    let lb_new = LoadBalancer::new(
+        &Some(new_primary),
+        &[existing_replica_config, added_replica_config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    lb_old.move_conns_to(&lb_new).unwrap();
+
+    let added_target = lb_new
+        .targets
+        .iter()
+        .find(|target| target.pool.addr().port == 5433)
+        .expect("newly added target should exist");
+    assert_eq!(added_target.role(), Role::Replica);
+
+    set_lsn_stats(&lb_new.targets[0], true, 100);
+    set_lsn_stats(&lb_new.targets[1], true, 90);
+    set_lsn_stats(&lb_new.targets[2], false, 200);
+
+    assert!(
+        !lb_new.redetect_roles(),
+        "primary did not change, so role detector reports no promotion"
+    );
+    assert_eq!(added_target.role(), Role::Replica);
+    assert!(lb_new.role_detection_enabled());
+}
+
+#[tokio::test]
+async fn test_auto_targets_remain_replicas_when_stats_are_invalid() {
+    let config1 = create_auto_test_pool_config("127.0.0.1", 5432);
+    let config2 = create_auto_test_pool_config("localhost", 5432);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[config1, config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    assert!(
+        lb.targets
+            .iter()
+            .all(|target| target.role() == Role::Replica)
+    );
+    assert!(lb.role_detection_enabled());
+
+    assert!(
+        !lb.redetect_roles(),
+        "no valid primary was discovered, so no promotion is reported"
+    );
+
+    assert!(
+        lb.targets
+            .iter()
+            .all(|target| target.role() == Role::Replica)
+    );
+    assert!(lb.has_replicas());
+}
+
+#[tokio::test]
+async fn test_redetect_roles_marks_auto_targets_replicas_when_all_valid_targets_are_replicas() {
+    let config1 = create_auto_test_pool_config("127.0.0.1", 5432);
+    let config2 = create_auto_test_pool_config("localhost", 5432);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[config1, config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    set_lsn_stats(&lb.targets[0], true, 100);
+    set_lsn_stats(&lb.targets[1], true, 90);
+
+    assert!(
+        lb.targets
+            .iter()
+            .all(|target| target.role() == Role::Replica)
+    );
+    assert!(lb.role_detection_enabled());
+
+    assert!(
+        !lb.redetect_roles(),
+        "no primary was discovered, so no promotion is reported"
+    );
+
+    assert!(
+        lb.targets
+            .iter()
+            .all(|target| target.role() == Role::Replica)
+    );
+    assert!(lb.has_replicas());
+}
+
+#[tokio::test]
+async fn test_auto_mode_waits_for_primary_election() {
+    let mut config = create_auto_test_pool_config("127.0.0.1", 5432);
+    config.config.checkout_timeout = Duration::from_millis(10);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    assert!(matches!(
+        lb.get_primary(&Request::default()).await,
+        Err(Error::CheckoutTimeout)
+    ));
+}
+
+#[tokio::test]
+async fn test_auto_mode_primary_election_releases_writes() {
+    let config = create_auto_test_pool_config("127.0.0.1", 5432);
+    let lb = LoadBalancer::new(
+        &None,
+        &[config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.targets[0].pool.launch();
+    let election = lb.clone();
+
+    let election = tokio::spawn(async move {
+        sleep(Duration::from_millis(10)).await;
+        set_lsn_stats(&election.targets[0], false, 100);
+        assert!(election.redetect_roles());
+    });
+
+    let primary = lb.get_primary(&Request::default()).await.unwrap();
+    assert_eq!(primary.pool.addr().host, "127.0.0.1");
+    drop(primary);
+    election.await.unwrap();
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_auto_mode_waits_for_each_new_primary() {
+    let first = create_auto_test_pool_config("127.0.0.1", 5432);
+    let second = create_auto_test_pool_config("localhost", 5432);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[first, second],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.targets.iter().for_each(|target| target.pool.launch());
+
+    // primary is not defined initially
+    assert!(lb.primary().is_none());
+    // spawn the task that will wait for primary to resolve
+    let spawned = {
+        let lb = lb.clone();
+
+        tokio::spawn(async move { lb.get_primary(&Request::default()).await })
+    };
+
+    // assert that the background wait is in progress
+    yield_now().await;
+    assert!(!spawned.is_finished());
+
+    // set the first target to primary and redetect roles
+    set_lsn_stats(&lb.targets[0], false, 100);
+    set_lsn_stats(&lb.targets[1], true, 90);
+    assert!(lb.redetect_roles());
+
+    // primary should be resolved to first primary
+    let primary = spawned.await.unwrap().unwrap();
+    assert_eq!(primary.pool.addr().host, "127.0.0.1");
+    drop(primary);
+
+    // remove primary from first
+    set_lsn_stats(&lb.targets[0], true, 100);
+    lb.redetect_roles();
+    assert!(lb.primary().is_none());
+
+    // spawn another task that should wait for new primary
+    let spawned = {
+        let lb = lb.clone();
+
+        tokio::spawn(async move { lb.get_primary(&Request::default()).await })
+    };
+
+    yield_now().await;
+    assert!(!spawned.is_finished());
+
+    set_lsn_stats(&lb.targets[1], false, 200);
+    assert!(lb.redetect_roles());
+    assert!(!lb.redetect_roles());
+    assert!(lb.primary().is_some());
+
+    // primary should be resolved to second target
+    let primary = spawned.await.unwrap().unwrap();
+    assert_eq!(primary.pool.addr().host, "localhost");
+    drop(primary);
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_election_channel_no_race_condition() {
+    let lb = LoadBalancer::new(
+        &None,
+        &[create_auto_test_pool_config("127.0.0.1", 5432)],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.targets[0].pool.launch();
+
+    // make sure there is no primary
+    assert!(lb.primary().is_none());
+
+    // initialize the primary before the wait_primary is called
+    set_lsn_stats(&lb.targets[0], false, 100);
+    assert!(lb.redetect_roles());
+
+    let elected = timeout(Duration::ZERO, lb.wait_primary())
+        .await
+        .expect("wait_primary should resolve")
+        .expect("primary should be elected");
+    assert_eq!(elected.addr().host, "127.0.0.1");
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_static_replica_only_does_not_wait_for_primary() {
+    let config = create_test_pool_config("127.0.0.1", 5432);
+    let lb = LoadBalancer::new(
+        &None,
+        &[config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    let started = Instant::now();
+    assert!(matches!(
+        lb.get_primary(&Request::default()).await,
+        Err(Error::NoPrimary)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn test_monitor_unbans_all_when_second_target_becomes_unhealthy_after_first_banned() {
+    let replicas = setup_test_replicas();
+
+    // First target becomes unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    // Wait for monitor to ban the first target
+    sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "First target should be banned"
+    );
+    assert!(
+        !replicas.targets[1].ban.banned(),
+        "Second target should not be banned yet"
+    );
+
+    // Now second target becomes unhealthy (first is already banned)
+    replicas.targets[1].health().toggle(false);
+
+    // Wait for monitor to process - should unban all since all are unhealthy
+    sleep(Duration::from_millis(400)).await;
+
+    // Both should be unbanned because all targets are unhealthy
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "First target should be unbanned when all targets are unhealthy"
+    );
+    assert!(
+        !replicas.targets[1].ban.banned(),
+        "Second target should be unbanned when all targets are unhealthy"
+    );
+
+    replicas.shutdown();
+}
+
+fn create_test_pool_config_weighted(host: &str, port: u16, lb_weight: u8) -> PoolConfig {
+    PoolConfig {
+        address: Address {
+            host: host.into(),
+            port,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            checkout_timeout: Duration::from_millis(1000),
+            ban_timeout: Duration::from_millis(100),
+            lb_weight,
+            ..Config::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn test_weighted_round_robin_smooth_distribution() {
+    let pool_config1 = create_test_pool_config_weighted("127.0.0.1", 5432, 5);
+    let pool_config2 = create_test_pool_config_weighted("localhost", 5432, 1);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::WeightedRoundRobin,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    let pool_a = lb.targets[0].pool.id();
+    let pool_b = lb.targets[1].pool.id();
+
+    // With weights [5, 1], over 6 rounds the sequence should be: A, A, B, A, A, A
+    // (B appears at position 3 due to max_by_key last-wins tie-breaking)
+    let mut sequence = Vec::new();
+    for _ in 0..6 {
+        let conn = lb.get(&request).await.unwrap();
+        sequence.push(conn.pool.id());
+    }
+
+    assert_eq!(
+        sequence,
+        vec![pool_a, pool_a, pool_b, pool_a, pool_a, pool_a],
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_weighted_round_robin_equal_weights() {
+    let pool_config1 = create_test_pool_config_weighted("127.0.0.1", 5432, 1);
+    let pool_config2 = create_test_pool_config_weighted("localhost", 5432, 1);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::WeightedRoundRobin,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    let pool_a = lb.targets[0].pool.id();
+    let pool_b = lb.targets[1].pool.id();
+
+    // With equal weights, should alternate: B, A, B, A
+    // (max_by_key picks the last element on tie, so B goes first)
+    let mut sequence = Vec::new();
+    for _ in 0..4 {
+        let conn = lb.get(&request).await.unwrap();
+        sequence.push(conn.pool.id());
+    }
+
+    assert_eq!(sequence, vec![pool_b, pool_a, pool_b, pool_a]);
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_weighted_round_robin_zero_weight_never_selected() {
+    let pool_config1 = create_test_pool_config_weighted("127.0.0.1", 5432, 0);
+    let pool_config2 = create_test_pool_config_weighted("localhost", 5432, 10);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::WeightedRoundRobin,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    let expected_id = lb.targets[1].pool.id();
+    for _ in 0..20 {
+        let conn = lb.get(&request).await.unwrap();
+        assert_eq!(
+            conn.pool.id(),
+            expected_id,
+            "Pool with weight 0 should never be selected first"
+        );
+    }
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_weighted_round_robin_proportional_distribution() {
+    let pool_config1 = create_test_pool_config_weighted("127.0.0.1", 5432, 3);
+    let pool_config2 = create_test_pool_config_weighted("localhost", 5432, 1);
+
+    let lb = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::WeightedRoundRobin,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    let pool_a = lb.targets[0].pool.id();
+
+    // Over 40 rounds (10 full cycles of total_weight=4), A should get exactly 30
+    let mut a_count = 0;
+    for _ in 0..40 {
+        let conn = lb.get(&request).await.unwrap();
+        if conn.pool.id() == pool_a {
+            a_count += 1;
+        }
+    }
+
+    assert_eq!(a_count, 30, "Pool A (weight 3) should get 3/4 of requests");
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_least_active_connections_prefers_pool_with_fewer_checked_out() {
+    let pool_config1 = create_test_pool_config("127.0.0.1", 5432);
+    let pool_config2 = create_test_pool_config("localhost", 5432);
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::LeastActiveConnections,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    replicas.launch();
+
+    let request = Request::default();
+
+    // Get first connection and hold it
+    let conn1 = replicas.get(&request).await.unwrap();
+    let first_pool_id = conn1.pool.id();
+
+    // Now first pool has 1 checked out, second pool has 0.
+    // LeastActiveConnections should select the pool with 0 checked out.
+    let conn2 = replicas.get(&request).await.unwrap();
+    let second_pool_id = conn2.pool.id();
+
+    // conn2 should come from a different pool (the one with 0 checked out)
+    assert_ne!(
+        first_pool_id, second_pool_id,
+        "LeastActiveConnections should select the pool with fewer checked-out connections"
+    );
+
+    replicas.shutdown();
+}
+
+// ==========================================
+// ban_check unit tests
+// ==========================================
+
+fn setup_test_replicas_no_launch() -> LoadBalancer {
+    let pool_config1 = create_test_pool_config("127.0.0.1", 5432);
+    let pool_config2 = create_test_pool_config("localhost", 5432);
+
+    LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    )
+}
+
+#[test]
+fn test_ban_check_clears_expired_ban_when_healthy_no_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Ban with short timeout
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(1));
+
+    // Wait for ban to expire
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert!(replicas.targets[0].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "Expired ban should be cleared when healthy and no replica lag"
+    );
+}
+
+#[test]
+fn test_ban_check_does_not_clear_expired_ban_when_healthy_with_bad_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Target is healthy (default)
+    assert!(replicas.targets[0].health().healthy());
+
+    // Ban with short timeout
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(1));
+
+    // Set replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(10),
+        bytes: 1000,
+    };
+
+    // Wait for ban to expire
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert!(replicas.targets[0].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::from_secs(1),
+        bytes: 100,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "Expired ban should NOT be cleared when healthy replica has bad lag"
+    );
+}
+
+#[test]
+fn test_ban_check_does_not_clear_expired_ban_when_unhealthy_with_bad_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    // Ban with short timeout
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(1));
+
+    // Set replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(10),
+        bytes: 1000,
+    };
+
+    // Wait for ban to expire
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert!(replicas.targets[0].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::from_secs(1),
+        bytes: 100,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "Expired ban should NOT be cleared when unhealthy replica has bad lag"
+    );
+}
+
+#[test]
+fn test_ban_check_bans_unhealthy_replica_with_bad_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    // Set replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(10),
+        bytes: 1000,
+    };
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::from_secs(1),
+        bytes: 100,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(replicas.targets[0].ban.banned());
+    assert_eq!(
+        replicas.targets[0].ban.error(),
+        Some(Error::ReplicaLag),
+        "Ban reason should be ReplicaLag when unhealthy replica has bad lag"
+    );
+}
+
+#[test]
+fn test_ban_check_bans_healthy_replica_with_bad_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Target stays healthy (default)
+    assert!(replicas.targets[0].health().healthy());
+
+    // Set replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(10),
+        bytes: 1000,
+    };
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::from_secs(1),
+        bytes: 100,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "Healthy replica with bad lag should be banned"
+    );
+    assert_eq!(
+        replicas.targets[0].ban.error(),
+        Some(Error::ReplicaLag),
+        "Ban reason should be ReplicaLag"
+    );
+}
+
+#[test]
+fn test_ban_check_bans_with_pool_unhealthy_reason() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    // No replica lag set (defaults to zero)
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(replicas.targets[0].ban.banned());
+    assert_eq!(
+        replicas.targets[0].ban.error(),
+        Some(Error::PoolUnhealthy),
+        "Ban reason should be PoolUnhealthy when replica lag is within threshold"
+    );
+}
+
+#[test]
+fn test_ban_check_does_not_ban_single_target() {
+    let pool_config = create_test_pool_config("127.0.0.1", 5432);
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+    // Don't launch - we're unit testing ban_check
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "Single target should not be banned even when unhealthy"
+    );
+}
+
+#[test]
+fn test_ban_check_does_not_ban_with_zero_ban_timeout() {
+    let pool_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            checkout_timeout: Duration::from_millis(1000),
+            ban_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    };
+
+    let pool_config2 = PoolConfig {
+        address: Address {
+            host: "localhost".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            checkout_timeout: Duration::from_millis(1000),
+            ban_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    };
+
+    let replicas = LoadBalancer::new(
+        &None,
+        &[pool_config1, pool_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "Target with zero ban_timeout should not be banned"
+    );
+}
+
+#[test]
+fn test_ban_check_unbans_all_when_all_unhealthy() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Ban both targets manually first
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+    replicas.targets[1]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    // Set both as unhealthy
+    replicas.targets[0].health().toggle(false);
+    replicas.targets[1].health().toggle(false);
+
+    assert!(replicas.targets[0].ban.banned());
+    assert!(replicas.targets[1].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "All bans should be cleared when all targets are unhealthy"
+    );
+    assert!(
+        !replicas.targets[1].ban.banned(),
+        "All bans should be cleared when all targets are unhealthy"
+    );
+}
+
+#[test]
+fn test_ban_check_unbans_all_when_all_healthy_but_banned() {
+    // Regression: bans can be applied outside the monitor (e.g. a failed
+    // checkout in `get_internal`), leaving every target banned even though
+    // they all report healthy. The monitor must clear these so reads can
+    // resume; otherwise reads fail until the (unexpired) bans time out even
+    // though every target is serviceable.
+    let replicas = setup_test_replicas_no_launch();
+
+    // Both targets banned with a long, unexpired timeout, but healthy.
+    replicas.targets[0]
+        .ban
+        .ban(Error::ConnectTimeout, Duration::from_secs(60));
+    replicas.targets[1]
+        .ban
+        .ban(Error::ConnectTimeout, Duration::from_secs(60));
+
+    assert!(replicas.targets[0].health().healthy());
+    assert!(replicas.targets[1].health().healthy());
+    assert!(replicas.targets[0].ban.banned());
+    assert!(replicas.targets[1].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "All bans should be cleared when every target is healthy but banned"
+    );
+    assert!(
+        !replicas.targets[1].ban.banned(),
+        "All bans should be cleared when every target is healthy but banned"
+    );
+}
+
+#[test]
+fn test_ban_check_preserves_manual_ban_when_all_banned() {
+    // The clear-all recovery must not undo an operator's manual ban, even when
+    // it makes every target unavailable.
+    let replicas = setup_test_replicas_no_launch();
+
+    replicas.targets[0].ban.ban(Error::ManualBan, Duration::MAX);
+    replicas.targets[1]
+        .ban
+        .ban(Error::ConnectTimeout, Duration::from_secs(60));
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "Manual ban must be preserved through the clear-all recovery"
+    );
+    assert_eq!(replicas.targets[0].ban.error(), Some(Error::ManualBan));
+    assert!(
+        !replicas.targets[1].ban.banned(),
+        "Automatic ban should be cleared so reads can resume on this target"
+    );
+}
+
+#[test]
+fn test_ban_check_does_not_clear_unexpired_ban() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Ban with long timeout
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    assert!(replicas.targets[0].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        replicas.targets[0].ban.banned(),
+        "Unexpired ban should not be cleared"
+    );
+}
+
+#[test]
+fn test_ban_check_default_threshold_does_not_ban_healthy_replica_with_high_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Target is healthy (default)
+    assert!(replicas.targets[0].health().healthy());
+
+    // Set very high replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(3600), // 1 hour lag
+        bytes: 1_000_000_000,                // 1GB lag
+    };
+
+    let monitor = Monitor::new_test(&replicas);
+    // Use default config thresholds (MAX values)
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "With default MAX threshold, healthy replica should NOT be banned despite high lag"
+    );
+}
+
+#[test]
+fn test_ban_check_default_threshold_bans_unhealthy_with_pool_unhealthy_reason() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Set very high replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(3600), // 1 hour lag
+        bytes: 1_000_000_000,                // 1GB lag
+    };
+
+    // Set target as unhealthy
+    replicas.targets[0].health().toggle(false);
+
+    let monitor = Monitor::new_test(&replicas);
+    // Use default config thresholds (MAX values)
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(replicas.targets[0].ban.banned());
+    assert_eq!(
+        replicas.targets[0].ban.error(),
+        Some(Error::PoolUnhealthy),
+        "With default MAX threshold, unhealthy replica should be banned with PoolUnhealthy reason"
+    );
+}
+
+#[test]
+fn test_ban_check_default_threshold_clears_expired_ban_despite_high_lag() {
+    let replicas = setup_test_replicas_no_launch();
+
+    // Ban with short timeout
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(1));
+
+    // Set very high replica lag on the pool
+    replicas.targets[0].pool.lock().replica_lag = ReplicaLag {
+        duration: Duration::from_secs(3600), // 1 hour lag
+        bytes: 1_000_000_000,                // 1GB lag
+    };
+
+    // Wait for ban to expire
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert!(replicas.targets[0].ban.banned());
+
+    let monitor = Monitor::new_test(&replicas);
+    // Use default config thresholds (MAX values) - replica lag should be ignored
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    };
+
+    monitor.ban_check(&threshold);
+
+    assert!(
+        !replicas.targets[0].ban.banned(),
+        "With default MAX threshold, expired ban should be cleared despite high replica lag"
+    );
+}
+
+// ==========================================
+// params() tests
+// ==========================================
+
+#[tokio::test]
+async fn test_params_returns_params_from_non_banned_target() {
+    let replicas = setup_test_replicas();
+
+    let request = Request::default();
+    let result = replicas.params(&request).await;
+
+    assert!(result.is_ok(), "params() should succeed when targets exist");
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_params_returns_all_replicas_down_when_all_banned() {
+    let replicas = setup_test_replicas();
+
+    // Ban all targets
+    for target in &replicas.targets {
+        target.ban.ban(Error::ServerError, Duration::from_secs(60));
+    }
+
+    let request = Request::default();
+    let result = replicas.params(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "params() should return AllReplicasDown when all targets are banned"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_params_skips_banned_targets() {
+    let replicas = setup_test_replicas();
+
+    // Ban first target
+    replicas.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    let request = Request::default();
+    let result = replicas.params(&request).await;
+
+    assert!(
+        result.is_ok(),
+        "params() should succeed by using non-banned target"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_params_returns_all_replicas_down_when_empty() {
+    let replicas = LoadBalancer::new(
+        &None,
+        &[],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+        Default::default(),
+    );
+
+    let request = Request::default();
+    let result = replicas.params(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "params() should return AllReplicasDown when no targets exist"
+    );
+}
+
+#[tokio::test]
+async fn ban_new_targets_until_health_check() {
+    let old = setup_test_replicas();
+    let new_config = PoolConfig {
+        address: test_addr("localhost", 2345, Default::default()),
+        config: test_config(Config {
+            require_healthcheck_on_discovery: true,
+            ..Default::default()
+        }),
+    };
+    let new = LoadBalancer::new(
+        &None,
+        &[new_config],
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+    old.move_conns_to(&new).unwrap();
+
+    let banned_targets = new
+        .targets
+        .iter()
+        .filter(|target| target.ban.banned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        banned_targets.len(),
+        "only the new target should have been banned"
+    );
+    let banned_target = banned_targets[0];
+    assert_eq!(2345, banned_target.pool.addr().port);
+    assert!(!banned_target.health().healthy());
+
+    banned_target.health().toggle(true);
+    Monitor::new_test(&new).ban_check(&ReplicaLag {
+        duration: Duration::MAX,
+        bytes: i64::MAX,
+    });
+
+    assert!(
+        !new.targets.iter().any(|target| target.ban.banned()),
+        "target still banned after health check"
+    );
+}
+
+#[tokio::test]
+async fn existing_targets_not_banned_when_healthcheck_required_on_discovery() {
+    let pool_config = |host: &str, port: u16| PoolConfig {
+        address: test_addr(host, port, Default::default()),
+        config: test_config(Config {
+            require_healthcheck_on_discovery: true,
+            ..Default::default()
+        }),
+    };
+    let existing = [
+        pool_config("127.0.0.1", 5432),
+        pool_config("localhost", 5432),
+    ];
+    let discovered = pool_config("localhost", 2345);
+
+    let old = LoadBalancer::new(
+        &None,
+        &existing,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+    let new = LoadBalancer::new(
+        &None,
+        &[existing[0].clone(), existing[1].clone(), discovered],
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+    old.move_conns_to(&new).unwrap();
+
+    let banned_target = new
+        .targets
+        .iter()
+        .filter(|target| target.ban.banned())
+        .exactly_one()
+        .expect("only the discovered target should have been banned");
+    assert_eq!(2345, banned_target.pool.addr().port);
+    assert!(!banned_target.health().healthy());
+
+    for target in new
+        .targets
+        .iter()
+        .filter(|target| target.pool.addr().port == 5432)
+    {
+        assert!(!target.ban.banned(), "existing target was banned");
+        assert!(
+            target.health().healthy(),
+            "existing target became unhealthy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_reload_preserves_only_manual_bans() {
+    let configs = [
+        create_test_pool_config("127.0.0.1", 5432),
+        create_test_pool_config("localhost", 5432),
+    ];
+    let new_lb = || {
+        LoadBalancer::new(
+            &None,
+            &configs,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    };
+    let old = new_lb();
+    let new = new_lb();
+    old.targets[0].ban.ban(Error::ManualBan, Duration::MAX);
+    old.targets[1].ban.ban(Error::ServerError, Duration::MAX);
+
+    old.move_conns_to(&new).expect("transfer pools on reload");
+
+    assert_eq!(new.targets[0].ban.error(), Some(Error::ManualBan));
+    assert!(!new.targets[1].ban.banned());
+}
+
+#[tokio::test]
+async fn test_get_returns_offline_when_all_targets_banned_and_offline() {
+    let replicas = LoadBalancer::new(
+        &None,
+        &[
+            create_test_pool_config("127.0.0.1", 5432),
+            create_test_pool_config("localhost", 5432),
+        ],
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+    for target in &replicas.targets {
+        target.ban.ban(Error::ManualBan, Duration::MAX);
+    }
+    replicas.shutdown();
+
+    let result = replicas.get(&Request::default()).await;
+
+    assert!(matches!(result, Err(Error::Offline)));
+}
+
+#[tokio::test]
+async fn initial_healthcheck_banned_targets_stay_banned_on_reload() {
+    let old = setup_test_replicas();
+    let new_config = PoolConfig {
+        address: test_addr("localhost", 2345, Default::default()),
+        config: test_config(Config {
+            require_healthcheck_on_discovery: true,
+            ..Default::default()
+        }),
+    };
+    let new = LoadBalancer::new(
+        &None,
+        std::slice::from_ref(&new_config),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+    let new_new = LoadBalancer::new(
+        &None,
+        &[new_config],
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+
+    old.move_conns_to(&new).unwrap();
+    assert_eq!(
+        1,
+        new.targets
+            .iter()
+            .filter(|target| target.ban.banned())
+            .count(),
+        "target was not banned moving to new lb"
+    );
+    new.move_conns_to(&new_new).unwrap();
+
+    let banned_target = new_new
+        .targets
+        .iter()
+        .filter(|target| target.ban.banned())
+        .exactly_one()
+        .expect("wrong number of targets banned");
+    assert!(
+        !banned_target.health().healthy(),
+        "banned target became healthy on copy"
+    );
+}

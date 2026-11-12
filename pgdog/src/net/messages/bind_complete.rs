@@ -3,7 +3,7 @@ use super::code;
 use super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct BindComplete;
+pub(crate) struct BindComplete;
 
 impl FromBytes for BindComplete {
     fn from_bytes(mut bytes: Bytes) -> Result<Self, Error> {
@@ -14,9 +14,9 @@ impl FromBytes for BindComplete {
 }
 
 impl ToBytes for BindComplete {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let payload = Payload::named(self.code());
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 

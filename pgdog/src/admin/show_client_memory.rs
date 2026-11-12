@@ -5,7 +5,7 @@ use crate::{
 
 use super::prelude::*;
 
-pub struct ShowClientMemory;
+pub(crate) struct ShowClientMemory;
 
 #[async_trait]
 impl Command for ShowClientMemory {
@@ -32,7 +32,7 @@ impl Command for ShowClientMemory {
             Field::numeric("net_buffer_bytes"),
             Field::numeric("total_bytes"),
         ]);
-        let mut messages = vec![rd.message()?];
+        let mut messages = vec![rd.message()];
 
         let clients = comms().clients();
         for (_, client) in clients {
@@ -42,7 +42,7 @@ impl Command for ShowClientMemory {
             let user = client.paramters.get_default("user", "postgres");
             let database = client.paramters.get_default("database", user);
 
-            row.add(client.id.pid as i64)
+            row.add(client.key.pid())
                 .add(database)
                 .add(user)
                 .add(client.addr.ip().to_string().as_str())
@@ -55,7 +55,7 @@ impl Command for ShowClientMemory {
                 .add(memory.stream as i64)
                 .add((memory.total()) as i64);
 
-            messages.push(row.message()?);
+            messages.push(row.message());
         }
 
         Ok(messages)

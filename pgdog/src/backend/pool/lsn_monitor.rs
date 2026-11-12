@@ -3,49 +3,59 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use tokio::{
-    select, spawn,
-    time::{interval, sleep, timeout},
-};
+use tokio::select;
 use tracing::{debug, error, trace};
 
-use crate::net::DataRow;
+use crate::{
+    backend::{ConnectReason, Server},
+    net::DataRow,
+    tasks,
+};
 
 use super::*;
 use pgdog_postgres_types::Format;
 
-pub use pgdog_stats::replication::ReplicaLag;
+use crate::util::{safe_interval, safe_sleep, safe_timeout};
 use pgdog_stats::LsnStats as StatsLsnStats;
+pub(crate) use pgdog_stats::replication::ReplicaLag;
 
 static AURORA_DETECTION_QUERY: &str = "SELECT aurora_version()";
 
 static LSN_QUERY: &str = "
+WITH recovery AS MATERIALIZED (
+    SELECT pg_is_in_recovery() AS replica
+),
+wal AS MATERIALIZED (
+    SELECT
+        replica,
+        CASE
+            WHEN replica THEN
+                COALESCE(
+                    pg_last_wal_replay_lsn(),
+                    pg_last_wal_receive_lsn()
+                )
+            ELSE
+                pg_current_wal_lsn()
+        END AS lsn
+    FROM recovery
+)
 SELECT
-    pg_is_in_recovery() AS replica,
+    replica,
+    lsn,
+    lsn - '0/0'::pg_lsn AS offset_bytes,
     CASE
-        WHEN pg_is_in_recovery() THEN
-            COALESCE(
-                pg_last_wal_replay_lsn(),
-                pg_last_wal_receive_lsn()
-            )
+        WHEN replica THEN
+            COALESCE(pg_last_xact_replay_timestamp() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')
         ELSE
-            pg_current_wal_lsn()
-    END AS lsn,
+            now() AT TIME ZONE 'UTC'
+    END AS timestamp,
     CASE
-        WHEN pg_is_in_recovery() THEN
-            COALESCE(
-                pg_last_wal_replay_lsn(),
-                pg_last_wal_receive_lsn()
-            ) - '0/0'::pg_lsn
+        WHEN replica THEN
+            (pg_control_checkpoint()).timeline_id
         ELSE
-            pg_current_wal_lsn() - '0/0'::pg_lsn
-    END AS offset_bytes,
-    CASE
-        WHEN pg_is_in_recovery() THEN
-            COALESCE(pg_last_xact_replay_timestamp(), now())
-        ELSE
-            now()
-    END AS timestamp
+            ('x' || substr(pg_walfile_name(lsn), 1, 8))::bit(32)::int
+    END AS timeline
+FROM wal
 ";
 
 static AURORA_LSN_QUERY: &str = "
@@ -53,12 +63,13 @@ SELECT
     pg_is_in_recovery() AS replica,
     '0/0'::pg_lsn AS lsn,
     0::bigint AS offset_bytes,
-    now() AS timestamp
+    now() AS timestamp,
+    (pg_control_checkpoint()).timeline_id AS timeline
 ";
 
 /// LSN information.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct LsnStats {
+pub(crate) struct LsnStats {
     inner: StatsLsnStats,
 }
 
@@ -84,27 +95,13 @@ impl From<StatsLsnStats> for LsnStats {
 
 impl LsnStats {
     /// How old the stats are.
-    pub fn lsn_age(&self, now: SystemTime) -> Duration {
+    pub(crate) fn lsn_age(&self, now: SystemTime) -> Duration {
         now.duration_since(self.fetched).unwrap_or_default()
     }
 
     /// Stats contain real data.
-    pub fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.inner.valid()
-    }
-
-    /// Calculate replica lag.
-    pub fn replica_lag(&self, primary: &LsnStats) -> ReplicaLag {
-        let bytes = primary.lsn.lsn - self.lsn.lsn;
-        let lag_ms = (primary.timestamp.to_naive_datetime() - self.timestamp.to_naive_datetime())
-            .num_milliseconds()
-            .clamp(0, i64::MAX);
-        let lag = Duration::from_millis(lag_ms as u64);
-
-        ReplicaLag {
-            bytes,
-            duration: lag,
-        }
     }
 }
 
@@ -117,6 +114,7 @@ impl LsnStats {
             timestamp: value.get(3, Format::Text).unwrap_or_default(),
             fetched: SystemTime::now(),
             aurora,
+            timeline: value.get(4, Format::Text).unwrap_or_default(),
         }
         .into()
     }
@@ -131,13 +129,13 @@ impl LsnMonitor {
     pub(super) fn run(pool: &Pool) {
         let monitor = Self { pool: pool.clone() };
 
-        spawn(async move {
+        tasks::spawn("pool lsn monitor", async move {
             monitor.spawn().await;
         });
     }
 
-    async fn run_query(&self, conn: &mut Guard, query: &str) -> Option<DataRow> {
-        match timeout(self.pool.config().lsn_check_timeout, conn.fetch_all(query)).await {
+    async fn run_query(&self, conn: &mut Server, query: &str) -> Option<DataRow> {
+        match safe_timeout(self.pool.config().lsn_check_timeout, conn.fetch_all(query)).await {
             Ok(Ok(rows)) => rows.into_iter().next(),
             Ok(Err(err)) => {
                 error!("lsn monitor query error: {} [{}]", err, self.pool.addr());
@@ -150,8 +148,8 @@ impl LsnMonitor {
         }
     }
 
-    async fn detect_aurora(&self, conn: &mut Guard) -> Option<bool> {
-        match timeout(
+    async fn detect_aurora(&self, conn: &mut Server) -> Option<bool> {
+        match safe_timeout(
             self.pool.config().lsn_check_timeout,
             conn.fetch_all::<DataRow>(AURORA_DETECTION_QUERY),
         )
@@ -182,49 +180,104 @@ impl LsnMonitor {
 
     async fn spawn(&self) {
         select! {
-            _ = sleep(self.pool.config().lsn_check_delay) => {},
-            _ = self.pool.comms().shutdown.notified() => { return; }
+            _ = safe_sleep(self.pool.config().lsn_check_delay) => {},
+            _ = self.pool.comms().shutdown.cancelled() => { return; }
         }
 
         debug!("lsn monitor loop is running [{}]", self.pool.addr());
 
         let mut aurora_detected: Option<bool> = None;
-        let mut interval = interval(self.pool.config().lsn_check_interval);
+        let mut interval = safe_interval(self.pool.config().lsn_check_interval);
 
         loop {
             select! {
                 _ = interval.tick() => {},
-                _ = self.pool.comms().shutdown.notified() => { break; }
+                _ = self.pool.comms().shutdown.cancelled() => { break; }
             }
 
-            let mut conn = match self.pool.get(&Request::default()).await {
-                Ok(conn) => conn,
+            match self.run_check(aurora_detected).await {
+                Ok(result) => aurora_detected = result,
                 Err(Error::Offline) => break,
-                Err(err) => {
-                    error!("lsn monitor checkout error: {} [{}]", err, self.pool.addr());
-                    continue;
-                }
-            };
-
-            if aurora_detected.is_none() {
-                aurora_detected = self.detect_aurora(&mut conn).await;
-            }
-
-            let Some(aurora) = aurora_detected else {
-                continue;
-            };
-
-            let query = if aurora { AURORA_LSN_QUERY } else { LSN_QUERY };
-
-            if let Some(row) = self.run_query(&mut conn, query).await {
-                drop(conn);
-                let stats = LsnStats::from_row(row, aurora);
-                *self.pool.inner().lsn_stats.write() = stats;
-                trace!("lsn monitor stats updated [{}]", self.pool.addr());
+                Err(_) => continue,
             }
         }
 
         debug!("lsn monitor shutdown [{}]", self.pool.addr());
+    }
+
+    async fn run_check(&self, mut aurora_detected: Option<bool>) -> Result<Option<bool>, Error> {
+        let mut conn = match self.get_connection().await {
+            Ok(conn) => conn,
+            Err(Error::Offline) => return Err(Error::Offline),
+            Err(err) => {
+                error!("lsn monitor checkout error: {} [{}]", err, self.pool.addr());
+                return Err(err);
+            }
+        };
+
+        if aurora_detected.is_none() {
+            aurora_detected = self.detect_aurora(&mut conn).await;
+        }
+
+        // Aurora detection failed, try again next iteration.
+        let Some(aurora) = aurora_detected else {
+            return Ok(None);
+        };
+
+        let query = if aurora { AURORA_LSN_QUERY } else { LSN_QUERY };
+
+        if let Some(row) = self.run_query(&mut conn, query).await {
+            drop(conn);
+            let stats = LsnStats::from_row(row, aurora);
+            {
+                let mut guard = self.pool.inner().lsn_stats.write();
+                // Notify that the role changed and the shard monitor
+                // should immediately resynchronize.
+                if stats.replica != guard.replica {
+                    self.pool.inner().lsn_role_change.notify_one();
+                }
+                (*guard) = stats;
+            }
+            trace!("lsn monitor stats updated [{}]", self.pool.addr());
+        }
+
+        Ok(aurora_detected)
+    }
+
+    async fn get_connection(&self) -> Result<LsnConnection, Error> {
+        match self.pool.get(&Request::default()).await {
+            Ok(conn) => Ok(LsnConnection::Guard(conn)),
+            Err(Error::Offline) => Err(Error::Offline),
+            Err(Error::CheckoutTimeout) => Ok(LsnConnection::Conn(Box::new(
+                self.pool.standalone(ConnectReason::LsnCheck).await?,
+            ))),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+enum LsnConnection {
+    Guard(Guard),
+    Conn(Box<Server>),
+}
+
+impl Deref for LsnConnection {
+    type Target = Server;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Guard(guard) => guard.deref(),
+            Self::Conn(server) => server,
+        }
+    }
+}
+
+impl DerefMut for LsnConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Guard(guard) => guard.deref_mut(),
+            Self::Conn(server) => server,
+        }
     }
 }
 
@@ -234,6 +287,211 @@ mod test {
 
     use pgdog_postgres_types::TimestampTz;
     use pgdog_stats::Lsn;
+    use tokio::time::timeout;
+
+    #[test]
+    fn test_lsn_stats_unsigned_offset() {
+        let mut row = DataRow::new();
+        row.add(true);
+        row.add("FFFFFFFF/FFFFFFFF");
+        row.add("18446744073709551615");
+        row.add("2026-07-01 13:33:10.000000+00");
+        row.add(1i64);
+        let stats = LsnStats::from_row(row, false);
+        assert_eq!(stats.lsn.lsn, u64::MAX);
+        assert_eq!(stats.offset_bytes, u64::MAX);
+    }
+
+    // A launched pool against the local Postgres. The default `lsn_check_delay`
+    // is `MAX_DURATION`, so the background LSN monitor spawned by `launch()`
+    // stays asleep and never competes with the `run_check` calls below.
+    fn monitor() -> LsnMonitor {
+        crate::logger();
+        let pool = Pool::new_test();
+        pool.launch();
+        LsnMonitor { pool }
+    }
+
+    #[tokio::test]
+    async fn test_run_check_detects_non_aurora() {
+        let monitor = monitor();
+
+        // No prior detection: run_check must detect Aurora (false locally),
+        // run the standard LSN query and update the stats.
+        let result = monitor.run_check(None).await;
+        assert_eq!(result, Ok(Some(false)));
+
+        let stats = monitor.pool.lsn_stats();
+        assert!(stats.valid(), "stats should be valid after a check");
+        assert!(!stats.replica, "local Postgres is a primary");
+        assert!(!stats.aurora, "local Postgres is not Aurora");
+        assert!(stats.lsn.lsn > 0, "primary LSN should advance past 0");
+        assert!(stats.offset_bytes > 0, "offset bytes should be positive");
+        assert_eq!(
+            stats.timestamp.offset,
+            Some(0),
+            "timestamp should be in UTC"
+        );
+
+        monitor.pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_run_check_skips_aurora_detection_when_known() {
+        let monitor = monitor();
+
+        // Detection already done: run_check must reuse `Some(false)` and still
+        // produce valid stats via the standard query.
+        let result = monitor.run_check(Some(false)).await;
+        assert_eq!(result, Ok(Some(false)));
+
+        let stats = monitor.pool.lsn_stats();
+        assert!(stats.valid());
+        assert!(!stats.aurora);
+        assert!(stats.lsn.lsn > 0);
+
+        monitor.pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_run_check_aurora_query_path() {
+        let monitor = monitor();
+
+        // When told the server is Aurora, run_check uses the Aurora query,
+        // which reports a zero LSN. Aurora stats are still valid at LSN 0.
+        let result = monitor.run_check(Some(true)).await;
+        assert_eq!(result, Ok(Some(true)));
+
+        let stats = monitor.pool.lsn_stats();
+        assert!(stats.aurora, "stats should be flagged Aurora");
+        assert!(stats.valid(), "Aurora stats are valid even at LSN 0");
+        assert_eq!(stats.lsn.lsn, 0, "Aurora query reports zero LSN");
+        assert_eq!(stats.offset_bytes, 0);
+        assert!(!stats.replica);
+
+        monitor.pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_run_check_offline_returns_offline() {
+        let monitor = monitor();
+        monitor.pool.shutdown();
+
+        // A shut-down pool can't hand out connections: checkout returns
+        // Offline and run_check propagates it so the loop can break.
+        let result = monitor.run_check(None).await;
+        assert_eq!(result, Err(Error::Offline));
+    }
+
+    #[tokio::test]
+    async fn test_run_check_notifies_on_role_change() {
+        let monitor = monitor();
+
+        // Seed the stats as if the server were previously seen as a replica.
+        *monitor.pool.inner().lsn_stats.write() = StatsLsnStats {
+            replica: true,
+            lsn: Lsn::default(),
+            offset_bytes: 0,
+            timestamp: TimestampTz::default(),
+            fetched: SystemTime::now(),
+            aurora: false,
+            timeline: 0,
+        }
+        .into();
+
+        // The check observes the local primary (replica = false), a role
+        // change, so it must fire the role-change notification.
+        let result = monitor.run_check(Some(false)).await;
+        assert_eq!(result, Ok(Some(false)));
+        assert!(!monitor.pool.lsn_stats().replica);
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                monitor.pool.inner().lsn_role_change.notified()
+            )
+            .await
+            .is_ok(),
+            "role change should have been notified"
+        );
+
+        monitor.pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_run_check_no_notify_without_role_change() {
+        let monitor = monitor();
+
+        // Establish the current role first. The seed default is "replica",
+        // so this first check flips to primary and fires one notification —
+        // drain that stored permit before testing the steady state.
+        assert_eq!(monitor.run_check(Some(false)).await, Ok(Some(false)));
+        let _ = safe_timeout(
+            Duration::from_millis(50),
+            monitor.pool.inner().lsn_role_change.notified(),
+        )
+        .await;
+
+        // A second check sees the same role, so no notification fires and
+        // the `notified()` future stays pending until the timeout.
+        assert_eq!(monitor.run_check(Some(false)).await, Ok(Some(false)));
+
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                monitor.pool.inner().lsn_role_change.notified()
+            )
+            .await
+            .is_err(),
+            "no role change should mean no notification"
+        );
+
+        monitor.pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_get_connection_falls_back_to_standalone_when_saturated() {
+        crate::logger();
+
+        // Keep the timeout bounded while allowing the initial connection to be
+        // established on slower test hosts.
+        let config = Config {
+            max: 1,
+            min: 1,
+            checkout_timeout: Duration::from_secs(1),
+            ..Config::default()
+        };
+
+        let pool = Pool::new(&PoolConfig {
+            address: Address::new_test(),
+            config,
+        });
+        pool.launch();
+
+        // Saturate the pool by holding its only connection.
+        let _hold = pool.get(&Request::default()).await.unwrap();
+        assert_eq!(pool.lock().idle(), 0);
+
+        // A normal checkout now hits the checkout timeout.
+        assert_eq!(
+            pool.get(&Request::default()).await.unwrap_err(),
+            Error::CheckoutTimeout
+        );
+
+        // Checkout times out, so get_connection opens a standalone connection
+        // instead of stalling the LSN loop.
+        let monitor = LsnMonitor { pool: pool.clone() };
+        let mut conn = monitor.get_connection().await.unwrap();
+        assert!(
+            matches!(conn, LsnConnection::Conn(_)),
+            "saturated pool should yield a standalone connection"
+        );
+
+        // The standalone connection is usable.
+        assert!(monitor.run_query(&mut conn, LSN_QUERY).await.is_some());
+
+        pool.shutdown();
+    }
 
     #[test]
     fn test_aurora_stats_valid_with_zero_lsn() {
@@ -244,6 +502,7 @@ mod test {
             timestamp: TimestampTz::default(),
             fetched: SystemTime::now(),
             aurora: true,
+            timeline: 0,
         }
         .into();
 
@@ -262,6 +521,7 @@ mod test {
             timestamp: TimestampTz::default(),
             fetched: SystemTime::now(),
             aurora: false,
+            timeline: 0,
         }
         .into();
 

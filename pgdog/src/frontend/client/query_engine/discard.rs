@@ -1,25 +1,95 @@
-use crate::net::{BackendKeyData, CommandComplete, Protocol, ReadyForQuery};
+use super::fake::FakeResponse;
+use crate::frontend::{
+    client::Transaction, client::TransactionType, router::parameter_hints::PGDOG_PIN,
+};
 
 use super::*;
 
 impl QueryEngine {
-    /// Ignore DISCARD command.
+    /// Handle DISCARD commands whose session state PgDog tracks.
     pub(super) async fn discard(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        // FIXME(sage): Remove mut
+        client_request: &mut ClientRequest,
+        target: DiscardTarget,
         extended: bool,
     ) -> Result<(), Error> {
         let _extended = extended;
-        let bytes_sent = context
-            .stream
-            .send_many(&[
-                CommandComplete::new("DISCARD")
-                    .message()?
-                    .backend(BackendKeyData::default()),
-                ReadyForQuery::in_transaction(context.in_transaction()).message()?,
-            ])
-            .await?;
-        self.stats.sent(bytes_sent);
+
+        match target {
+            DiscardTarget::All if context.in_transaction() => {
+                context.transaction = Some(Transaction::started_at(
+                    match context
+                        .transaction
+                        .map(|transaction| transaction.transaction_type())
+                    {
+                        Some(TransactionType::ReadOnly | TransactionType::ErrorReadOnly) => {
+                            TransactionType::ErrorReadOnly
+                        }
+                        _ => TransactionType::ErrorReadWrite,
+                    },
+                    context.statement_start,
+                ));
+                self.error_response(
+                    context,
+                    client_request,
+                    ErrorResponse::discard_all_in_transaction(),
+                )
+                .await?;
+                return Ok(());
+            }
+            DiscardTarget::Temp if self.backend.connected() => {
+                self.execute(context, client_request, None).await?;
+                if !context.in_error() {
+                    self.temp_tables.discard(context.in_transaction());
+                    self.sync_lock();
+                    // execute() cleaned up before temp tracking was cleared.
+                    // Try again now that the backend is unpinned.
+                    self.cleanup_backend(context).await?;
+                }
+                return Ok(());
+            }
+            DiscardTarget::All => {
+                if self.backend.connected() {
+                    self.backend
+                        .execute("SELECT pg_advisory_unlock_all()")
+                        .await?;
+                }
+                self.advisory_locks.clear();
+                context.prepared_statements.close_all();
+                self.backend.unlisten_all();
+                self.reset_session_params(context);
+                self.sync_lock();
+                self.cleanup_backend(context).await?;
+            }
+            DiscardTarget::Plans | DiscardTarget::Sequences | DiscardTarget::Temp => {}
+        }
+
+        let command = match target {
+            DiscardTarget::All => "DISCARD ALL",
+            DiscardTarget::Plans => "DISCARD PLANS",
+            DiscardTarget::Sequences => "DISCARD SEQUENCES",
+            DiscardTarget::Temp => "DISCARD TEMP",
+        };
+
+        self.fake_command_response(
+            context,
+            &client_request.messages,
+            &FakeResponse::command(command),
+        )
+        .await?;
         Ok(())
+    }
+
+    fn reset_session_params(&mut self, context: &mut QueryEngineContext<'_>) {
+        context.params.restore_startup();
+        self.manual_lock = context
+            .params
+            .get(PGDOG_PIN)
+            .and_then(|value| value.as_str())
+            .map(|value| matches!(value, "true" | "t"))
+            .unwrap_or_default();
+        self.comms.update_params(context.params);
     }
 }

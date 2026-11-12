@@ -2,7 +2,7 @@ use super::code;
 use super::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct CloseComplete;
+pub(crate) struct CloseComplete;
 
 impl Protocol for CloseComplete {
     fn code(&self) -> char {
@@ -18,7 +18,7 @@ impl FromBytes for CloseComplete {
 }
 
 impl ToBytes for CloseComplete {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
-        Ok(Payload::named('3').freeze())
+    fn to_bytes(&self) -> Bytes {
+        Payload::named('3').freeze()
     }
 }

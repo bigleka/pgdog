@@ -1,173 +1,113 @@
 use uuid::Uuid;
 
-use crate::{
-    backend::ShardingSchema,
-    config::{DataType, ShardedTable},
-    net::{
-        messages::{Format, FromDataType, ParameterWithFormat, Vector},
-        vector::str_to_vector,
-    },
+pub(crate) mod context;
+pub(crate) mod context_builder;
+pub(crate) mod error;
+pub(crate) mod ffi;
+pub(crate) mod hasher;
+pub(crate) mod lookup;
+pub(crate) mod mapping;
+pub(crate) mod operator;
+pub(crate) mod schema;
+pub(crate) mod tables;
+#[cfg(test)]
+pub(crate) mod test;
+pub(crate) mod value;
+
+pub(crate) use context::*;
+pub(crate) use context_builder::*;
+pub(crate) use error::Error;
+pub(crate) use hasher::Hasher;
+pub(crate) use lookup::{
+    LookupCache, LookupStats, LookupTable, PendingLookup, ResolvedLookups, ShardOrLookup,
 };
+pub(crate) use mapping::Mapping;
+pub(crate) use operator::*;
+pub(crate) use pgdog_vector::Centroids;
+pub(crate) use schema::SchemaSharder;
+pub(crate) use tables::*;
+pub(crate) use value::*;
 
-// pub mod context;
-#[cfg(test)]
-pub mod benchmark_simd;
-pub mod context;
-pub mod context_builder;
-pub mod distance_simd_rust;
-pub mod error;
-pub mod ffi;
-pub mod hasher;
-pub mod list;
-pub mod mapping;
-pub mod operator;
-pub mod range;
-pub mod schema;
-pub mod tables;
-#[cfg(test)]
-pub mod test;
-pub mod value;
-pub mod vector;
-
-pub use context::*;
-pub use context_builder::*;
-pub use error::Error;
-pub use hasher::Hasher;
-pub use operator::*;
-pub use schema::SchemaSharder;
-pub use tables::*;
-pub use value::*;
-pub use vector::{Centroids, Distance};
-
-use super::parser::Shard;
-pub use list::{ListShards, Lists};
-pub use mapping::Mapping;
-pub use range::Ranges;
+const HASH_PARTITION_SEED: u64 = 0x7A5B22367996DCFD;
 
 /// Hash `BIGINT`.
-pub fn bigint(id: i64) -> u64 {
+pub(crate) fn bigint(id: i64) -> u64 {
     unsafe { ffi::hash_combine64(0, ffi::hashint8extended(id)) }
 }
 
 /// Hash UUID.
-pub fn uuid(uuid: Uuid) -> u64 {
+pub(crate) fn uuid(uuid: Uuid) -> u64 {
     unsafe {
         ffi::hash_combine64(
             0,
-            ffi::hash_bytes_extended(uuid.as_bytes().as_ptr(), uuid.as_bytes().len() as i64),
+            ffi::hash_bytes_extended(
+                uuid.as_bytes().as_ptr(),
+                uuid.as_bytes().len() as i64,
+                HASH_PARTITION_SEED,
+            ),
         )
     }
 }
 
 /// Hash VARCHAR.
-pub fn varchar(s: &[u8]) -> u64 {
-    unsafe { ffi::hash_combine64(0, ffi::hash_bytes_extended(s.as_ptr(), s.len() as i64)) }
-}
-
-/// Shard a string value, parsing out a BIGINT, UUID, or vector.
-///
-/// TODO: This is really not great, we should pass in the type oid
-/// from RowDescription in here to avoid guessing.
-pub(crate) fn shard_str(
-    value: &str,
-    schema: &ShardingSchema,
-    centroids: &Vec<Vector>,
-    centroid_probes: usize,
-) -> Shard {
-    let data_type = if value.starts_with('[') && value.ends_with(']') {
-        DataType::Vector
-    } else if value.parse::<i64>().is_ok() {
-        DataType::Bigint
-    } else if value.parse::<Uuid>().is_ok() {
-        DataType::Uuid
-    } else {
-        DataType::Varchar
-    };
-    shard_value(value, &data_type, schema.shards, centroids, centroid_probes)
-}
-
-/// Shard a value that's coming out of the query text directly.
-pub(crate) fn shard_value(
-    value: &str,
-    data_type: &DataType,
-    shards: usize,
-    centroids: &Vec<Vector>,
-    centroid_probes: usize,
-) -> Shard {
-    match data_type {
-        DataType::Bigint => value
-            .parse()
-            .map(|v| bigint(v) as usize % shards)
-            .ok()
-            .map(Shard::Direct)
-            .unwrap_or(Shard::All),
-        DataType::Uuid => value
-            .parse()
-            .map(|v| uuid(v) as usize % shards)
-            .ok()
-            .map(Shard::Direct)
-            .unwrap_or(Shard::All),
-        DataType::Vector => str_to_vector(value)
-            .ok()
-            .map(|v| {
-                Centroids::from(centroids)
-                    .shard(&v, shards, centroid_probes)
-                    .into()
-            })
-            .unwrap_or(Shard::All),
-        DataType::Varchar => Shard::Direct(varchar(value.as_bytes()) as usize % shards),
+pub(crate) fn varchar(s: &[u8]) -> u64 {
+    unsafe {
+        ffi::hash_combine64(
+            0,
+            ffi::hash_bytes_extended(s.as_ptr(), s.len() as i64, HASH_PARTITION_SEED),
+        )
     }
 }
 
-pub(crate) fn shard_binary(
-    bytes: &[u8],
-    data_type: &DataType,
-    shards: usize,
-    centroids: &Vec<Vector>,
-    centroid_probes: usize,
-) -> Shard {
-    match data_type {
-        DataType::Bigint => i64::decode(bytes, Format::Binary)
-            .ok()
-            .map(|i| Shard::new_direct(bigint(i) as usize % shards))
-            .unwrap_or(Shard::All),
-        DataType::Uuid => Uuid::decode(bytes, Format::Binary)
-            .ok()
-            .map(|u| Shard::new_direct(uuid(u) as usize % shards))
-            .unwrap_or(Shard::All),
-        DataType::Vector => Vector::decode(bytes, Format::Binary)
-            .ok()
-            .map(|v| {
-                Centroids::from(centroids)
-                    .shard(&v, shards, centroid_probes)
-                    .into()
-            })
-            .unwrap_or(Shard::All),
-        DataType::Varchar => Shard::Direct(varchar(bytes) as usize % shards),
-    }
+/// hashtext(`s`) equivalient behavior
+pub(crate) fn varchar_not_extended(s: &[u8]) -> u32 {
+    unsafe { ffi::hash_bytes(s.as_ptr(), s.len() as i64) }
 }
 
-/// Shard query parameter.
-pub fn shard_param(value: &ParameterWithFormat, table: &ShardedTable, shards: usize) -> Shard {
-    match value.format() {
-        Format::Binary => shard_binary(
-            value.data(),
-            &table.data_type,
-            shards,
-            &table.centroids,
-            table.centroid_probes,
-        ),
-        Format::Text => value
-            .text()
-            .map(|v| {
-                shard_value(
-                    v,
-                    &table.data_type,
-                    shards,
-                    &table.centroids,
-                    table.centroid_probes,
-                )
-            })
-            .unwrap_or(Shard::All),
+/// hashtextextended(`s`, `seed`) equivalient behavior
+pub(crate) fn varchar_extended(s: &[u8], seed: u64) -> u64 {
+    unsafe { ffi::hash_bytes_extended(s.as_ptr(), s.len() as i64, seed) }
+}
+
+#[cfg(test)]
+pub(crate) use test_impls::shard_value;
+#[cfg(test)]
+mod test_impls {
+    use super::{Centroids, bigint, uuid, varchar};
+    use crate::config::DataType;
+    use crate::frontend::router::parser::Shard;
+    use crate::net::{messages::Vector, vector::str_to_vector};
+
+    /// Shard a value that's coming out of the query text directly.
+    pub(crate) fn shard_value(
+        value: &str,
+        data_type: &DataType,
+        shards: usize,
+        centroids: &Vec<Vector>,
+        centroid_probes: usize,
+    ) -> Shard {
+        match data_type {
+            DataType::Bigint => value
+                .parse()
+                .map(|v| bigint(v) as usize % shards)
+                .ok()
+                .map(Shard::Direct)
+                .unwrap_or(Shard::All),
+            DataType::Uuid => value
+                .parse()
+                .map(|v| uuid(v) as usize % shards)
+                .ok()
+                .map(Shard::Direct)
+                .unwrap_or(Shard::All),
+            DataType::Vector => str_to_vector(value)
+                .ok()
+                .map(|v| {
+                    Centroids::from(centroids)
+                        .shard(&v, shards, centroid_probes)
+                        .into()
+                })
+                .unwrap_or(Shard::All),
+            DataType::Varchar => Shard::Direct(varchar(value.as_bytes()) as usize % shards),
+        }
     }
 }

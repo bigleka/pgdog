@@ -1,4 +1,6 @@
-use pg_query::parse;
+use crate::frontend::client::query_engine::TempTableChange;
+use pg_raw_parse::raw::OnCommitAction::ONCOMMIT_DROP;
+use std::ffi::c_char;
 
 use super::*;
 
@@ -6,12 +8,12 @@ impl QueryParser {
     /// Handle DDL, e.g. CREATE, DROP, ALTER, etc.
     pub(super) fn ddl(
         &mut self,
-        node: &Option<NodeEnum>,
+        node: Node<'_>,
         context: &mut QueryParserContext<'_>,
     ) -> Result<Command, Error> {
         let command = Self::shard_ddl(
             node,
-            &context.sharding_schema,
+            context.sharding_schema,
             &mut context.shards_calculator,
         )?;
 
@@ -19,30 +21,56 @@ impl QueryParser {
     }
 
     pub(super) fn shard_ddl(
-        node: &Option<NodeEnum>,
+        node: Node<'_>,
         schema: &ShardingSchema,
         calculator: &mut ShardsWithPriority,
     ) -> Result<Command, Error> {
+        use nodes::ObjectType;
         let mut shard = Shard::All;
         let mut schema_changed = false;
+        let mut temp_table = None;
+        let mut table_change = TableChange::None;
 
         match node {
-            Some(NodeEnum::CreateStmt(stmt)) => {
+            Node::CreateStmt(stmt) => {
                 schema_changed = true;
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
+                table_change = TableChange::Created;
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
+                if let Some(rv) = stmt.relation()
+                    && rv.relpersistence == b't' as c_char
+                {
+                    temp_table = Some(TempTableChange::Create {
+                        name: rv
+                            .relname()
+                            .expect("CREATE TABLE always has table name")
+                            .to_owned(),
+                        drop_on_commit: stmt.oncommit == ONCOMMIT_DROP,
+                    });
+                }
             }
 
-            Some(NodeEnum::CreateSeqStmt(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.sequence, schema)?.unwrap_or(Shard::All);
+            Node::CreateSeqStmt(stmt) => {
+                shard = Self::shard_ddl_table(stmt.sequence(), schema)?.unwrap_or(Shard::All);
+                if let Some(rv) = stmt.sequence()
+                    && rv.relpersistence == b't' as c_char
+                {
+                    temp_table = Some(TempTableChange::Create {
+                        name: rv
+                            .relname()
+                            .expect("CREATE SEQUENCE always has a name")
+                            .to_owned(),
+                        drop_on_commit: false,
+                    });
+                }
             }
 
-            Some(NodeEnum::DropStmt(stmt)) => match stmt.remove_type() {
-                ObjectType::ObjectTable
-                | ObjectType::ObjectIndex
-                | ObjectType::ObjectView
-                | ObjectType::ObjectSequence => {
-                    let table = Table::try_from(&stmt.objects).ok();
+            Node::DropStmt(stmt) => match stmt.remove_type {
+                ObjectType::OBJECT_TABLE => {
+                    table_change =
+                        TableChange::Dropped(stmt.objects().len().try_into().unwrap_or(u32::MAX));
+                    let table = Table::try_from(stmt.objects()).ok();
                     if let Some(table) = table {
+                        temp_table = Some(TempTableChange::Drop(table.name.to_owned()));
                         if let Some(schema) = schema.schemas.get(table.schema()) {
                             shard = schema.shard().into();
                         }
@@ -50,45 +78,56 @@ impl QueryParser {
                     schema_changed = true;
                 }
 
-                ObjectType::ObjectSchema => {
-                    if let Some(Node {
-                        node: Some(NodeEnum::String(string)),
-                    }) = stmt.objects.first()
-                    {
-                        if let Some(schema) = schema.schemas.get(Some(string.sval.as_str().into()))
-                        {
+                ObjectType::OBJECT_INDEX
+                | ObjectType::OBJECT_VIEW
+                | ObjectType::OBJECT_SEQUENCE => {
+                    let table = Table::try_from(stmt.objects()).ok();
+                    if let Some(table) = table {
+                        temp_table = Some(TempTableChange::Drop(table.name.to_owned()));
+                        if let Some(schema) = schema.schemas.get(table.schema()) {
                             shard = schema.shard().into();
                         }
+                    }
+                    schema_changed = true;
+                }
+
+                ObjectType::OBJECT_SCHEMA => {
+                    if let Some(string) = stmt.objects().first().and_then(Node::as_str)
+                        && let Some(schema) = schema.schemas.get(Some(string.into()))
+                    {
+                        shard = schema.shard().into();
                     }
                 }
 
                 _ => (),
             },
 
-            Some(NodeEnum::CreateSchemaStmt(stmt)) => {
-                if let Some(schema) = schema.schemas.get(Some(stmt.schemaname.as_str().into())) {
+            Node::CreateSchemaStmt(stmt) => {
+                if let Some(schema) = schema.schemas.get(stmt.schemaname().map(Into::into)) {
                     shard = schema.shard().into();
                 }
             }
 
-            Some(NodeEnum::IndexStmt(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
+            Node::IndexStmt(stmt) => {
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
             }
 
-            Some(NodeEnum::ViewStmt(stmt)) => {
+            Node::ViewStmt(stmt) => {
                 schema_changed = true;
-                shard = Self::shard_ddl_table(&stmt.view, schema)?.unwrap_or(Shard::All);
+                shard = Self::shard_ddl_table(stmt.view(), schema)?.unwrap_or(Shard::All);
             }
 
-            Some(NodeEnum::CreateTableAsStmt(stmt)) => {
+            Node::CreateTableAsStmt(stmt) => {
                 schema_changed = true;
-                if let Some(into) = &stmt.into {
-                    shard = Self::shard_ddl_table(&into.rel, schema)?.unwrap_or(Shard::All);
+                table_change = TableChange::Created;
+                if let Some(into) = stmt.into() {
+                    shard = Self::shard_ddl_table(into.rel(), schema)?.unwrap_or(Shard::All);
                 }
             }
 
-            Some(NodeEnum::CreateFunctionStmt(stmt)) => {
-                let table = Table::try_from(&stmt.funcname).ok();
+            Node::CreateFunctionStmt(stmt) => {
+                schema_changed = true;
+                let table = Table::try_from(stmt.funcname()).ok();
                 if let Some(table) = table {
                     shard = schema
                         .schemas
@@ -98,8 +137,9 @@ impl QueryParser {
                 }
             }
 
-            Some(NodeEnum::CreateEnumStmt(stmt)) => {
-                let table = Table::try_from(&stmt.type_name).ok();
+            Node::CreateEnumStmt(stmt) => {
+                schema_changed = true;
+                let table = Table::try_from(stmt.type_name()).ok();
                 if let Some(table) = table {
                     shard = schema
                         .schemas
@@ -109,101 +149,85 @@ impl QueryParser {
                 }
             }
 
-            Some(NodeEnum::AlterOwnerStmt(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
+            Node::AlterOwnerStmt(stmt) => {
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
             }
 
-            Some(NodeEnum::RenameStmt(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
-            }
-
-            Some(NodeEnum::AlterTableStmt(stmt)) => {
+            Node::RenameStmt(stmt) => {
                 schema_changed = true;
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
             }
 
-            Some(NodeEnum::AlterSeqStmt(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.sequence, schema)?.unwrap_or(Shard::All);
+            Node::AlterTableStmt(stmt) => {
+                schema_changed = true;
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
             }
 
-            Some(NodeEnum::LockStmt(stmt)) => {
-                if let Some(node) = stmt.relations.first() {
-                    if let Some(NodeEnum::RangeVar(ref table)) = node.node {
-                        let table = Table::from(table);
-                        shard = schema
-                            .schemas
-                            .get(table.schema())
-                            .map(|schema| schema.shard().into())
-                            .unwrap_or(Shard::All);
-                    }
+            Node::AlterSeqStmt(stmt) => {
+                shard = Self::shard_ddl_table(stmt.sequence(), schema)?.unwrap_or(Shard::All);
+            }
+
+            Node::LockStmt(stmt) => {
+                if let Some(node) = stmt.relations().first()
+                    && let Node::RangeVar(table) = node
+                {
+                    let table = Table::from(table);
+                    shard = schema
+                        .schemas
+                        .get(table.schema())
+                        .map(|schema| schema.shard().into())
+                        .unwrap_or(Shard::All);
                 }
             }
 
-            Some(NodeEnum::VacuumStmt(stmt)) => {
-                for rel in &stmt.rels {
-                    if let Some(NodeEnum::VacuumRelation(ref stmt)) = rel.node {
-                        shard =
-                            Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
-                    }
+            Node::VacuumStmt(stmt) => {
+                for rel in stmt.rels() {
+                    // FIXME: This almost certainly needs to be combining
+                    // shards, not setting it to the target of the last
+                    // relation mentioned
+                    shard = Self::shard_ddl_table(rel.relation(), schema)?.unwrap_or(Shard::All);
                 }
             }
 
-            Some(NodeEnum::VacuumRelation(stmt)) => {
-                shard = Self::shard_ddl_table(&stmt.relation, schema)?.unwrap_or(Shard::All);
+            Node::VacuumRelation(stmt) => {
+                shard = Self::shard_ddl_table(stmt.relation(), schema)?.unwrap_or(Shard::All);
             }
 
             // DO $$ BEGIN ... END
-            Some(NodeEnum::DoStmt(stmt)) => {
-                if let Some(inner) = stmt.args.first() {
-                    if let Some(NodeEnum::DefElem(ref elem)) = inner.node {
-                        if let Some(ref arg) = elem.arg {
-                            if let Some(NodeEnum::String(ref string)) = arg.node {
-                                // Parse each statement individually.
-                                // The first DDL statement to return a direct shard will be used.
-                                // TODO: handle non-DDL statements in here as well,
-                                // need a full recursive call back to QueryParser::query basically, but that requires a refactor.
-                                for stmt in string.sval.lines() {
-                                    if let Ok(stmt) = parse(stmt) {
-                                        if let Some(node) = stmt
-                                            .protobuf
-                                            .stmts
-                                            .first()
-                                            .map(|stmt| &stmt.stmt)
-                                            .cloned()
-                                            .flatten()
-                                        {
-                                            // Use a fresh calculator for each inner statement
-                                            // to avoid pollution from statements that don't match
-                                            // any DDL pattern (like BEGIN, END, etc.)
-                                            let mut inner_calculator =
-                                                ShardsWithPriority::default();
-                                            let command = Self::shard_ddl(
-                                                &node.node,
-                                                schema,
-                                                &mut inner_calculator,
-                                            )?;
-                                            if let Command::Query(query) = command {
-                                                if !query.is_cross_shard() {
-                                                    shard = query.shard().clone();
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+            Node::DoStmt(stmt) => {
+                if let Some(elem) = stmt.args().iter().find(|elem| elem.defname() == Some("as"))
+                    && let Some(string) = elem.arg().as_str()
+                {
+                    // Parse each statement individually.
+                    // The first DDL statement to return a direct shard will be used.
+                    // TODO: handle non-DDL statements in here as well,
+                    // need a full recursive call back to QueryParser::query basically, but that requires a refactor.
+                    for line in string.lines() {
+                        if let Ok(ast) = pg_raw_parse::parse(line)
+                            && let Some(node) = ast.stmts().next()
+                        {
+                            // Use a fresh calculator for each inner statement
+                            // to avoid pollution from statements that don't match
+                            // any DDL pattern (like BEGIN, END, etc.)
+                            let mut inner_calculator = ShardsWithPriority::default();
+                            let command = Self::shard_ddl(node, schema, &mut inner_calculator)?;
+                            if let Command::Query(query) = command
+                                && !query.is_cross_shard()
+                            {
+                                shard = query.shard().clone();
+                                break;
                             }
                         }
                     }
                 }
             }
 
-            Some(NodeEnum::TruncateStmt(stmt)) => {
+            Node::TruncateStmt(stmt) => {
                 let mut shards = HashSet::new();
-                for relation in &stmt.relations {
-                    if let Some(NodeEnum::RangeVar(ref relation)) = relation.node {
+                for relation in stmt.relations() {
+                    if let Node::RangeVar(relation) = relation {
                         shards.insert(
-                            Self::shard_ddl_table(&Some(relation.clone()), schema)?
-                                .unwrap_or(Shard::All),
+                            Self::shard_ddl_table(Some(relation), schema)?.unwrap_or(Shard::All),
                         );
                     }
                 }
@@ -225,19 +249,23 @@ impl QueryParser {
         calculator.push(ShardWithPriority::new_table(shard));
 
         Ok(Command::Query(
-            Route::write(calculator.shard()).with_schema_changed(schema_changed),
+            Route::write(calculator.shard())
+                .with_schema_changed(schema_changed)
+                .with_temp_table_change(temp_table)
+                .with_table_change(table_change)
+                .ddl(),
         ))
     }
 
     pub(super) fn shard_ddl_table(
-        range_var: &Option<RangeVar>,
+        range_var: Option<&nodes::RangeVar>,
         schema: &ShardingSchema,
     ) -> Result<Option<Shard>, Error> {
-        let table = range_var.as_ref().map(Table::from);
-        if let Some(table) = table {
-            if let Some(sharded_schema) = schema.schemas.get(table.schema()) {
-                return Ok(Some(sharded_schema.shard().into()));
-            }
+        let table = range_var.map(Table::from);
+        if let Some(table) = table
+            && let Some(sharded_schema) = schema.schemas.get(table.schema())
+        {
+            return Ok(Some(sharded_schema.shard().into()));
         }
 
         Ok(None)
@@ -246,16 +274,10 @@ impl QueryParser {
 
 #[cfg(test)]
 mod test {
-    use pg_query::{parse, NodeEnum};
+    use super::*;
+    use crate::backend::replication::ShardedSchemas;
+    use crate::frontend::client::query_engine::TempTableChange;
     use pgdog_config::ShardedSchema;
-
-    use crate::{
-        backend::{replication::ShardedSchemas, ShardingSchema},
-        frontend::router::{
-            parser::{Shard, ShardsWithPriority},
-            QueryParser,
-        },
-    };
 
     fn test_schema() -> ShardingSchema {
         ShardingSchema {
@@ -276,276 +298,246 @@ mod test {
         }
     }
 
-    fn parse_stmt(query: &str) -> Option<NodeEnum> {
-        let root = parse(query)
-            .unwrap()
-            .protobuf
-            .stmts
-            .first()
-            .unwrap()
-            .clone()
-            .stmt
-            .unwrap()
-            .node;
-        root
+    fn parse_stmt(query: &str) -> Command {
+        let ast = pg_raw_parse::parse(query).unwrap();
+        let root = ast.stmts().next().unwrap();
+        let mut calculator = ShardsWithPriority::default();
+        QueryParser::shard_ddl(root, &test_schema(), &mut calculator).unwrap()
     }
 
     #[test]
     fn test_create_table_sharded_schema() {
-        let root = parse_stmt("CREATE TABLE shard_0.test (id BIGINT)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TABLE shard_0.test (id BIGINT)");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_table_unsharded_schema() {
-        let root = parse_stmt("CREATE TABLE unsharded.test (id BIGINT)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TABLE unsharded.test (id BIGINT)");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_table_no_schema() {
-        let root = parse_stmt("CREATE TABLE test (id BIGINT)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TABLE test (id BIGINT)");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
+        assert_eq!(command.route().table_change(), TableChange::Created);
     }
 
     #[test]
     fn test_create_sequence_sharded() {
-        let root = parse_stmt("CREATE SEQUENCE shard_1.test_seq");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE SEQUENCE shard_1.test_seq");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_sequence_unsharded() {
-        let root = parse_stmt("CREATE SEQUENCE public.test_seq");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE SEQUENCE public.test_seq");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
+        assert!(command.route().temp_table_change.is_none());
+    }
+
+    #[test]
+    fn test_create_temp_sequence_pins_backend() {
+        let command = parse_stmt("CREATE TEMP SEQUENCE test_seq");
+        assert!(matches!(
+            &command.route().temp_table_change,
+            Some(TempTableChange::Create {
+                name,
+                drop_on_commit: false,
+            }) if name == "test_seq"
+        ));
+
+        let command = parse_stmt("CREATE TEMPORARY SEQUENCE IF NOT EXISTS shard_1.test_seq");
+        assert_eq!(command.route().shard(), &Shard::Direct(1));
+        assert!(matches!(
+            &command.route().temp_table_change,
+            Some(TempTableChange::Create {
+                name,
+                drop_on_commit: false,
+            }) if name == "test_seq"
+        ));
     }
 
     #[test]
     fn test_drop_table_sharded() {
-        let root = parse_stmt("DROP TABLE shard_0.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP TABLE shard_0.test");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
+        assert_eq!(command.route().table_change(), TableChange::Dropped(1));
+    }
+
+    #[test]
+    fn test_drop_multiple_tables_counts_each_table() {
+        let command = parse_stmt("DROP TABLE public.one, public.two");
+        assert_eq!(command.route().table_change(), TableChange::Dropped(2));
     }
 
     #[test]
     fn test_drop_table_unsharded() {
-        let root = parse_stmt("DROP TABLE public.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP TABLE public.test");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_drop_index_sharded() {
-        let root = parse_stmt("DROP INDEX shard_1.test_idx");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP INDEX shard_1.test_idx");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(command.route().is_schema_changed());
+        assert_eq!(command.route().table_change(), TableChange::None);
     }
 
     #[test]
     fn test_drop_view_sharded() {
-        let root = parse_stmt("DROP VIEW shard_0.test_view");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP VIEW shard_0.test_view");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_drop_sequence_sharded() {
-        let root = parse_stmt("DROP SEQUENCE shard_1.test_seq");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP SEQUENCE shard_1.test_seq");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_drop_schema_sharded() {
-        let root = parse_stmt("DROP SCHEMA shard_0");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP SCHEMA shard_0");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_drop_schema_unsharded() {
-        let root = parse_stmt("DROP SCHEMA public");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("DROP SCHEMA public");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_schema_sharded() {
-        let root = parse_stmt("CREATE SCHEMA shard_0");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE SCHEMA shard_0");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_schema_unsharded() {
-        let root = parse_stmt("CREATE SCHEMA new_schema");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE SCHEMA new_schema");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_index_sharded() {
-        let root = parse_stmt("CREATE INDEX test_idx ON shard_1.test (id)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE INDEX test_idx ON shard_1.test (id)");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
 
-        let root = parse_stmt("CREATE UNIQUE INDEX test_idx ON shard_1.test (id)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE UNIQUE INDEX test_idx ON shard_1.test (id)");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_do_begin() {
-        let root = parse_stmt(
+        let command = parse_stmt(
             r#"DO $$ BEGIN
          ALTER TABLE "shard_1"."foo" ADD CONSTRAINT "foo_id_foo2_id_fk" FOREIGN KEY ("id") REFERENCES "shard_1"."foo2"("id") ON DELETE cascade ON UPDATE cascade;
         EXCEPTION
          WHEN duplicate_object THEN null;
         END $$;"#,
         );
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_index_unsharded() {
-        let root = parse_stmt("CREATE INDEX test_idx ON public.test (id)");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE INDEX test_idx ON public.test (id)");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_view_sharded() {
-        let root = parse_stmt("CREATE VIEW shard_0.test_view AS SELECT 1");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE VIEW shard_0.test_view AS SELECT 1");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_view_unsharded() {
-        let root = parse_stmt("CREATE VIEW public.test_view AS SELECT 1");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE VIEW public.test_view AS SELECT 1");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_table_as_sharded() {
-        let root = parse_stmt("CREATE TABLE shard_1.new_table AS SELECT * FROM other");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TABLE shard_1.new_table AS SELECT * FROM other");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(command.route().is_schema_changed());
+        assert_eq!(command.route().table_change(), TableChange::Created);
     }
 
     #[test]
     fn test_create_table_as_unsharded() {
-        let root = parse_stmt("CREATE TABLE public.new_table AS SELECT * FROM other");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TABLE public.new_table AS SELECT * FROM other");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_lock_table() {
-        let root = parse_stmt(r#"LOCK TABLE "shard_1"."__migrations_table""#);
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt(r#"LOCK TABLE "shard_1"."__migrations_table""#);
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_function_sharded() {
-        let root = parse_stmt(
+        let command = parse_stmt(
             "CREATE FUNCTION shard_0.test_func() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql",
         );
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
         assert_eq!(command.route().shard(), &Shard::Direct(0));
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_function_unsharded() {
-        let root = parse_stmt(
+        let command = parse_stmt(
             "CREATE FUNCTION public.test_func() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql",
         );
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
         assert_eq!(command.route().shard(), &Shard::All);
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_enum_sharded() {
-        let root = parse_stmt("CREATE TYPE shard_1.mood AS ENUM ('sad', 'ok', 'happy')");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TYPE shard_1.mood AS ENUM ('sad', 'ok', 'happy')");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_create_enum_unsharded() {
-        let root = parse_stmt("CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy')");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy')");
         assert_eq!(command.route().shard(), &Shard::All);
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_alter_owner_sharded() {
         // Note: ALTER TABLE ... OWNER TO is parsed as AlterTableStmt, not AlterOwnerStmt
-        let root = parse_stmt("ALTER TABLE shard_0.test OWNER TO new_owner");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE shard_0.test OWNER TO new_owner");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
     }
@@ -553,134 +545,104 @@ mod test {
     #[test]
     fn test_alter_owner_unsharded() {
         // Note: ALTER TABLE ... OWNER TO is parsed as AlterTableStmt, not AlterOwnerStmt
-        let root = parse_stmt("ALTER TABLE public.test OWNER TO new_owner");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE public.test OWNER TO new_owner");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_rename_table_sharded() {
-        let root = parse_stmt("ALTER TABLE shard_1.test RENAME TO new_test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE shard_1.test RENAME TO new_test");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_rename_table_unsharded() {
-        let root = parse_stmt("ALTER TABLE public.test RENAME TO new_test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE public.test RENAME TO new_test");
         assert_eq!(command.route().shard(), &Shard::All);
-        assert!(!command.route().is_schema_changed());
+        assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_alter_table_sharded() {
-        let root = parse_stmt("ALTER TABLE shard_0.test ADD COLUMN new_col INT");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE shard_0.test ADD COLUMN new_col INT");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_alter_table_unsharded() {
-        let root = parse_stmt("ALTER TABLE public.test ADD COLUMN new_col INT");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER TABLE public.test ADD COLUMN new_col INT");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(command.route().is_schema_changed());
     }
 
     #[test]
     fn test_alter_sequence_sharded() {
-        let root = parse_stmt("ALTER SEQUENCE shard_1.test_seq RESTART WITH 100");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER SEQUENCE shard_1.test_seq RESTART WITH 100");
         assert_eq!(command.route().shard(), &Shard::Direct(1));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_alter_sequence_unsharded() {
-        let root = parse_stmt("ALTER SEQUENCE public.test_seq RESTART WITH 100");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("ALTER SEQUENCE public.test_seq RESTART WITH 100");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_vacuum_sharded() {
-        let root = parse_stmt("VACUUM shard_0.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("VACUUM shard_0.test");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_vacuum_unsharded() {
-        let root = parse_stmt("VACUUM public.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("VACUUM public.test");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_vacuum_no_table() {
-        let root = parse_stmt("VACUUM");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("VACUUM");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_truncate_single_table_sharded() {
-        let root = parse_stmt("TRUNCATE shard_0.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("TRUNCATE shard_0.test");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_truncate_single_table_unsharded() {
-        let root = parse_stmt("TRUNCATE public.test");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("TRUNCATE public.test");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
     fn test_truncate_multiple_tables_same_shard() {
-        let root = parse_stmt("TRUNCATE shard_0.test1, shard_0.test2");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("TRUNCATE shard_0.test1, shard_0.test2");
         assert_eq!(command.route().shard(), &Shard::Direct(0));
         assert!(!command.route().is_schema_changed());
     }
 
     #[test]
+    #[should_panic]
     fn test_truncate_cross_shard_error() {
-        let root = parse_stmt("TRUNCATE shard_0.test1, shard_1.test2");
-        let mut calculator = ShardsWithPriority::default();
-        let result = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator);
-        assert!(result.is_err());
+        parse_stmt("TRUNCATE shard_0.test1, shard_1.test2");
     }
 
     #[test]
     fn test_unhandled_ddl_defaults_to_all() {
-        let root = parse_stmt("COMMENT ON TABLE public.test IS 'test comment'");
-        let mut calculator = ShardsWithPriority::default();
-        let command = QueryParser::shard_ddl(&root, &test_schema(), &mut calculator).unwrap();
+        let command = parse_stmt("COMMENT ON TABLE public.test IS 'test comment'");
         assert_eq!(command.route().shard(), &Shard::All);
         assert!(!command.route().is_schema_changed());
     }

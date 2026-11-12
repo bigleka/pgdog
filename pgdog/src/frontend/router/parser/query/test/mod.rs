@@ -2,10 +2,12 @@
 
 use crate::{
     config::config,
+    frontend::client::QueryTimestamps,
     net::{
-        messages::{parse::Parse, Parameter},
-        Close, Format, Parameters, Sync,
+        Close, Format, Sync,
+        messages::{bind::Parameter, parse::Parse},
     },
+    parameters::ParameterStore,
 };
 use bytes::Bytes;
 
@@ -14,43 +16,51 @@ use crate::backend::Cluster;
 use crate::config::ReadWriteStrategy;
 use crate::frontend::router::parser::{AstContext, Cache};
 use crate::frontend::{
-    client::{Sticky, TransactionType},
     BufferedQuery, ClientRequest, PreparedStatements, RouterContext,
+    client::{Sticky, Transaction, TransactionType},
 };
 use crate::net::messages::Query;
 
-pub mod setup;
+pub(crate) mod setup;
 
-pub mod test_bypass;
-pub mod test_comments;
-pub mod test_ddl;
-pub mod test_delete;
-pub mod test_dml;
-pub mod test_explain;
-pub mod test_functions;
-pub mod test_insert;
-pub mod test_rr;
-pub mod test_schema_sharding;
-pub mod test_search_path;
-pub mod test_select;
-pub mod test_session_control;
-pub mod test_set;
-pub mod test_sharding;
-pub mod test_special;
-pub mod test_subqueries;
-pub mod test_transaction;
+pub(crate) mod test_bypass;
+pub(crate) mod test_comments;
+pub(crate) mod test_copy;
+pub(crate) mod test_ddl;
+pub(crate) mod test_delete;
+pub(crate) mod test_dml;
+pub(crate) mod test_explain;
+pub(crate) mod test_functions;
+pub(crate) mod test_insert;
+mod test_join_columns;
+pub(crate) mod test_prefer_primary;
+pub(crate) mod test_prepared;
+mod test_replica_only;
+pub(crate) mod test_rr;
+pub(crate) mod test_schema_sharding;
+pub(crate) mod test_search_path;
+pub(crate) mod test_select;
+pub(crate) mod test_session_control;
+pub(crate) mod test_set;
+pub(crate) mod test_sharding;
+pub(crate) mod test_special;
+pub(crate) mod test_split;
+pub(crate) mod test_subqueries;
+pub(crate) mod test_transaction;
 
 fn parse_query(query: &str) -> Command {
     let mut query_parser = QueryParser::default();
     let cluster = Cluster::new_test(&config());
     let buffered = BufferedQuery::Query(Query::new(query));
-    let params = Parameters::default();
-    let ctx = AstContext::from_cluster(&cluster, &params);
+    let params = ParameterStore::default();
+    let ctx = AstContext::from_cluster(&cluster, &params, QueryTimestamps::default());
     let ast = Cache::get()
         .query(&buffered, &ctx, &mut PreparedStatements::default())
         .unwrap();
     let mut client_request = ClientRequest::from(vec![Query::new(query).into()]);
-    client_request.ast = Some(ast);
+    client_request.ast = Some(ast.ast);
+    client_request.cached = ast.cached;
+    client_request.routing_comment = Some(ast.comment);
 
     let context =
         RouterContext::new(&client_request, &cluster, &params, None, Sticky::new_test()).unwrap();
@@ -58,25 +68,61 @@ fn parse_query(query: &str) -> Command {
     query_parser.parse(context).unwrap().clone()
 }
 
-macro_rules! command {
-    ($query:expr) => {{
-        command!($query, false)
-    }};
+#[test]
+fn parser_marks_dml_for_metrics() {
+    for query in [
+        "SELECT 1",
+        "INSERT INTO metrics_test VALUES (1)",
+        "UPDATE metrics_test SET id = 2",
+        "DELETE FROM metrics_test",
+        "COPY metrics_test TO STDOUT",
+    ] {
+        let command = parse_query(query);
+        assert_eq!(
+            command.route().statement_type(),
+            Some(StatementType::Dml),
+            "{query}"
+        );
+        assert_eq!(command.route().table_change(), TableChange::None);
+    }
+}
 
-    ($query:expr, $in_transaction:expr) => {{
+#[test]
+fn parser_marks_table_ddl_for_metrics() {
+    let command = parse_query("CREATE TABLE metrics_test (id BIGINT)");
+    assert_eq!(command.route().statement_type(), Some(StatementType::Ddl));
+    assert_eq!(command.route().table_change(), TableChange::Created);
+}
+
+#[test]
+fn parser_does_not_count_session_commands_as_dml() {
+    let command = parse_query("SHOW transaction_isolation");
+    assert_eq!(command.route().statement_type(), None);
+}
+
+macro_rules! command {
+    ($query:expr_2021) => {{ command!($query, false) }};
+
+    ($query:expr_2021, $in_transaction:expr_2021) => {{
         let query = $query;
         let mut query_parser = QueryParser::default();
         let cluster = Cluster::new_test(&crate::config::config());
         let buffered = BufferedQuery::Query(Query::new($query));
-        let params = Parameters::default();
-        let ctx = crate::frontend::router::parser::AstContext::from_cluster(&cluster, &params);
+        let params = ParameterStore::default();
+        let ctx = crate::frontend::router::parser::AstContext::from_cluster(
+            &cluster,
+            &params,
+            QueryTimestamps::default(),
+        );
         let ast = crate::frontend::router::parser::Cache::get()
             .query(&buffered, &ctx, &mut PreparedStatements::default())
             .unwrap();
         let mut client_request = ClientRequest::from(vec![Query::new(query).into()]);
-        client_request.ast = Some(ast);
+        client_request.ast = Some(ast.ast);
+        client_request.cached = ast.cached;
+        client_request.routing_comment = Some(ast.comment);
         let transaction = if $in_transaction {
-            Some(TransactionType::ReadWrite)
+            Some(Transaction::new(TransactionType::ReadWrite))
         } else {
             None
         };
@@ -95,11 +141,9 @@ macro_rules! command {
 }
 
 macro_rules! query {
-    ($query:expr) => {{
-        query!($query, false)
-    }};
+    ($query:expr_2021) => {{ query!($query, false) }};
 
-    ($query:expr, $in_transaction:expr) => {{
+    ($query:expr_2021, $in_transaction:expr_2021) => {{
         let query = $query;
         let (command, _) = command!(query, $in_transaction);
 
@@ -112,7 +156,7 @@ macro_rules! query {
 }
 
 macro_rules! query_parser {
-    ($qp:expr, $query:expr, $in_transaction:expr, $cluster:expr) => {{
+    ($qp:expr_2021, $query:expr_2021, $in_transaction:expr_2021, $cluster:expr_2021) => {{
         let cluster = $cluster;
         let mut client_request: ClientRequest = vec![$query.into()].into();
 
@@ -122,17 +166,22 @@ macro_rules! query_parser {
             .expect("no query in client request");
 
         let mut prep_stmts = PreparedStatements::default();
-        let params = Parameters::default();
-        let ctx = crate::frontend::router::parser::AstContext::from_cluster(&cluster, &params);
+        let params = ParameterStore::default();
+        let ctx = crate::frontend::router::parser::AstContext::from_cluster(
+            &cluster,
+            &params,
+            QueryTimestamps::default(),
+        );
 
-        let mut ast = crate::frontend::router::parser::Cache::get()
+        let ast = crate::frontend::router::parser::Cache::get()
             .query(&buffered_query, &ctx, &mut prep_stmts)
             .unwrap();
-        ast.cached = false; // Dry run test needs this.
-        client_request.ast = Some(ast);
+        client_request.ast = Some(ast.ast);
+        client_request.cached = false; // Dry run test needs this
+        client_request.routing_comment = Some(ast.comment);
 
         let maybe_transaction = if $in_transaction {
-            Some(TransactionType::ReadWrite)
+            Some(Transaction::new(TransactionType::ReadWrite))
         } else {
             None
         };
@@ -149,7 +198,7 @@ macro_rules! query_parser {
         $qp.parse(router_context).unwrap()
     }};
 
-    ($qp:expr, $query:expr, $in_transaction:expr) => {
+    ($qp:expr_2021, $query:expr_2021, $in_transaction:expr_2021) => {
         query_parser!(
             $qp,
             $query,
@@ -160,11 +209,11 @@ macro_rules! query_parser {
 }
 
 macro_rules! parse {
-    ($query: expr, $params: expr) => {
+    ($query: expr_2021, $params: expr_2021) => {
         parse!("", $query, $params)
     };
 
-    ($name:expr, $query:expr, $params:expr, $codes:expr) => {{
+    ($name:expr_2021, $query:expr_2021, $params:expr_2021, $codes:expr_2021) => {{
         let parse = Parse::named($name, $query);
         let params = $params
             .into_iter()
@@ -176,14 +225,19 @@ macro_rules! parse {
         let bind = Bind::new_params_codes($name, &params, $codes);
         let cluster = Cluster::new_test(&crate::config::config());
         let buffered = BufferedQuery::Prepared(Parse::new_anonymous($query));
-        let client_params = Parameters::default();
-        let ctx =
-            crate::frontend::router::parser::AstContext::from_cluster(&cluster, &client_params);
+        let client_params = ParameterStore::default();
+        let ctx = crate::frontend::router::parser::AstContext::from_cluster(
+            &cluster,
+            &client_params,
+            QueryTimestamps::default(),
+        );
         let ast = crate::frontend::router::parser::Cache::get()
             .query(&buffered, &ctx, &mut PreparedStatements::default())
             .unwrap();
         let mut client_request = ClientRequest::from(vec![parse.into(), bind.into()]);
-        client_request.ast = Some(ast);
+        client_request.ast = Some(ast.ast);
+        client_request.cached = ast.cached;
+        client_request.routing_comment = Some(ast.comment);
         let route = QueryParser::default()
             .parse(
                 RouterContext::new(
@@ -205,7 +259,7 @@ macro_rules! parse {
         }
     }};
 
-    ($name:expr, $query:expr, $params: expr) => {
+    ($name:expr_2021, $query:expr_2021, $params: expr_2021) => {
         parse!($name, $query, $params, &[])
     };
 }
@@ -216,7 +270,7 @@ fn test_insert() {
         "INSERT INTO sharded (id, email) VALUES ($1, $2)",
         ["11".as_bytes(), "test@test.com".as_bytes()]
     );
-    assert_eq!(route.shard(), &Shard::new_direct(1));
+    assert_eq!(route.shard(), &Shard::Direct(1));
 }
 
 #[test]
@@ -307,6 +361,26 @@ fn test_select_for_update_in_cte() {
 }
 
 #[test]
+fn test_select_for_update_in_subselect() {
+    // FOR UPDATE buried inside a subselect should still route to the primary.
+    let route =
+        query!("SELECT * FROM locked WHERE id IN (SELECT id FROM sharded WHERE id = 1 FOR UPDATE)");
+    assert!(route.is_write());
+
+    // Doubly-nested subselect
+    let route = query!(
+        "SELECT * FROM locked WHERE id IN \
+            (SELECT id FROM sharded WHERE id IN \
+                (SELECT id FROM sharded WHERE id = 1 FOR UPDATE))"
+    );
+    assert!(route.is_write());
+
+    // Sanity check: a plain SELECT inside a subselect without locking is still a read.
+    let route = query!("SELECT * FROM locked WHERE id IN (SELECT id FROM sharded WHERE id = 1)");
+    assert!(route.is_read());
+}
+
+#[test]
 fn test_omni() {
     let mut omni_round_robin = HashSet::new();
     let q = "SELECT sharded_omni.* FROM sharded_omni WHERE sharded_omni.id = 1";
@@ -388,7 +462,7 @@ fn test_set() {
         match command {
             Command::Set { params, .. } => {
                 assert_eq!(params[0].name, "timezone");
-                assert_eq!(params[0].value, ParameterValue::from("UTC"));
+                assert_eq!(params[0].value, Some(ParameterValue::from("UTC")));
             }
             _ => panic!("not a set"),
         };
@@ -398,7 +472,7 @@ fn test_set() {
     match command {
         Command::Set { params, .. } => {
             assert_eq!(params[0].name, "statement_timeout");
-            assert_eq!(params[0].value, ParameterValue::from("3000"));
+            assert_eq!(params[0].value, Some(ParameterValue::from("3000")));
         }
         _ => panic!("not a set"),
     };
@@ -409,7 +483,7 @@ fn test_set() {
     match command {
         Command::Set { params, .. } => {
             assert_eq!(params[0].name, "is_superuser");
-            assert_eq!(params[0].value, ParameterValue::from("true"));
+            assert_eq!(params[0].value, Some(ParameterValue::from("true")));
         }
         _ => panic!("not a set"),
     };
@@ -428,7 +502,11 @@ fn test_set() {
             assert_eq!(params[0].name, "search_path");
             assert_eq!(
                 params[0].value,
-                ParameterValue::Tuple(vec!["$user".into(), "public".into(), "APPLES".into()])
+                Some(ParameterValue::Tuple(vec![
+                    "$user".into(),
+                    "public".into(),
+                    "APPLES".into()
+                ]))
             )
         }
         _ => panic!("search path"),
@@ -438,14 +516,16 @@ fn test_set() {
     let cluster = Cluster::new_test(&config());
     let mut prep_stmts = PreparedStatements::default();
     let buffered_query = BufferedQuery::Query(Query::new(query_str));
-    let params = Parameters::default();
-    let ctx = AstContext::from_cluster(&cluster, &params);
+    let params = ParameterStore::default();
+    let ctx = AstContext::from_cluster(&cluster, &params, QueryTimestamps::default());
     let ast = Cache::get()
         .query(&buffered_query, &ctx, &mut prep_stmts)
         .unwrap();
     let mut buffer: ClientRequest = vec![Query::new(query_str).into()].into();
-    buffer.ast = Some(ast);
-    let transaction = Some(TransactionType::ReadWrite);
+    buffer.ast = Some(ast.ast);
+    buffer.cached = ast.cached;
+    buffer.routing_comment = Some(ast.comment);
+    let transaction = Some(Transaction::new(TransactionType::ReadWrite));
     let router_context =
         RouterContext::new(&buffer, &cluster, &params, transaction, Sticky::new()).unwrap();
     let mut context = QueryParserContext::new(router_context).unwrap();
@@ -504,9 +584,11 @@ fn test_transaction() {
     match route {
         Command::Set { params, .. } => {
             assert_eq!(params[0].name, "application_name");
-            assert_eq!(params[0].value.as_str().unwrap(), "test");
+            assert_eq!(
+                params[0].value.as_ref().and_then(|s| s.as_str()),
+                Some("test")
+            );
             assert!(!cluster.read_only());
-            assert!(!params[0].local);
         }
 
         _ => panic!("not a query"),
@@ -515,17 +597,16 @@ fn test_transaction() {
 
 #[test]
 fn test_insert_do_update() {
-    let route = query!("INSERT INTO foo (id) VALUES ($1::UUID) ON CONFLICT (id) DO UPDATE SET id = excluded.id RETURNING id");
+    let route = query!(
+        "INSERT INTO foo (id) VALUES ($1::UUID) ON CONFLICT (id) DO UPDATE SET id = excluded.id RETURNING id"
+    );
     assert!(route.is_write())
 }
 
 #[test]
 fn test_begin_extended() {
     let command = query_parser!(QueryParser::default(), Parse::new_anonymous("BEGIN"), false);
-    match command {
-        Command::StartTransaction { extended, .. } => assert!(extended),
-        _ => panic!("not a transaction"),
-    }
+    assert!(matches!(command, Command::StartTransaction { .. }));
 }
 
 #[test]
@@ -536,16 +617,14 @@ fn test_show_shards() {
 
 #[test]
 fn test_write_functions() {
-    let route = query!("SELECT pg_advisory_lock($1)");
+    let route = query!("SELECT pg_advisory_lock(1)");
     assert!(route.is_write());
-    assert!(!route.is_lock_session()); // Need Bind
 }
 
 #[test]
 fn test_write_nolock() {
     let route = query!("SELECT nextval('234')");
     assert!(route.is_write());
-    assert!(!route.is_lock_session());
 }
 
 #[test]
@@ -553,7 +632,9 @@ fn test_cte() {
     let route = query!("WITH s AS (SELECT 1) SELECT 2");
     assert!(route.is_read());
 
-    let route = query!("WITH s AS (SELECT 1), s2 AS (INSERT INTO test VALUES ($1) RETURNING *), s3 AS (SELECT 123) SELECT * FROM s");
+    let route = query!(
+        "WITH s AS (SELECT 1), s2 AS (INSERT INTO test VALUES ($1) RETURNING *), s3 AS (SELECT 123) SELECT * FROM s"
+    );
     assert!(route.is_write());
 }
 
@@ -578,14 +659,16 @@ WHERE t2.account = (
 	)
 	";
     let buffered_query = BufferedQuery::Query(Query::new(query_str));
-    let params = Parameters::default();
-    let ctx = AstContext::from_cluster(&cluster, &params);
+    let params = ParameterStore::default();
+    let ctx = AstContext::from_cluster(&cluster, &params, QueryTimestamps::now());
     let ast = Cache::get()
         .query(&buffered_query, &ctx, &mut prep_stmts)
         .unwrap();
     let mut buffer: ClientRequest = vec![Query::new(query_str).into()].into();
-    buffer.ast = Some(ast);
-    let transaction = Some(TransactionType::ReadWrite);
+    buffer.ast = Some(ast.ast);
+    buffer.cached = ast.cached;
+    buffer.routing_comment = Some(ast.comment);
+    let transaction = Some(Transaction::new(TransactionType::ReadWrite));
     let router_context =
         RouterContext::new(&buffer, &cluster, &params, transaction, Sticky::new()).unwrap();
     let mut context = QueryParserContext::new(router_context).unwrap();
@@ -618,7 +701,7 @@ fn test_close_direct_one_shard() {
 
     let buf: ClientRequest = vec![Close::named("test").into(), Sync.into()].into();
     let transaction = None;
-    let params = Parameters::default();
+    let params = ParameterStore::default();
 
     let context = RouterContext::new(&buf, &cluster, &params, transaction, Sticky::new()).unwrap();
 
@@ -661,12 +744,6 @@ fn test_any() {
 }
 
 #[test]
-fn test_commit_prepared() {
-    let stmt = pg_query::parse("COMMIT PREPARED 'test'").unwrap();
-    println!("{:?}", stmt);
-}
-
-#[test]
 fn test_set_comments() {
     // let command = query_parser!(
     //     QueryParser::default(),
@@ -681,39 +758,4 @@ fn test_set_comments() {
         true
     );
     assert!(matches!(command, Command::Set { .. }));
-}
-
-#[test]
-fn test_subqueries() {
-    println!(
-        "{:#?}",
-        pg_query::parse(r#"
-        SELECT
-            count(*) AS "count"
-        FROM
-        (
-            SELECT "companies".* FROM
-            (
-                 SELECT "companies".*
-                 FROM "companies"
-                 INNER JOIN "organizations_relevant_companies" ON
-                 ("organizations_relevant_companies"."company_id" = "companies"."id")
-                 WHERE
-                 (
-                     ("organizations_relevant_companies"."org_id" = 1)
-                     AND NOT
-                     (
-                        EXISTS
-                        (
-                           SELECT * FROM "hidden_globals"
-                           WHERE
-                           (
-                               ("hidden_globals"."org_id" = 1)
-                               AND ("hidden_globals"."global_company_id" = "organizations_relevant_companies"."company_id")
-                           )
-                     )
-                )
-            )
-        ) AS "companies" OFFSET 0) AS "t1" LIMIT 1"#).unwrap()
-    );
 }

@@ -1,16 +1,34 @@
 use crate::{
     backend::databases,
-    config::{self, config, RewriteMode},
+    config::{self, RewriteMode, config},
     frontend::PreparedStatements,
 };
 
 use super::prelude::*;
-use pg_query::{parse, protobuf::a_const, NodeEnum};
+use pg_raw_parse::{
+    Node,
+    raw::VariableSetKind::{VAR_RESET, VAR_RESET_ALL},
+};
 use serde::de::DeserializeOwned;
 
-pub struct Set {
+pub(crate) struct Set {
     name: String,
     value: String,
+}
+
+pub(super) fn is_set_statement(sql: &str) -> bool {
+    is_set_or_error(sql).unwrap_or_default()
+}
+
+fn is_set_or_error(sql: &str) -> Result<bool, Error> {
+    let stmt = pg_raw_parse::parse(sql).map_err(|_| Error::Syntax)?;
+    let root = stmt.stmts().next().ok_or(Error::Syntax)?;
+
+    Ok(if let Node::VariableSetStmt(stmt) = root {
+        !matches!(stmt.kind, VAR_RESET_ALL | VAR_RESET)
+    } else {
+        false
+    })
 }
 
 #[async_trait]
@@ -20,29 +38,18 @@ impl Command for Set {
     }
 
     fn parse(sql: &str) -> Result<Self, Error> {
-        let stmt = parse(sql).map_err(|_| Error::Syntax)?;
-        let root = stmt.protobuf.stmts.first().cloned().ok_or(Error::Syntax)?;
-        let stmt = root.stmt.ok_or(Error::Syntax)?;
-        match stmt.node.ok_or(Error::Syntax)? {
-            NodeEnum::VariableSetStmt(stmt) => {
-                let name = stmt.name;
+        let stmt = pg_raw_parse::parse(sql).map_err(|_| Error::Syntax)?;
+        let root = stmt.stmts().next().ok_or(Error::Syntax)?;
+        match root {
+            Node::VariableSetStmt(stmt) => {
+                let name = stmt.name().ok_or(Error::Syntax)?.to_owned();
 
-                let setting = stmt.args.first().ok_or(Error::Syntax)?;
-                let node = setting.node.clone().ok_or(Error::Syntax)?;
-                match node {
-                    NodeEnum::AConst(a_const) => match a_const.val {
-                        Some(a_const::Val::Ival(val)) => Ok(Self {
-                            name,
-                            value: val.ival.to_string(),
-                        }),
-
-                        Some(a_const::Val::Sval(sval)) => Ok(Self {
-                            name,
-                            value: sval.sval.to_string(),
-                        }),
-
-                        _ => Err(Error::Syntax),
-                    },
+                let setting = stmt.args().first().ok_or(Error::Syntax)?;
+                match setting {
+                    Node::A_Const(a_const) if let Some(val) = a_const.val() => Ok(Self {
+                        name,
+                        value: val.to_string(),
+                    }),
 
                     _ => Err(Error::Syntax),
                 }
@@ -70,6 +77,10 @@ impl Command for Set {
 
             "passthrough_auth" => {
                 config.config.general.passthrough_auth = Self::from_json(&self.value)?;
+            }
+
+            "passthrough_auth_debounce_delay" => {
+                config.config.general.passthrough_auth_debounce_delay = self.value.parse()?;
             }
 
             "read_write_strategy" => {
@@ -128,6 +139,20 @@ impl Command for Set {
                     .map_err(|_| Error::Syntax)?;
             }
 
+            "rewrite_omni_non_deterministic_functions" => {
+                config.config.rewrite.non_deterministic_functions = self
+                    .value
+                    .parse::<RewriteMode>()
+                    .map_err(|_| Error::Syntax)?;
+            }
+
+            "rewrite_subqueries" => {
+                config.config.rewrite.subqueries = self
+                    .value
+                    .parse::<RewriteMode>()
+                    .map_err(|_| Error::Syntax)?;
+            }
+
             "rewrite_enabled" => {
                 config.config.rewrite.enabled = Self::from_json(&self.value)?;
             }
@@ -180,7 +205,22 @@ impl Command for Set {
                 config.config.general.connect_timeout = self.value.parse()?;
             }
 
-            _ => return Err(Error::Syntax),
+            "canonicalize_type_information" => {
+                config.config.general.canonicalize_type_information = Self::from_json(&self.value)?;
+            }
+
+            "dry_run" => {
+                config.config.general.dry_run = Self::from_json(&self.value)?;
+            }
+
+            "resharding_parallel_within_table_copies" => {
+                config
+                    .config
+                    .general
+                    .resharding_parallel_within_table_copies = self.value.parse()?;
+            }
+
+            _ => return Ok(vec![]),
         }
 
         config::set(config)?;

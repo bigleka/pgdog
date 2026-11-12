@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::{config::General, frontend::ClientRequest, state::State};
 
 #[derive(Debug, Clone, Copy)]
-pub struct Timeouts {
+pub(crate) struct Timeouts {
     pub(super) query_timeout: Duration,
     pub(super) client_idle_timeout: Duration,
     pub(super) idle_in_transaction_timeout: Duration,
@@ -29,7 +29,6 @@ impl Timeouts {
     }
 
     /// Get active query timeout.
-    #[inline]
     pub(crate) fn query_timeout(&self, state: &State) -> Duration {
         match state {
             State::Active => self.query_timeout,
@@ -37,7 +36,6 @@ impl Timeouts {
         }
     }
 
-    #[inline]
     pub(crate) fn client_idle_timeout(
         &self,
         state: &State,
@@ -76,7 +74,8 @@ mod test {
         let config = config(); // Will be default.
         let timeout = Timeouts::from_config(&config.config.general);
 
-        let actual = timeout.client_idle_timeout(&State::IdleInTransaction, &ClientRequest::new());
+        let actual =
+            timeout.client_idle_timeout(&State::IdleInTransaction, &ClientRequest::default());
         assert_eq!(actual, timeout.idle_in_transaction_timeout);
         assert_eq!(actual.as_millis(), i64::MAX as u128);
 

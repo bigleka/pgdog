@@ -1,8 +1,9 @@
 use super::code;
 use super::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
-pub struct ParameterDescription {
+pub(crate) struct ParameterDescription {
     params: Vec<i32>,
 }
 
@@ -20,14 +21,14 @@ impl FromBytes for ParameterDescription {
 }
 
 impl ToBytes for ParameterDescription {
-    fn to_bytes(&self) -> Result<Bytes, Error> {
+    fn to_bytes(&self) -> Bytes {
         let mut payload = Payload::named(self.code());
         payload.put_u16(self.params.len() as u16);
         for param in &self.params {
             payload.put_i32(*param);
         }
 
-        Ok(payload.freeze())
+        payload.freeze()
     }
 }
 
@@ -38,20 +39,34 @@ impl Protocol for ParameterDescription {
 }
 
 impl ParameterDescription {
-    /// Create an empty parameter description.
-    pub fn empty() -> Self {
-        Self { params: Vec::new() }
+    /// Keep only the first `len` parameters.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.params.truncate(len);
     }
 
-    /// Create a parameter description from a list of type OIDs.
-    pub fn from_params(params: Vec<i32>) -> Self {
-        Self { params }
+    pub(crate) fn rewrite_data_types(&mut self, mapping: &HashMap<u32, u32>) {
+        for param in &mut self.params {
+            if let Some(&canonical) = mapping.get(&(*param as u32)) {
+                *param = canonical as i32;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    impl ParameterDescription {
+        pub(crate) fn new(params: Vec<i32>) -> Self {
+            Self { params }
+        }
+
+        /// Type OIDs of the parameters, in order.
+        pub(crate) fn params(&self) -> &[i32] {
+            &self.params
+        }
+    }
 
     #[test]
     fn parameter_description_round_trip_small() {
@@ -60,7 +75,7 @@ mod test {
             params: params.clone(),
         };
 
-        let bytes = description.to_bytes().unwrap();
+        let bytes = description.to_bytes();
         let mut buf = bytes.clone();
         assert_eq!(buf.get_u8(), b't');
         let len = buf.get_i32();
@@ -79,7 +94,7 @@ mod test {
             params: params.clone(),
         };
 
-        let bytes = description.to_bytes().unwrap();
+        let bytes = description.to_bytes();
         let mut buf = bytes.clone();
         assert_eq!(buf.get_u8(), b't');
         let len = buf.get_i32();
