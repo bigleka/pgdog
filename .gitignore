@@ -68,3 +68,6 @@ integration/**/*.test
 enterprise/control-web/dist
 enterprise/control-web/node_modules
 enterprise/control-web/.vite/*
+
+# Editor swap files
+*.kate-swp
