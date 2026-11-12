@@ -10,11 +10,14 @@
 //! the statement does: only plain `SELECT`s go through the cache.
 
 use pg_query::{
-    protobuf::{a_const::Val, SelectStmt, TransactionStmtKind},
+    protobuf::{a_const::Val, TransactionStmtKind},
     Node, NodeEnum, ParseResult,
 };
 
-use crate::net::{parameter::ParameterValue, Parameters};
+use crate::{
+    net::{parameter::ParameterValue, Parameters},
+    result_cache::statements::plain_select,
+};
 
 /// Isolation level named by a statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,27 +131,6 @@ impl TransactionCache {
             }
         }
     }
-}
-
-/// A `SELECT` that only reads: no `FOR UPDATE`/`FOR SHARE`, `INTO`, or
-/// data-modifying `WITH`, in it or in its set operations.
-fn plain_select(select: &SelectStmt) -> bool {
-    let ctes_read = select.with_clause.as_ref().is_none_or(|with| {
-        with.ctes.iter().all(|cte| match cte.node.as_ref() {
-            Some(NodeEnum::CommonTableExpr(cte)) => matches!(
-                cte.ctequery.as_ref().and_then(|query| query.node.as_ref()),
-                Some(NodeEnum::SelectStmt(query)) if plain_select(query)
-            ),
-            _ => false,
-        })
-    });
-    let side_reads = |side: &Option<Box<SelectStmt>>| side.as_deref().is_none_or(plain_select);
-
-    ctes_read
-        && select.locking_clause.is_empty()
-        && select.into_clause.is_none()
-        && side_reads(&select.larg)
-        && side_reads(&select.rarg)
 }
 
 #[cfg(test)]

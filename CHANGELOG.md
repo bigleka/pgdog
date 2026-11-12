@@ -44,6 +44,11 @@ This fork has its own version numbers. It forked from upstream
   (`BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED`). `BEGIN READ ONLY`
   without a level does with `cache_read_only_transactions = true`.
   `REPEATABLE READ` and `SERIALIZABLE` transactions never do.
+- A simple query with several statements is cached only if all of them are
+  plain `SELECT`s, and invalidates the tables of all of them. It went by its
+  first statement: after `SELECT 1; UPDATE pedidos ...`, reads of `pedidos`
+  could be served stale, and the same query run again could be served from
+  the cache without running its write at all.
 
 ## 1.0.0
 

@@ -508,3 +508,48 @@ async fn test_extended_hit_respects_result_format() {
         }
     }
 }
+
+/// A simple query with several statements is routed by its first one: a
+/// write after a read in it must still invalidate.
+#[tokio::test]
+async fn test_write_after_read_in_one_query_invalidates() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let mut table = TestTable::new().await;
+    let mut writer = TestClient::new(Parameters::default()).await;
+    let mut reader = TestClient::new(Parameters::default()).await;
+    prime_cache(&mut reader, &mut table).await;
+
+    simple(
+        &mut writer,
+        &format!("SELECT 1; UPDATE {} SET v = 2 WHERE id = 1", table.name),
+    )
+    .await;
+    let after = select_value(&mut reader, &table.select()).await;
+    table.drop().await;
+
+    assert_eq!(after.as_deref(), Some("2"), "stale read after the write");
+}
+
+/// ... and isn't a read the cache can replay: the write must run each time,
+/// even when nothing in the query names a table to invalidate.
+#[tokio::test]
+async fn test_query_with_write_after_read_not_cached() {
+    enable_result_cache(QueryParserLevel::Auto);
+    let table = TestTable::new().await;
+    let mut client = TestClient::new(Parameters::default()).await;
+
+    let query = format!(
+        "SELECT 1; DO $$ BEGIN UPDATE {} SET v = v + 1 WHERE id = 1; END $$",
+        table.name
+    );
+    simple(&mut client, &query).await;
+    simple(&mut client, &query).await;
+    let value = select_value(
+        &mut client,
+        &format!("SELECT v + 0 FROM {} WHERE id = 1", table.name),
+    )
+    .await;
+    table.drop().await;
+
+    assert_eq!(value.as_deref(), Some("3"), "second UPDATE didn't run");
+}

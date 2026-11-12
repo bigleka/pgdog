@@ -3,6 +3,7 @@ pub mod entry;
 pub mod lock;
 pub mod redis;
 pub mod singleflight;
+pub mod statements;
 pub mod ttl;
 pub mod xfetch;
 
@@ -63,6 +64,13 @@ impl CacheableRequest {
     fn new(client_request: &ClientRequest, query: String, variant: Vec<u8>) -> Option<Self> {
         let route = client_request.route();
         if !route.is_read() {
+            return None;
+        }
+        if client_request
+            .ast
+            .as_ref()
+            .is_some_and(|ast| !statements::only_reads(ast.parse_result()))
+        {
             return None;
         }
 

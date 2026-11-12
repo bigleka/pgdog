@@ -194,11 +194,12 @@ impl QueryEngine {
         // Table-based invalidation: remember tables touched by writes. Their cache
         // entries are dropped once the writes are visible to other sessions, i.e.
         // when the transaction (explicit or implicit) ends.
-        if self.result_cache.is_some()
-            && context.client_request.route().is_write()
-            && context.client_request.is_executable()
-        {
-            if let Some(ast) = context.client_request.ast.as_ref() {
+        if self.result_cache.is_some() && context.client_request.is_executable() {
+            if let Some(ast) = context.client_request.ast.as_ref().filter(|ast| {
+                // The route comes from the first statement only.
+                context.client_request.route().is_write()
+                    || !crate::result_cache::statements::only_reads(ast.parse_result())
+            }) {
                 for table in ast.tables() {
                     // Cache tags ignore aliases, so dedup on schema + name only.
                     let seen = self.pending_invalidations.iter().any(|pending| {
