@@ -37,6 +37,10 @@ for arg in "$@"; do
 done
 
 sudo pg_ctlcluster "$PSQL_VERSION" main start
+
+# Result cache tests: standalone Redis, Redis Cluster, Sentinel and twemproxy.
+bash "${SCRIPT_DIR}/apt.sh" redis-server redis-sentinel redis-tools nutcracker
+bash "${REPO_ROOT}/integration/ci/redis-topologies.sh"
 sudo -u postgres psql \
     -c "ALTER SYSTEM SET fsync TO off" \
     -c "ALTER SYSTEM SET full_page_writes TO off" \
@@ -45,6 +49,12 @@ sudo -u postgres psql \
 USER_NAME="$(id -un)"
 sudo -u postgres createuser --superuser --login "$USER_NAME"
 sudo -u postgres createdb "$USER_NAME"
+
+# asyncpg's type introspection query costs above jit_above_cost, and JIT
+# makes it about 100x slower on a cold backend (100 ms vs 1 ms locally).
+# On busy runners that exceeds the 2 s query_timeout. Takes effect on new
+# connections, no restart needed.
+psql -d postgres -c "ALTER SYSTEM SET jit TO off" -c "SELECT pg_reload_conf()"
 
 bash "${REPO_ROOT}/integration/setup.sh" \
     || (sudo pg_ctlcluster "$PSQL_VERSION" main restart && bash "${REPO_ROOT}/integration/setup.sh")

@@ -1,0 +1,111 @@
+# Helm chart (charts/pgdog): render tests, PgDog configcheck and an
+# end-to-end install on kind for every change to it; published as an OCI
+# chart on release tags.
+name: helm
+on:
+  pull_request:
+    paths: ['charts/**', '.github/workflows/helm.yml']
+  push:
+    branches: ['main']
+    paths: ['charts/**', '.github/workflows/helm.yml']
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  HELM_VERSION: v3.19.0
+  KUBECONFORM_VERSION: v0.7.0
+  YQ_VERSION: v4.45.4
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kubeconform and yq
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C "$HOME/bin" kubeconform
+          curl -fsSL -o "$HOME/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          chmod +x "$HOME/bin/yq"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Render tests
+        run: charts/pgdog/test/test.sh
+
+      # Check the configurations with PgDog from this commit: settings added
+      # to PgDog and the chart together aren't in the published image yet.
+      # The ci workflow caches the binary under the same key.
+      - name: Compute pgdog binary cache key
+        id: cache-key
+        run: echo "key=pgdog-bin-${{ runner.os }}-$(bash integration/ci/cache-key.sh)" >> "$GITHUB_OUTPUT"
+      - name: Restore pgdog binaries
+        id: pgdog-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/debug/pgdog
+            target/release/pgdog
+          key: ${{ steps.cache-key.outputs.key }}
+      - name: Install build deps
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang libclang-dev pkg-config libicu-dev libreadline-dev zlib1g-dev bison flex perl
+      - uses: Swatinem/rust-cache@v2
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        with:
+          prefix-key: build-v2
+          save-if: false
+      - name: Build pgdog
+        if: steps.pgdog-bin.outputs.cache-hit != 'true'
+        run: cargo build --bin pgdog
+
+      - name: PgDog accepts every rendered configuration
+        run: |
+          bin=target/release/pgdog
+          [ -x "$bin" ] || bin=target/debug/pgdog
+          PGDOG_BIN="$bin" charts/pgdog/test/configcheck.sh
+
+  e2e:
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: pgdog-e2e
+
+      - name: Install on kind and test the result cache
+        run: charts/pgdog/test/e2e/run.sh main
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    needs: [test, e2e]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Package and push to ghcr.io/bigleka/charts
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "$TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package charts/pgdog --version "$version" --app-version "$version" -d dist
+          helm push "dist/pgdog-$version.tgz" oci://ghcr.io/bigleka/charts

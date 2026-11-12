@@ -2,7 +2,7 @@ name: tests
 on:
   push:
     branches:
-      - main-ent
+      - main
   pull_request:
     types: [opened, synchronize, reopened]
   merge_group:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   coverage:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
       image: ghcr.io/pgdogdev/pgdog-ci:v5
@@ -50,7 +50,7 @@ jobs:
           fail_ci_if_error: false
 
   doc-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
       image: ghcr.io/pgdogdev/pgdog-ci:v5
@@ -65,6 +65,6 @@ jobs:
   tests:
     needs: [coverage, doc-tests]
     if: always()
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - run: test "${{ needs.coverage.result }}" = "success" && test "${{ needs.doc-tests.result }}" = "success"

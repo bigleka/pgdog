@@ -2,7 +2,7 @@ name: ci
 on:
   push:
     branches:
-      - main-ent
+      - main
   pull_request:
     types: [opened, synchronize, reopened]
   merge_group:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     container:
       image: ghcr.io/pgdogdev/pgdog-ci:v5
     steps:
@@ -45,7 +45,7 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
 
   ci:
-    runs-on: ${{ matrix.runner || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     needs: [build]
     timeout-minutes: 10
     container:
@@ -59,7 +59,7 @@ jobs:
           - {
               name: pgbench,
               script: integration/pgbench/run.sh,
-              runner: blacksmith-8vcpu-ubuntu-2404,
+              runner: ubuntu-24.04,
             }
           - { name: schema-sync, script: integration/schema_sync/run.sh }
           - { name: go, script: integration/go/run.sh }
@@ -112,7 +112,7 @@ jobs:
               lb_part: prepared,
               needs_rust_cache: true,
               needs_docker: true,
-              runner: blacksmith-8vcpu-ubuntu-2404,
+              runner: ubuntu-24.04,
             }
           - { name: tls, script: integration/tls/run.sh, needs_docker: true }
           - {
@@ -215,6 +215,6 @@ jobs:
     name: All Integration Tests Passed
     needs: ci
     if: always()
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
     - run: test "${{ needs.ci.result }}" = "success"

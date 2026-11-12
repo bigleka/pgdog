@@ -1,0 +1,283 @@
+# Builds the .deb, .rpm and .apk packages for amd64 and arm64, tests each on
+# the distributions it targets, builds the signed APT/YUM/APK repository
+# and tests installing from it. For a v* tag, attaches the packages to the
+# GitHub Release and publishes the repository on GitHub Pages.
+# See packaging/README.md and packaging/repo/README.md.
+name: release
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/release.yml'
+      - 'pgdog/Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: 2.43.0
+
+jobs:
+  # Packages and indexes are signed with the REPO_GPG_KEY and REPO_APK_KEY
+  # secrets. Without them (forks, or before they are set) a throwaway pair
+  # is generated here and shared, so both architectures sign with the same
+  # keys; a release refuses to go out that way.
+  keys:
+    runs-on: ubuntu-24.04
+    outputs:
+      real: ${{ steps.check.outputs.real }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        env:
+          REPO_GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
+          REPO_APK_KEY: ${{ secrets.REPO_APK_KEY }}
+        run: |
+          if [ -n "$REPO_GPG_KEY" ] && [ -n "$REPO_APK_KEY" ]; then
+            echo real=true >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "set the REPO_GPG_KEY and REPO_APK_KEY secrets to release" >&2
+            exit 1
+          else
+            echo real=false >> "$GITHUB_OUTPUT"
+            packaging/repo/test-keys.sh test-keys
+          fi
+
+      - if: steps.check.outputs.real == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-keys
+          path: test-keys/*
+          retention-days: 1
+
+  binary:
+    name: binary (${{ matrix.libc }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        libc: [glibc, musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/build-cache/registry
+            ~/build-cache/git
+            ~/build-cache/target
+          key: release-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'packaging/builder/*') }}
+          restore-keys: release-${{ matrix.libc }}-${{ matrix.arch }}-
+
+      - name: Build builder image
+        run: docker build -t pgdog-builder -f packaging/builder/${{ matrix.libc }}.Containerfile packaging/builder
+
+      - name: Compile
+        run: |
+          mkdir -p ~/build-cache/registry ~/build-cache/git ~/build-cache/target
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            -v ~/build-cache/registry:/usr/local/cargo/registry \
+            -v ~/build-cache/git:/usr/local/cargo/git \
+            -v ~/build-cache/target:/target -e CARGO_TARGET_DIR=/target \
+            pgdog-builder sh -c 'git config --global --add safe.directory /src && packaging/scripts/compile.sh dist'
+          # Files written by root in the container; the cache step needs them.
+          sudo chown -R "$(id -u):$(id -g)" ~/build-cache dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.libc }}-${{ matrix.arch }}
+          path: dist/pgdog
+          if-no-files-found: error
+          retention-days: 3
+
+  package:
+    name: package (${{ matrix.arch }})
+    needs: [keys, binary]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-${{ matrix.arch }}
+          path: dist
+
+      - name: Install nfpm
+        run: |
+          arch=$([ "${{ matrix.arch }}" = amd64 ] && echo x86_64 || echo arm64)
+          base="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}"
+          tarball="nfpm_${NFPM_VERSION}_Linux_${arch}.tar.gz"
+          curl --retry 5 --retry-all-errors -fsSLO "$base/$tarball"
+          curl --retry 5 --retry-all-errors -fsSL "$base/checksums.txt" | grep " $tarball\$" | sha256sum -c -
+          sudo tar -xzf "$tarball" -C /usr/local/bin nfpm
+
+      - if: needs.keys.outputs.real == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-keys
+          path: ${{ runner.temp }}/keys
+
+      - name: Signing keys
+        env:
+          REPO_GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
+          REPO_APK_KEY: ${{ secrets.REPO_APK_KEY }}
+        run: |
+          keys="$RUNNER_TEMP/keys"
+          mkdir -p "$keys"
+          if [ "${{ needs.keys.outputs.real }}" = true ]; then
+            printf '%s\n' "$REPO_GPG_KEY" > "$keys/gpg.asc"
+            printf '%s\n' "$REPO_APK_KEY" > "$keys/apk.rsa"
+          fi
+          chmod 0600 "$keys"/*
+          {
+            echo "NFPM_RPM_KEY_FILE=$keys/gpg.asc"
+            echo "NFPM_APK_KEY_FILE=$keys/apk.rsa"
+            echo "REPO_GPG_KEY_FILE=$keys/gpg.asc"
+            echo "REPO_APK_KEY_FILE=$keys/apk.rsa"
+          } >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          chmod +x dist/*/pgdog
+          packaging/package.sh ${{ matrix.arch }} \
+            dist/binary-glibc-${{ matrix.arch }}/pgdog \
+            dist/binary-musl-${{ matrix.arch }}/pgdog \
+            packages
+
+      - name: Install test
+        run: ENGINE=docker packaging/test/run.sh packages ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/*
+          if-no-files-found: error
+
+  # The repository holds every released version: it is rebuilt from the
+  # packages of all GitHub Releases plus this build's.
+  repo:
+    name: repo (${{ matrix.arch }})
+    needs: [keys, package]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      REPO_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: packages
+          merge-multiple: true
+
+      - name: Packages of earlier releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in $(gh release list --limit 1000 --json tagName -q '.[].tagName'); do
+            [ "$tag" = "$GITHUB_REF_NAME" ] && continue
+            gh release download "$tag" -D packages --skip-existing \
+              -p '*.deb' -p '*.rpm' -p '*.apk'
+          done
+
+      - if: needs.keys.outputs.real == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-keys
+          path: ${{ runner.temp }}/keys
+
+      - name: Signing keys
+        env:
+          REPO_GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
+          REPO_APK_KEY: ${{ secrets.REPO_APK_KEY }}
+        run: |
+          keys="$RUNNER_TEMP/keys"
+          mkdir -p "$keys"
+          if [ "${{ needs.keys.outputs.real }}" = true ]; then
+            printf '%s\n' "$REPO_GPG_KEY" > "$keys/gpg.asc"
+            printf '%s\n' "$REPO_APK_KEY" > "$keys/apk.rsa"
+          fi
+          chmod 0600 "$keys"/*
+          {
+            echo "NFPM_RPM_KEY_FILE=$keys/gpg.asc"
+            echo "NFPM_APK_KEY_FILE=$keys/apk.rsa"
+            echo "REPO_GPG_KEY_FILE=$keys/gpg.asc"
+            echo "REPO_APK_KEY_FILE=$keys/apk.rsa"
+          } >> "$GITHUB_ENV"
+
+      - name: Build repository
+        run: |
+          REPO_URL="${REPO_URL,,}" ENGINE=docker packaging/repo/build.sh packages repo
+
+      - name: Install test
+        run: REPO_URL="${REPO_URL,,}" ENGINE=docker packaging/test/repo.sh repo ${{ matrix.arch }}
+
+      - if: matrix.arch == 'amd64' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, repo]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches pgdog/Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pgdog/Cargo.toml | head -n1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || {
+            echo "tag $GITHUB_REF_NAME, but pgdog/Cargo.toml is $version" >&2
+            exit 1
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: packages
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd packages
+          sha256sum * > SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" * --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" * --verify-tag --generate-notes --title "PgDog $GITHUB_REF_NAME"
+          fi
+
+  pages:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

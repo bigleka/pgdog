@@ -1,10 +1,5 @@
 name: package-base
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/package-base.yml"
-      - "docker/Dockerfile.base-*"
   workflow_dispatch:
   schedule:
     # Weekly: Mondays at 06:00 UTC.
@@ -22,25 +17,25 @@ jobs:
           - suffix: base-builder
             dockerfile: docker/Dockerfile.base-builder
             platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - suffix: base-builder
             dockerfile: docker/Dockerfile.base-builder
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
           - suffix: base-runtime
             dockerfile: docker/Dockerfile.base-runtime
             platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - suffix: base-runtime
             dockerfile: docker/Dockerfile.base-runtime
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Prepare
         run: |
@@ -82,7 +77,7 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - build
     strategy:

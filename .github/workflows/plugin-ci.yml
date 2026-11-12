@@ -3,7 +3,6 @@ on:
   push:
     branches:
       - main
-      - main-ent
     paths:
       - ".github/workflows/plugin-ci.yml"
       - "integration/ci/**"
@@ -17,7 +16,7 @@ on:
 
 jobs:
   plugin-unit-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 30
     container:

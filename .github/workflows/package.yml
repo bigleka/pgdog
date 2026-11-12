@@ -1,27 +1,26 @@
 name: package
+# Images on ghcr.io/bigleka/pgdog: `main` and the short commit SHA on every
+# push to main; `X.Y.Z`, `X.Y`, `vX.Y.Z` and `latest` on release tags.
+# Releases are created by the release workflow with GITHUB_TOKEN, which
+# doesn't trigger other workflows, so this listens to the tag push itself.
 on:
   push:
-    branches: ["main", "main-ent"]
-    paths:
-      - ".github/workflows/package.yml"
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
-      - ".dockerignore"
-  release:
-    types: [published]
+    branches: ['main']
+    tags: ['v*']
   workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+    inputs:
+      tag:
+        description: Release tag to build again, e.g. v1.0.0 (empty builds the selected branch)
+        required: false
+        default: ''
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  BUILDER_BASE: ghcr.io/${{ github.repository }}-base-builder:latest
-  RUNTIME_BASE: ghcr.io/${{ github.repository }}-base-runtime:latest
+  # Public base images from upstream. This fork doesn't publish its own:
+  # package-base is disabled in forks.
+  BUILDER_BASE: ghcr.io/pgdogdev/pgdog-base-builder:latest
+  RUNTIME_BASE: ghcr.io/pgdogdev/pgdog-base-runtime:latest
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
@@ -30,17 +29,19 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
+      attestations: write
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-tags: true
           fetch-depth: 0
 
@@ -64,14 +65,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Generate PGO profile
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake clang pkg-config libssl-dev mold
-          bash integration/ci/install-deps.sh
-          bash integration/ci/setup.sh --with-toxi
-          bash scripts/pgo-profile.sh
 
       - name: Build and push Docker image
         id: build
@@ -101,23 +94,27 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Sign and attest artifact
-        uses: ./.github/actions/sign-and-attest-image
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   merge:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - build
     permissions:
       contents: read
       packages: write
+      attestations: write
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-tags: true
           fetch-depth: 0
 
@@ -148,7 +145,7 @@ jobs:
       - name: Check for git tag
         id: tag
         run: |
-          TAG=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
+          TAG=$(git describe --exact-match --tags --match 'v[0-9]*' HEAD 2>/dev/null || echo "")
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           if [ -n "$TAG" ]; then
             echo "Git tag found: $TAG"
@@ -161,11 +158,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` only with a release tag, never for main.
+          flavor: |
+            latest=${{ steps.tag.outputs.tag != '' }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=main,enable=${{ steps.tag.outputs.tag == '' && github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
             type=raw,value=${{ steps.tag.outputs.tag }},enable=${{ steps.tag.outputs.tag != '' }}
             type=raw,value=${{ steps.commit.outputs.sha }}
 
@@ -174,19 +173,6 @@ jobs:
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
-
-      - name: Get manifest digest
-        id: manifest
-        run: |
-          digest=$(docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
-            --format '{{json .Manifest}}' | jq -r '.digest')
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Sign and attest merged artifact
-        uses: ./.github/actions/sign-and-attest-image
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
 
       - name: Inspect image
         run: |
