@@ -76,3 +76,6 @@ integration/tls/backend/rotate/
 integration/tls/backend/docker/certs/
 
 pgo.profdata
+
+# Editor swap files
+*.kate-swp
